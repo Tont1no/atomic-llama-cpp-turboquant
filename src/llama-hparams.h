@@ -101,6 +101,9 @@ struct llama_hparams {
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
 
+    // When true, only NextN/MTP tail layers allocate KV (see has_kv()).
+    bool kv_only_nextn = false;
+
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
@@ -235,13 +238,18 @@ struct llama_hparams {
     // TODO: can be expressed via the `new n_embd_inp_impl` and remove this param
     uint32_t n_deepstack_layers = 0;
 
-    // deepstack layer array (Granite4 Vision)
-    // -1  => no deepstack
-    // >=0 => input embedding index for deepstack injection
+    // deepstack layer array (Granite4 Vision): -1 => none, >=0 => input embedding index
     std::array<int32_t, LLAMA_MAX_LAYERS> deepstack_mapping_arr;
 
     // gemma4 per-layer embedding
     uint32_t n_embd_per_layer = 0;
+
+    // gemma4 MTP assistant (speculative drafter)
+    uint32_t n_centroids              = 0;
+    uint32_t centroid_top_k           = 0;
+    uint32_t n_embd_backbone          = 0;
+    bool     attention_k_eq_v         = false;
+    bool     use_ordered_embeddings   = false;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggml-org/llama.cpp/pull/8141
@@ -352,6 +360,9 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // number of layers that carry a KV cache (respects n_layer_kv_from_start)
+    uint32_t n_layer_kv() const;
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

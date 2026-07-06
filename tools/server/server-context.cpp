@@ -23,6 +23,7 @@
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <unordered_map>
 #include <fstream>
 
 // fix problem with std::min and std::max
@@ -913,6 +914,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    std::unordered_map<std::string, int> cache_key_slots;
 
     int trace = 0;
     int slots_debug = 0;
@@ -926,6 +928,8 @@ private:
 
     // Necessary similarity of prompt for slot selection
     float slot_prompt_similarity = 0.0f;
+    float  slot_cache_key_similarity = 0.0f;
+    size_t slot_cache_key_min_prefix = 0;
 
     std::string model_name; // name of the loaded model, to be used by API
     std::set<std::string> model_aliases; // additional names for the model
@@ -1301,6 +1305,8 @@ private:
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
+        slot_cache_key_similarity = params_base.slot_cache_key_similarity;
+        slot_cache_key_min_prefix = std::max<int32_t>(0, params_base.slot_cache_key_min_prefix);
 
         // setup slots
         SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
@@ -1309,8 +1315,8 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - using rope scaling to extend\n", n_ctx_slot, n_ctx_train);
+            // Do not cap: caller has configured rope scaling (--rope-scale / --rope-scaling yarn) to handle extended context.
         }
 
         slots.clear();
@@ -1552,6 +1558,75 @@ private:
         return nullptr;
     }
 
+    server_slot * get_slot_by_cache_key(const std::string & cache_key) {
+        if (cache_key.empty()) {
+            return nullptr;
+        }
+
+        auto it = cache_key_slots.find(cache_key);
+        if (it == cache_key_slots.end()) {
+            return nullptr;
+        }
+
+        server_slot * slot = get_slot_by_id(it->second);
+        if (slot == nullptr) {
+            cache_key_slots.erase(it);
+            return nullptr;
+        }
+
+        if (slot->prompt.tokens.empty()) {
+            SLT_INF(*slot, "ignoring cache_key slot with empty prompt, key = %s\n", cache_key.c_str());
+            cache_key_slots.erase(it);
+            return nullptr;
+        }
+
+        if (slot->is_processing()) {
+            SLT_INF(*slot, "ignoring busy cache_key slot, key = %s\n", cache_key.c_str());
+            return nullptr;
+        }
+
+        return slot;
+    }
+
+    bool cache_key_slot_has_enough_similarity(const server_slot & slot, const server_task & task) const {
+        if (slot.prompt.tokens.empty() || task.tokens.empty()) {
+            SLT_INF(slot, "ignoring cache_key slot with empty prompt or task, key = %s\n", task.cache_key.c_str());
+            return false;
+        }
+
+        const size_t n_common = slot.prompt.tokens.get_common_prefix(task.tokens);
+        const float  sim_cur  = float(n_common) / task.tokens.size();
+        const bool enough_prefix = n_common >= slot_cache_key_min_prefix;
+        const bool enough_similarity = slot_cache_key_similarity <= 0.0f || sim_cur >= slot_cache_key_similarity;
+        if (enough_prefix && enough_similarity) {
+            SLT_INF(slot, "selected slot by cache_key, sim = %.3f (>= %.3f thold), common = %zu (>= %zu), key = %s\n",
+                    sim_cur, slot_cache_key_similarity, n_common, slot_cache_key_min_prefix, task.cache_key.c_str());
+            return true;
+        }
+
+        SLT_INF(slot, "ignoring cache_key slot, sim = %.3f (< %.3f thold) or common = %zu (< %zu), key = %s\n",
+                sim_cur, slot_cache_key_similarity, n_common, slot_cache_key_min_prefix, task.cache_key.c_str());
+        return false;
+    }
+
+    void clear_cache_keys_for_slot(int id_slot) {
+        for (auto it = cache_key_slots.begin(); it != cache_key_slots.end(); ) {
+            if (it->second == id_slot) {
+                it = cache_key_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void bind_cache_key_to_slot(const std::string & cache_key, int id_slot) {
+        clear_cache_keys_for_slot(id_slot);
+
+        if (!cache_key.empty()) {
+            cache_key_slots[cache_key] = id_slot;
+        }
+    }
+
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
         if (cmpl_id.empty()) {
             return nullptr;
@@ -1566,7 +1641,7 @@ private:
         return nullptr;
     }
 
-    server_slot * get_available_slot(const server_task & task) {
+    server_slot * get_available_slot(const server_task & task, bool allow_prompt_similarity = true) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1580,7 +1655,7 @@ private:
         }
 
         // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        if (allow_prompt_similarity && ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1834,6 +1909,8 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+
+        bind_cache_key_to_slot(slot.task->cache_key, slot.id);
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -2371,9 +2448,21 @@ private:
                         }
                     }
 
+                    const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
-                    server_slot * slot = get_available_slot(task);
+                    server_slot * slot = nullptr;
+                    if (id_slot != -1) {
+                        slot = get_slot_by_id(id_slot);
+                    } else if (!task.cache_key.empty()) {
+                        server_slot * slot_cache_key = get_slot_by_cache_key(task.cache_key);
+                        if (slot_cache_key != nullptr && cache_key_slot_has_enough_similarity(*slot_cache_key, task)) {
+                            slot = slot_cache_key;
+                        }
+                    }
+                    if (slot == nullptr) {
+                        slot = get_available_slot(task, task.cache_key.empty());
+                    }
 
                     //
                     // slot scheduling logic
@@ -3431,6 +3520,17 @@ private:
                             continue;
                         }
 
+                        if (ctx_dft && llama_get_ctx_other(ctx_dft.get()) != ctx_tgt) {
+                            // TODO: in the future, figure out how to infuse target embeddings to the images
+                            //       for now, we skip this for simplicity
+                            //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
+                            //       [TAG_MTMD_DRAFT_PROCESSING]
+                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                            if (res != 0) {
+                                GGML_ABORT("failed to process multi-modal data on draft context\n");
+                            }
+                        }
+
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
                         // add the image chunk to cache
@@ -4114,6 +4214,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+            task.cache_key = json_value(data, "cache_key", json_value(data, "session_id", std::string()));
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

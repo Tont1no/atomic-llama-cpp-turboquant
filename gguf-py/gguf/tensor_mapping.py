@@ -479,6 +479,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.e_score_correction",                    # exaone-moe
             "model.layers.{bid}.block_sparse_moe.gate.e_score_correction",  # kimi
             "model.layers.{bid}.moe.router_bias",                           # step3.5 expert selection bias
+            "model.layers.{bid}.mlp.experts.e_score_correction",       # laguna
         ),
 
         # Feed-forward up
@@ -2421,6 +2422,19 @@ class TensorNameMap:
 
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
+        ),
+
+        MODEL_TENSOR.MTP_PRE_PROJECTION: (
+            "pre_projection",
+        ),
+        MODEL_TENSOR.MTP_POST_PROJECTION: (
+            "post_projection",
+        ),
+        MODEL_TENSOR.MTP_CENTROIDS: (
+            "masked_embedding.centroids",
+        ),
+        MODEL_TENSOR.MTP_TOKEN_ORDERING: (
+            "masked_embedding.token_ordering",
         ),
     }
 

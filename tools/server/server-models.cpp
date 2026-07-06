@@ -44,8 +44,7 @@ extern char **environ;
 
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
 
-#define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
-#define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
+// CMD defines moved to server-models.h
 
 // address for child process, this is needed because router may run on 0.0.0.0
 // ref: https://github.com/ggml-org/llama.cpp/issues/17862
@@ -668,7 +667,7 @@ void server_models::update_meta(const std::string & name, const server_model_met
     if (it != mapping.end()) {
         it->second.meta = meta;
     }
-    cv.notify_all(); // notify wait_until_loading_finished
+    cv.notify_all(); // notify waiters
 }
 
 bool server_models::has_model(const std::string & name) {
@@ -934,7 +933,31 @@ void server_models::load(const std::string & name, const load_options & opts) {
                     std::string str(buffer);
                     if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_STATE)) {
                         this->handle_child_state(name, str);
+                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_ERROR)) {
+                        SRV_ERR("model name=%s loading error: %s\n", name.c_str(), buffer);
+                        this->update_status(name, { SERVER_MODEL_STATUS_UNLOADED, 1 });
+                        std::string err_msg(buffer);
+                        size_t prefix_len = strlen(CMD_CHILD_TO_ROUTER_ERROR);
+                        if (err_msg.size() > prefix_len) {
+                            auto trimmed = err_msg.substr(prefix_len);
+                            while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r')) {
+                                trimmed.pop_back();
+                            }
+                            this->update_last_error(name, trimmed);
+                        }
+                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_READY)) {
+                        this->update_status(name, { SERVER_MODEL_STATUS_LOADED });
+                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_INFO)) {
+                        this->update_loaded_info(name, str);
+                    } else if (string_starts_with(buffer, CMD_CHILD_TO_ROUTER_SLEEP)) {
+                        this->update_status(name, { SERVER_MODEL_STATUS_SLEEPING });
                     }
+                }
+                // EOF on stdout means the child process exited or closed the pipe.
+                // Immediately mark UNLOADED so /v1/models stops advertising
+                // this model as loaded.
+                if (feof(stdout_file) && child_mode != SERVER_CHILD_MODE_DOWNLOAD) {
+                    this->update_status(name, { SERVER_MODEL_STATUS_UNLOADED, 1 });
                 }
             } else {
                 SRV_ERR("failed to get stdout/stderr of child process for name=%s\n", name.c_str());
@@ -946,14 +969,17 @@ void server_models::load(const std::string & name, const load_options & opts) {
             auto is_stopping = [this, &name]() {
                 return this->stopping_models.find(name) != this->stopping_models.end();
             };
+            auto should_wake = [&]() {
+                return is_stopping()
+                    || child_proc->stopped.load(std::memory_order_acquire)
+                    || !child_proc->is_alive();
+            };
             {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                this->cv_stop.wait(lk, [&]() {
-                    return is_stopping() || child_proc->stopped.load(std::memory_order_acquire);
-                });
+                std::unique_lock<std::mutex> lk(this->stop_mutex);
+                this->cv_stop.wait(lk, should_wake);
             }
             // child crashed or finished on its own, skip graceful shutdown sequence
-            if (child_proc->stopped.load(std::memory_order_acquire)) {
+            if (child_proc->stopped.load(std::memory_order_acquire) || !child_proc->is_alive()) {
                 return;
             }
             SRV_INF("stopping model instance name=%s\n", name.c_str());
@@ -961,8 +987,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
             fflush(stdin_file);
             int64_t start_time = ggml_time_ms();
             while (true) {
-                std::unique_lock<std::mutex> lk(this->mutex);
-                if (!is_stopping() || child_proc->stopped.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(this->stop_mutex);
+                if (!is_stopping()
+                        || child_proc->stopped.load(std::memory_order_acquire)
+                        || !child_proc->is_alive()) {
                     return;
                 }
                 int64_t elapsed = ggml_time_ms() - start_time;
@@ -985,8 +1013,20 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
 
         child_proc->stopped.store(true, std::memory_order_release);
+        // The log thread may have detected EOF on stdout (child hung up)
+        // without the child actually exiting, e.g. the client disconnected.
+        // In that case the stopping thread is still waiting on cv_stop
+        // because is_stopping() is false and the subprocess is alive.
+        // Kill the child here so the stopping thread unblocks and cleanup
+        // (subprocess_join/destroy) runs, freeing GPU memory.
+        if (child_proc->is_alive()) {
+            SRV_WRN("model name=%s child still alive after log thread EOF, force-killing\n", name.c_str());
+            child_proc->terminate();
+        }
+
+        // stop the timeout monitoring thread
         {
-            std::lock_guard<std::mutex> lk(this->mutex);
+            std::lock_guard<std::mutex> lk(this->stop_mutex);
             stopping_models.erase(name);
             cv_stop.notify_all();
         }
@@ -1045,13 +1085,16 @@ void server_models::unload(const std::string & name) {
             });
         } else if (it->second.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
-            stopping_models.insert(name);
+            {
+                std::lock_guard<std::mutex> lk2(stop_mutex);
+                stopping_models.insert(name);
+                cv_stop.notify_all();
+            }
             if (it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
                 // special case: if model is in loading state, unloading means force-killing it
                 SRV_WRN("model name=%s is still loading, force-killing\n", name.c_str());
                 it->second.subproc->terminate();
             }
-            cv_stop.notify_all();
             // status change will be handled by the managing thread
         } else {
             SRV_WRN("model instance name=%s is not running\n", name.c_str());
@@ -1063,6 +1106,7 @@ void server_models::unload_all() {
     std::vector<std::thread> to_join;
     {
         std::lock_guard<std::mutex> lk(mutex);
+        std::lock_guard<std::mutex> lk2(stop_mutex);
         for (auto & [name, inst] : mapping) {
             if (inst.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
                 SRV_INF("cancelling download for model name=%s\n", name.c_str());
@@ -1118,6 +1162,37 @@ void server_models::update_status(const std::string & name, const update_status_
     cv.notify_all();
 }
 
+void server_models::update_loaded_info(const std::string & name, std::string & raw_info) {
+    if (!string_starts_with(raw_info, CMD_CHILD_TO_ROUTER_INFO)) {
+        SRV_WRN("invalid loaded info format from child for model name=%s: %s\n", name.c_str(), raw_info.c_str());
+        return;
+    }
+
+    json info;
+    try {
+        info = json::parse(raw_info.substr(strlen(CMD_CHILD_TO_ROUTER_INFO)));
+    } catch (const std::exception & e) {
+        SRV_WRN("failed to parse loaded info from child for model name=%s: %s\n", name.c_str(), e.what());
+        return;
+    }
+
+    std::unique_lock<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it != mapping.end()) {
+        auto & meta = it->second.meta;
+        meta.loaded_info = info;
+    }
+    cv.notify_all();
+}
+
+void server_models::update_last_error(const std::string & name, const std::string & error) {
+    std::unique_lock<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it != mapping.end()) {
+        it->second.meta.last_error = error;
+    }
+}
+
 void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok) {
     json curr;
     {
@@ -1170,11 +1245,14 @@ bool server_models::remove(const std::string & name) {
     } else if (it->second.meta.is_running()) {
         // stop running instance
         SRV_INF("stopping model instance name=%s\n", name.c_str());
-        stopping_models.insert(name);
+        {
+            std::lock_guard<std::mutex> lk_stop(stop_mutex);
+            stopping_models.insert(name);
+            cv_stop.notify_all();
+        }
         if (it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
             it->second.subproc->terminate();
         }
-        cv_stop.notify_all();
     }
 
     // wait until the monitoring thread finishes
@@ -1676,6 +1754,12 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+                if (meta.is_signaled()) {
+                    status["exit_signal"] = meta.exit_signal();
+                }
+            }
+            if (!meta.last_error.empty()) {
+                status["last_error"] = meta.last_error;
             }
 
             // pi coding agent multimodal compatibility
