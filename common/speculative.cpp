@@ -1182,6 +1182,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.clear();
             }
         }
+
+        // the noise block is scratch: its cells occupy the positions the NEXT
+        // process() call injects the real target features into. Drop them, or
+        // the draft cache reports inconsistent (non-consecutive) positions.
+        // (upstream's server purges the draft cache between rounds; a host that
+        // only drives draft()/process()/accept() has no other place to do it)
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_block_beg[seq_id] < 0) {
+                continue;
+            }
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, dparams[seq_id].n_past, -1)) {
+                LOG_WRN("%s: failed to drop noise block cells for seq %d (pos >= %d)\n",
+                        __func__, (int) seq_id, (int) dparams[seq_id].n_past);
+            }
+        }
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {

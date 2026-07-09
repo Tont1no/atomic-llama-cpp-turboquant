@@ -34,6 +34,8 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
+    LLAMA_LOG_INFO("%s: creating DFlash tensors (n_layer %d)\n", __func__, (int) n_layer);
+
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
@@ -58,6 +60,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), { n_embd, n_ff }, 0);
     }
+
+    LLAMA_LOG_INFO("%s: DFlash tensors created\n", __func__);
 }
 
 std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
