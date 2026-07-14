@@ -16,6 +16,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// TODO: tmp until the mtmd draft processing is refactored [TAG_MTMD_DRAFT_PROCESSING]
+#include "../../src/llama-ext.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
