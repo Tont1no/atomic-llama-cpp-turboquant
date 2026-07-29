@@ -704,6 +704,14 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 ok = false;
                 break;
             }
+            if (ggml_type_is_private_turbo_kv(info.t.type)) {
+                GGML_LOG_ERROR(
+                    "%s: tensor '%s' uses private runtime-only Turbo KV type id %d "
+                    "(ABI v%d); GGUF input is ambiguous with upstream type ids and is rejected\n",
+                    __func__, info.t.name, info.t.type, GGML_TURBO_KV_ABI_VERSION);
+                ok = false;
+                break;
+            }
             const size_t  type_size = ggml_type_size(info.t.type);
             const int64_t blck_size = ggml_blck_size(info.t.type);
 
@@ -1367,6 +1375,11 @@ void gguf_add_tensor(
              struct gguf_context * ctx,
         const struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
+    if (ggml_type_is_private_turbo_kv(tensor->type)) {
+        GGML_ABORT(
+            "private runtime-only Turbo KV type %d (ABI v%d) cannot be serialized to GGUF",
+            (int) tensor->type, GGML_TURBO_KV_ABI_VERSION);
+    }
     if (gguf_find_tensor(ctx, tensor->name) != -1) {
         GGML_ABORT("duplicate tensor name: %s", tensor->name);
     }
@@ -1379,6 +1392,11 @@ void gguf_add_tensor(
 }
 
 void gguf_set_tensor_type(struct gguf_context * ctx, const char * name, enum ggml_type type) {
+    if (ggml_type_is_private_turbo_kv(type)) {
+        GGML_ABORT(
+            "private runtime-only Turbo KV type %d (ABI v%d) cannot be serialized to GGUF",
+            (int) type, GGML_TURBO_KV_ABI_VERSION);
+    }
     const int64_t tensor_id = gguf_find_tensor(ctx, name);
     if (tensor_id < 0) {
         GGML_ABORT("tensor not found: %s", name);
@@ -1498,6 +1516,11 @@ struct gguf_writer_base {
     }
 
     void write_tensor_meta(const struct gguf_tensor_info & info) {
+        if (ggml_type_is_private_turbo_kv(info.t.type)) {
+            GGML_ABORT(
+                "private runtime-only Turbo KV type %d (ABI v%d) cannot be written to GGUF",
+                (int) info.t.type, GGML_TURBO_KV_ABI_VERSION);
+        }
         write(info.t.name);
 
         const uint32_t n_dims = ggml_n_dims(&info.t);

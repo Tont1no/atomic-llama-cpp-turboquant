@@ -410,6 +410,17 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
         memset(&result, 0, sizeof(result));
         return result;
     }
+    if (ggml_type_is_private_turbo_kv(tensor->type)) {
+        // Protocol 4.0 does not negotiate the private Turbo ABI. Send an
+        // explicitly invalid type so both this fork and upstream receivers
+        // reject it; never let upstream reinterpret private id 42 as Q2_0.
+        memset(&result, 0, sizeof(result));
+        result.type = GGML_TYPE_COUNT;
+        GGML_LOG_ERROR(
+            "[%s] refusing private Turbo KV type %d over unversioned RPC (ABI v%d)\n",
+            __func__, (int) tensor->type, GGML_TURBO_KV_ABI_VERSION);
+        return result;
+    }
 
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
@@ -993,6 +1004,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
+        return nullptr;
+    }
+    if (ggml_type_is_private_turbo_kv((enum ggml_type) tensor->type)) {
+        GGML_LOG_ERROR(
+            "[%s] refusing private Turbo KV type %u over unversioned RPC (ABI v%d)\n",
+            __func__, tensor->type, GGML_TURBO_KV_ABI_VERSION);
         return nullptr;
     }
 

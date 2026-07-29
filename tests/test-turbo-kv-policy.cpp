@@ -15,6 +15,12 @@ static int failures = 0;
     } while (0)
 
 int main() {
+    CHECK(GGML_TURBO_KV_ABI_VERSION == 1);
+    CHECK(ggml_type_is_private_turbo_kv(GGML_TYPE_TURBO2_0));
+    CHECK(ggml_type_is_private_turbo_kv(GGML_TYPE_TURBO3_0));
+    CHECK(ggml_type_is_private_turbo_kv(GGML_TYPE_TURBO4_0));
+    CHECK(!ggml_type_is_private_turbo_kv(GGML_TYPE_Q8_0));
+
     CHECK(llama_kv_type_is_turbo(GGML_TYPE_TURBO2_0));
     CHECK(llama_kv_type_is_turbo(GGML_TYPE_TURBO3_0));
     CHECK(llama_kv_type_is_turbo(GGML_TYPE_TURBO4_0));

@@ -113,7 +113,7 @@ static std::vector<tensor_config_t> get_tensor_configs(std::mt19937 & rng) {
 
     for (int i = 0; i < 100; ++i) {
         const enum ggml_type type = ggml_type(rng() % GGML_TYPE_COUNT);
-        if (ggml_type_size(type) == 0) {
+        if (ggml_type_size(type) == 0 || ggml_type_is_private_turbo_kv(type)) {
             continue;
         }
 
@@ -953,7 +953,7 @@ static struct random_gguf_context_result get_random_gguf_context(ggml_backend_t 
         const enum ggml_type type = ggml_type(rng() % GGML_TYPE_COUNT);
         const size_t type_size = ggml_type_size(type);
 
-        if (type_size == 0) {
+        if (type_size == 0 || ggml_type_is_private_turbo_kv(type)) {
             continue;
         }
 

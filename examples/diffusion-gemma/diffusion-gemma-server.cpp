@@ -16,6 +16,7 @@
 #include "arg.h"
 #include "chat.h"
 #include "common.h"
+#include "diffusion-answer-metrics.h"
 #include "llama.h"
 #include "log.h"
 #ifdef GGML_USE_CUDA
@@ -589,17 +590,18 @@ struct diffusion_server {
             if (llama_vocab_is_eog(vocab, generated[j])) break;
             answer.push_back(generated[j]);
         }
-        std::string ans = common_detokenize(vocab, answer, false);
-        {
-            std::string s = ans;
-            size_t h = s.find_first_not_of(" \n\t"); if (h != std::string::npos) s = s.substr(h);
-            const size_t half = s.size() / 2;
-            if (half > 0 && s.compare(0, half, s, s.size() - half, half) == 0) ans = s.substr(0, half);
-        }
+        const auto visible = diffusion_answer_metrics::normalize(
+            common_detokenize(vocab, answer, false),
+            [&](const std::string & text) {
+                if (text.empty()) return size_t(0);
+                return common_tokenize(vocab, text, false, true).size();
+            });
 
-        out.answer        = ans;
+        out.answer        = visible.text;
         out.prompt_tokens = prefix_len;
-        out.answer_tokens = (int) answer.size();
+        // Count the final client-visible answer, not the fixed canvas and not a
+        // duplicate suffix removed by normalize().
+        out.answer_tokens = visible.token_count;
         out.n_blocks      = n_blocks_run;
         out.n_steps_total = n_steps_total;
         out.canvas_tokens = n_blocks_run * canvas_length;

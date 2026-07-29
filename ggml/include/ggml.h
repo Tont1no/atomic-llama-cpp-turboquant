@@ -437,6 +437,17 @@ extern "C" {
         GGML_TYPE_COUNT   = 47,
     };
 
+    // Private runtime ABI v1. IDs 42-44 predate upstream's GGML_TYPE_Q2_0=42,
+    // so they are deliberately valid only for in-process KV tensors. GGUF and
+    // unversioned RPC inputs must reject them instead of guessing which ABI
+    // produced the numeric type ID.
+#define GGML_TURBO_KV_ABI_VERSION 1
+    static inline bool ggml_type_is_private_turbo_kv(enum ggml_type type) {
+        return type == GGML_TYPE_TURBO2_0 ||
+               type == GGML_TYPE_TURBO3_0 ||
+               type == GGML_TYPE_TURBO4_0;
+    }
+
     // precision
     enum ggml_prec {
         GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
