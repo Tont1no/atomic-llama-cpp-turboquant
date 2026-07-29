@@ -9,6 +9,10 @@
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+// Kept as a small declaration instead of including mmq.cuh and all of its
+// kernel templates in this translation unit.
+bool ggml_cuda_mmq_type_supported(enum ggml_type type);
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
@@ -271,7 +275,13 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
                     std::getenv("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH"), compiled, GGML_CUDA_CC_ADA_LOVELACE);
                 return policy.decision == ggml_cuda_ada_moe_mmq_decision::enabled ? policy.min_batch : 0;
             }();
-            if (experimental_mmq_min_batch > 0 && experimental_mmq_min_batch <= architecture_max_batch) {
+            // Never force an otherwise MMVQ-capable quant type into the
+            // synchronized host fallback. The experiment may shorten the
+            // MMVQ boundary only when the subsequent MMQ dispatcher has a
+            // real kernel specialization for this exact type.
+            if (experimental_mmq_min_batch > 0 &&
+                experimental_mmq_min_batch <= architecture_max_batch &&
+                ggml_cuda_mmq_type_supported(type)) {
                 return experimental_mmq_min_batch - 1;
             }
         }
