@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/ada-moe-mmq-policy.h"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/turbo4-sym-lut-policy.h"
 #include "ggml-cuda/acc.cuh"
@@ -219,6 +220,25 @@ static int ggml_cuda_parse_id(char devName[]) {
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
+    const char * ada_moe_mmq_value = getenv("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH");
+    constexpr bool ada_moe_mmq_compiled =
+#ifdef GGML_CUDA_ADA_MOE_MMQ_EXPERIMENT
+        true;
+#else
+        false;
+#endif
+    const ggml_cuda_ada_moe_mmq_policy_result ada_moe_mmq_initial =
+        ggml_cuda_ada_moe_mmq_policy(ada_moe_mmq_value, ada_moe_mmq_compiled, GGML_CUDA_CC_ADA_LOVELACE);
+    if (ada_moe_mmq_initial.decision == ggml_cuda_ada_moe_mmq_decision::invalid_value) {
+        GGML_ABORT("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH must be exactly 0 or an integer from 2 through 8");
+    }
+    if (ada_moe_mmq_initial.decision == ggml_cuda_ada_moe_mmq_decision::unavailable_in_build) {
+        GGML_ABORT("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH requested, but the binary was built without "
+                   "GGML_CUDA_ADA_MOE_MMQ_EXPERIMENT");
+    }
+    const bool ada_moe_mmq_requested =
+        ada_moe_mmq_initial.decision == ggml_cuda_ada_moe_mmq_decision::enabled;
+
     const char * turbo4_sym_lut_value = getenv("GGML_CUDA_TURBO4_SYM_LUT");
     constexpr bool turbo4_sym_lut_compiled =
 #ifdef GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT
@@ -240,12 +260,19 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     cudaError_t err = cudaGetDeviceCount(&info.device_count);
     if (err != cudaSuccess) {
+        if (ada_moe_mmq_requested) {
+            GGML_ABORT("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH requested, but CUDA device discovery failed: %s",
+                       cudaGetErrorString(err));
+        }
         if (turbo4_sym_lut_requested) {
             GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 requested, but CUDA device discovery failed: %s",
                        cudaGetErrorString(err));
         }
         GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": %s\n", __func__, cudaGetErrorString(err));
         return info;
+    }
+    if (ada_moe_mmq_requested && info.device_count == 0) {
+        GGML_ABORT("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH requested, but no CUDA device is visible");
     }
     if (turbo4_sym_lut_requested && info.device_count == 0) {
         GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 requested, but no CUDA device is visible");
@@ -257,6 +284,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
     for (int id = 0; id < info.device_count; ++id) {
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
+        if (ada_moe_mmq_requested) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            GGML_ABORT("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH is supported only by the CUDA SM89 backend");
+#else
+            const int cc = 100*prop.major + 10*prop.minor;
+            if (cc != GGML_CUDA_CC_ADA_LOVELACE) {
+                GGML_ABORT("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH requires every visible CUDA device to be SM89; "
+                           "device %d (%s) has compute capability %d.%d",
+                           id, prop.name, prop.major, prop.minor);
+            }
+#endif
+        }
         if (turbo4_sym_lut_requested) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 is supported only by the CUDA SM89 backend");
@@ -270,6 +309,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
 #endif
         }
         total_vram += prop.totalGlobalMem;
+    }
+    if (ada_moe_mmq_requested) {
+        GGML_LOG_WARN("CUDA: enabling experimental SM89 MoE MMQ dispatch for MUL_MAT_ID batches >= %d; "
+                      "MMVQ remains active below the threshold\n",
+                      ada_moe_mmq_initial.min_batch);
     }
     if (turbo4_sym_lut_requested) {
         GGML_LOG_WARN("CUDA: enabling experimental SM89 Turbo4 symmetric-magnitude LUT "

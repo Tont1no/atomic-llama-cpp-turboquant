@@ -1,9 +1,11 @@
 #include "mmvq.cuh"
+#include "ada-moe-mmq-policy.h"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -245,15 +247,35 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    int architecture_max_batch;
+
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-            return MMVQ_MAX_BATCH_SIZE;
+            architecture_max_batch = MMVQ_MAX_BATCH_SIZE;
+        } else if (cc >= GGML_CUDA_CC_TURING) {
+            architecture_max_batch = get_mmvq_mmid_max_batch_turing_plus(type);
+        } else {
+            architecture_max_batch = get_mmvq_mmid_max_batch_pascal_older(type);
         }
-        if (cc >= GGML_CUDA_CC_TURING) {
-            return get_mmvq_mmid_max_batch_turing_plus(type);
+
+        if (cc == GGML_CUDA_CC_ADA_LOVELACE) {
+            static const int experimental_mmq_min_batch = []() {
+                constexpr bool compiled =
+#ifdef GGML_CUDA_ADA_MOE_MMQ_EXPERIMENT
+                    true;
+#else
+                    false;
+#endif
+                const auto policy = ggml_cuda_ada_moe_mmq_policy(
+                    std::getenv("GGML_CUDA_ADA_MOE_MMQ_MIN_BATCH"), compiled, GGML_CUDA_CC_ADA_LOVELACE);
+                return policy.decision == ggml_cuda_ada_moe_mmq_decision::enabled ? policy.min_batch : 0;
+            }();
+            if (experimental_mmq_min_batch > 0 && experimental_mmq_min_batch <= architecture_max_batch) {
+                return experimental_mmq_min_batch - 1;
+            }
         }
-        return get_mmvq_mmid_max_batch_pascal_older(type);
+        return architecture_max_batch;
     }
 
     // AMD

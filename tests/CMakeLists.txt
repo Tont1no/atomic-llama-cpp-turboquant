@@ -250,6 +250,10 @@ target_include_directories(test-turbo4-sym-lut PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/src
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda
 )
+llama_build_and_test(test-ada-moe-mmq-policy.cpp)
+target_include_directories(test-ada-moe-mmq-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda
+)
 if (GGML_CUDA AND GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_test(
