@@ -2491,12 +2491,19 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
             GGML_ABORT("layer input tensor not found");
         }
 
-        const size_t nbytes = ggml_nbytes(t);
-        const size_t nfloats = nbytes / sizeof(float);
         GGML_ASSERT(n_tokens > 0);
-        GGML_ASSERT(nfloats % n_tokens == 0);
+        // The public getter returns float rows with the model embedding width.
+        // Fail closed if a model graph starts exposing a differently typed,
+        // shaped, or strided tensor instead of silently copying bytes into that
+        // contract and letting callers interpret corrupt activations.
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(t));
+        GGML_ASSERT(t->ne[0] == (int64_t) model.hparams.n_embd);
+        GGML_ASSERT(ggml_nrows(t) == (int64_t) n_tokens);
 
-        const size_t row_floats = nfloats / n_tokens;
+        const size_t row_floats = (size_t) model.hparams.n_embd;
+        const size_t nfloats = row_floats * n_tokens;
+        const size_t nbytes = nfloats * sizeof(float);
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
