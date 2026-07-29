@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-turbo.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -108,6 +109,13 @@ llama_kv_cache::llama_kv_cache(
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
+    if (llama_kv_turbo_innerq_requested(getenv("TURBO_INNERQ"))) {
+        throw std::runtime_error(
+                "TURBO_INNERQ is disabled: its experimental calibration state is "
+                "process-global and cannot safely isolate models, layers, K/V sides, "
+                "devices, users, or saved KV slots");
+    }
+
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
@@ -128,7 +136,7 @@ llama_kv_cache::llama_kv_cache(
     // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
     // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
     {
-        const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+        const bool k_is_turbo = llama_kv_type_is_turbo(type_k);
         if (k_is_turbo) {
             const uint32_t n_head    = hparams.n_head(0);
             const uint32_t n_head_kv = hparams.n_head_kv(0);
@@ -214,6 +222,17 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+    const char * adaptive_env = getenv("TURBO_LAYER_ADAPTIVE");
+    const int adaptive_mode =
+            llama_kv_turbo_adaptive_mode(type_v, hparams.n_layer(), adaptive_env);
+    if (adaptive_mode > 0) {
+        if (adaptive_env != nullptr) {
+            LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", adaptive_mode);
+        } else {
+            LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V "
+                           "(opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+        }
+    }
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -301,24 +320,8 @@ llama_kv_cache::llama_kv_cache(
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
-            static const int adaptive_mode = [&]() {
-                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
-                if (env) {
-                    int mode = atoi(env);
-                    if (mode > 0) {
-                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
-                    }
-                    return mode;
-                }
-                // Auto-enable Boundary V (mode 7) when V is turbo2
-                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
-                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-                    return 7;
-                }
-                return 0;
-            }();
-            const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-            const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+            const bool is_turbo = llama_kv_type_is_turbo(type_k);
+            const bool v_is_turbo = llama_kv_type_is_turbo(type_v);
             const uint32_t n_layer = hparams.n_layer();
             if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
                 if (il < 4 || il >= n_layer - 4) {
@@ -1093,6 +1096,16 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     if (do_shift) {
         if (!get_can_shift()) {
+            const bool has_turbo_k = std::any_of(
+                    layers.begin(), layers.end(),
+                    [](const kv_layer & layer) {
+                        return llama_kv_type_is_turbo(layer.k->type);
+                    });
+            if (has_turbo_k) {
+                GGML_ABORT(
+                        "TurboQuant K cache context shift is disabled: a correct shift "
+                        "requires inverse WHT, RoPE delta, WHT and requantization");
+            }
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
         }
 
@@ -1449,6 +1462,11 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+    for (const auto & layer : layers) {
+        if (!llama_kv_turbo_k_can_shift(layer.k->type)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1463,8 +1481,6 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 bool llama_kv_cache::get_has_shift() const {
-    // TurboQuant uses kernel-level WHT rotation -- position shift is a no-op
-    if (!layers.empty() && (layers[0].k->type == GGML_TYPE_TURBO2_0 || layers[0].k->type == GGML_TYPE_TURBO3_0 || layers[0].k->type == GGML_TYPE_TURBO4_0)) { return false; }
     bool result = false;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2298,8 +2314,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
-        const bool is_turbo_k = (layer.k->type == GGML_TYPE_TURBO2_0 || layer.k->type == GGML_TYPE_TURBO3_0 || layer.k->type == GGML_TYPE_TURBO4_0);
-        if (is_turbo_k) { continue; }
+        GGML_ASSERT(llama_kv_turbo_k_can_shift(layer.k->type));
 
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);

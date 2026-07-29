@@ -814,6 +814,8 @@ int main(int argc, char ** argv) {
     ctx_params.n_ctx    = srv.n_ctx;
     ctx_params.n_batch  = srv.n_ub;
     ctx_params.n_ubatch = srv.n_ub;
+    ctx_params.type_k   = params.cache_type_k;
+    ctx_params.type_v   = params.cache_type_v;
     ctx_params.no_perf  = params.no_perf;
     ctx_params.diffusion_self_cond_top_k = srv.diffusion.self_cond_top_k;
     ctx_params.diffusion_input_gpu_groups = srv.diffusion.input_gpu_groups;
@@ -847,8 +849,9 @@ int main(int argc, char ** argv) {
     const uint32_t default_seed = params.sampling.seed == LLAMA_DEFAULT_SEED ? 1234u : params.sampling.seed;
 
     SRV_INF("%s\n", llama_print_system_info());
-    SRV_INF("model loaded: '%s' | n_ctx = %d | canvas = %d | denoise steps = %d | 1 slot\n",
-            srv.model_id.c_str(), srv.n_ctx, srv.canvas_length, srv.n_steps);
+    SRV_INF("model loaded: '%s' | n_ctx = %d | canvas = %d | denoise steps = %d | cache K/V = %s/%s | 1 slot\n",
+            srv.model_id.c_str(), srv.n_ctx, srv.canvas_length, srv.n_steps,
+            ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v));
     SRV_INF("gpu sampling: %s%s%s%s | top-k fixed=%d anneal=[%d->%d] tail_correction=%d\n",
             srv.use_gpu_sampling ? "on" : "off",
             (!default_topk_gpu_ok ? " (default top-k will use CPU fallback until k <= CUDA limit)" :

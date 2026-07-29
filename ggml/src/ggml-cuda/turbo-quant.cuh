@@ -140,8 +140,10 @@ static __device__ __forceinline__ void turbo_rotate_forward_64(float * x) {
 
 // ---- InnerQ per-channel equalization ----
 // Equalizes K channel variances before WHT rotation to reduce quantization error.
-// Enabled via TURBO_INNERQ=N env var (N = calibration token count).
 // Math: <Q/s, s*K> = <Q, K> preserves dot products.
+// The implementation below is retained for isolated research only. Production
+// activation via TURBO_INNERQ is disabled until all calibration state is scoped
+// per cache/model/layer/K-or-V/device and follows saved-slot lifecycle.
 // INNERQ_MAX_CHANNELS is defined in turbo-innerq.cuh
 
 static __device__ float d_innerq_scale[INNERQ_MAX_CHANNELS];
@@ -156,33 +158,21 @@ static int  innerq_target_tokens = 0;
 static float innerq_strength     = 0.5f;
 static bool  innerq_initialized  = false;
 
-// Host: read TURBO_INNERQ env, start calibration if enabled
+// InnerQ's current state is process-global and mixes models, layers, K/V
+// sides, devices and saved slots. Keep the kernels available for controlled
+// research, but never activate them from a production environment variable.
 static void turbo_innerq_init(void) {
     if (innerq_initialized) return;
     innerq_initialized = true;
 
     const char * env = getenv("TURBO_INNERQ");
-    if (!env || atoi(env) <= 0) {
-        innerq_enabled = 0;
-        return;
+    if (env && atoi(env) > 0) {
+        GGML_LOG_ERROR(
+                "%s: TURBO_INNERQ is disabled by the KV safety policy; "
+                "the calibration state is not context-isolated\n",
+                __func__);
     }
-    innerq_target_tokens = atoi(env);
-    innerq_enabled = 1;  // calibrating
-
-    const char * env_str = getenv("TURBO_INNERQ_STRENGTH");
-    if (env_str) innerq_strength = atof(env_str);
-    if (innerq_strength <= 0.0f || innerq_strength > 1.0f) innerq_strength = 0.5f;
-
-    // Zero accumulators and set calibrating flag on device
-    float zeros[INNERQ_MAX_CHANNELS] = {0};
-    int zero = 0, one = 1;
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_sq_accum, zeros, sizeof(zeros)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_active, &zero, sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_innerq_calibrating, &one, sizeof(int)));
-
-    GGML_LOG_INFO("%s: InnerQ calibration started (target=%d tokens, strength=%.2f)\n",
-                   __func__, innerq_target_tokens, innerq_strength);
+    innerq_enabled = 0;
 }
 
 // Host: finalize calibration — compute scales, upload, activate
