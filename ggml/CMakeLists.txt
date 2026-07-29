@@ -207,6 +207,8 @@ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"  
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT  "ggml: compile opt-in SM89 Turbo4 symmetric FlashAttention LUT experiment" OFF)
+option(GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+                                             "ggml: compile opt-in SM89 Turbo4 two-column symmetric FlashAttention LUT experiment" OFF)
 option(GGML_CUDA_ADA_MOE_MMQ_EXPERIMENT     "ggml: compile opt-in SM89 MoE MMQ dispatch experiment" OFF)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)

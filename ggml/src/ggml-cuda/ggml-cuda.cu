@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/ada-moe-mmq-policy.h"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/turbo4-sym-lut-ncols2-policy.h"
 #include "ggml-cuda/turbo4-sym-lut-policy.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -258,6 +259,40 @@ static ggml_cuda_device_info ggml_cuda_init() {
     const bool turbo4_sym_lut_requested =
         turbo4_sym_lut_initial == ggml_turbo4_sym_lut_decision::enabled;
 
+    const char * turbo4_sym_lut_ncols2_value = getenv("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2");
+    constexpr bool turbo4_sym_lut_ncols2_compiled =
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+        true;
+#else
+        false;
+#endif
+    const ggml_turbo4_sym_lut_ncols2_decision turbo4_sym_lut_ncols2_initial =
+        ggml_turbo4_sym_lut_ncols2_policy(
+            turbo4_sym_lut_ncols2_value, turbo4_sym_lut_ncols2_compiled, GGML_CUDA_CC_ADA_LOVELACE);
+    if (turbo4_sym_lut_ncols2_initial == ggml_turbo4_sym_lut_ncols2_decision::invalid_value) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2 must be exactly 0 or 1");
+    }
+    if (turbo4_sym_lut_ncols2_initial == ggml_turbo4_sym_lut_ncols2_decision::unavailable_in_build) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 requested, but the binary was built without "
+                   "GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT");
+    }
+    const bool turbo4_sym_lut_ncols2_requested =
+        turbo4_sym_lut_ncols2_initial == ggml_turbo4_sym_lut_ncols2_decision::enabled;
+    const char * turbo4_sym_lut_ncols2_trace_value =
+        getenv("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_TRACE");
+    if (turbo4_sym_lut_ncols2_trace_value != nullptr &&
+        strcmp(turbo4_sym_lut_ncols2_trace_value, "0") != 0 &&
+        strcmp(turbo4_sym_lut_ncols2_trace_value, "1") != 0) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_TRACE must be exactly 0 or 1");
+    }
+    const bool turbo4_sym_lut_ncols2_trace =
+        turbo4_sym_lut_ncols2_trace_value != nullptr &&
+        strcmp(turbo4_sym_lut_ncols2_trace_value, "1") == 0;
+    if (turbo4_sym_lut_ncols2_trace && !turbo4_sym_lut_ncols2_requested) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_TRACE=1 requires "
+                   "GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1");
+    }
+
     cudaError_t err = cudaGetDeviceCount(&info.device_count);
     if (err != cudaSuccess) {
         if (ada_moe_mmq_requested) {
@@ -268,6 +303,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
             GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 requested, but CUDA device discovery failed: %s",
                        cudaGetErrorString(err));
         }
+        if (turbo4_sym_lut_ncols2_requested) {
+            GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 requested, but CUDA device discovery failed: %s",
+                       cudaGetErrorString(err));
+        }
         GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": %s\n", __func__, cudaGetErrorString(err));
         return info;
     }
@@ -276,6 +315,9 @@ static ggml_cuda_device_info ggml_cuda_init() {
     }
     if (turbo4_sym_lut_requested && info.device_count == 0) {
         GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 requested, but no CUDA device is visible");
+    }
+    if (turbo4_sym_lut_ncols2_requested && info.device_count == 0) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 requested, but no CUDA device is visible");
     }
 
     GGML_ASSERT(info.device_count <= GGML_CUDA_MAX_DEVICES);
@@ -308,6 +350,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
             }
 #endif
         }
+        if (turbo4_sym_lut_ncols2_requested) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 is supported only by the CUDA SM89 backend");
+#else
+            const int cc = 100*prop.major + 10*prop.minor;
+            if (!ggml_turbo4_sym_lut_ncols2_device_supported(cc)) {
+                GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 requires every visible CUDA device to be SM89; "
+                           "device %d (%s) has compute capability %d.%d",
+                           id, prop.name, prop.major, prop.minor);
+            }
+#endif
+        }
         total_vram += prop.totalGlobalMem;
     }
     if (ada_moe_mmq_requested) {
@@ -319,6 +373,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_WARN("CUDA: enabling experimental SM89 Turbo4 symmetric-magnitude LUT "
                       "for one-column VEC decode on all visible devices\n");
     }
+    if (turbo4_sym_lut_ncols2_requested) {
+        GGML_LOG_WARN("CUDA: enabling experimental SM89 Turbo4 symmetric-magnitude LUT "
+                      "for two-column VEC batches on all visible devices\n");
+    }
+    info.turbo4_sym_lut_enabled = turbo4_sym_lut_requested;
+    info.turbo4_sym_lut_ncols2_enabled = turbo4_sym_lut_ncols2_requested;
+    info.turbo4_sym_lut_ncols2_trace = turbo4_sym_lut_ncols2_trace;
     GGML_LOG_INFO("%s: found %d " GGML_CUDA_NAME " devices (Total VRAM: %zu MiB):\n",
                   __func__, info.device_count, (size_t)(total_vram / (1024 * 1024)));
     total_vram = 0;

@@ -1116,6 +1116,11 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
 
 struct ggml_cuda_device_info {
     int device_count;
+    // Process-start policy. These values are validated once during CUDA
+    // discovery and remain immutable for every FlashAttention dispatch.
+    bool turbo4_sym_lut_enabled = false;
+    bool turbo4_sym_lut_ncols2_enabled = false;
+    bool turbo4_sym_lut_ncols2_trace = false;
 
     struct cuda_device_info {
         int     cc;                             // compute capability

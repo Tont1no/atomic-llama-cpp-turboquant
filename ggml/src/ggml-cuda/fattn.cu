@@ -542,6 +542,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    if (ggml_cuda_info().turbo4_sym_lut_ncols2_enabled &&
+        K->type == GGML_TYPE_TURBO4_0 && Q->ne[1] > 1 &&
+        !ggml_turbo4_sym_lut_ncols2_head_size_supported(Q->ne[0])) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 reached unsupported Turbo4 head size %lld",
+                   (long long) Q->ne[0]);
+    }
+
 #ifdef GGML_USE_HIP
     // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate large f16 temp buffers for
     // quantized KV types (K_f16, V_f16 in launch_fattn). For SMALL batches (decode)
@@ -567,7 +574,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    const bool turbo4_ncols2_odd_tail =
+                        ggml_cuda_info().turbo4_sym_lut_ncols2_enabled &&
+                        K->type == GGML_TYPE_TURBO4_0 && Q->ne[1] == 3;
+                    if (Q->ne[1] <= 2 || turbo4_ncols2_odd_tail) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
