@@ -9,6 +9,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "turbo4-sym-lut.cuh"
 #include "turbo-innerq.cuh"
 #include <cstdlib>
 #include <cmath>
@@ -285,10 +286,14 @@ static bool turbo_innerq_is_active(void) {
 // ---- 4-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
 static __constant__ float TURBO_CENTROIDS_4BIT[16] = {
-    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
-    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
-     0.006938f,  0.020989f,  0.035597f,  0.051262f,
-     0.068756f,  0.089527f,  0.117195f,  0.173926f
+    ggml_turbo4_sym_centroid( 0), ggml_turbo4_sym_centroid( 1),
+    ggml_turbo4_sym_centroid( 2), ggml_turbo4_sym_centroid( 3),
+    ggml_turbo4_sym_centroid( 4), ggml_turbo4_sym_centroid( 5),
+    ggml_turbo4_sym_centroid( 6), ggml_turbo4_sym_centroid( 7),
+    ggml_turbo4_sym_centroid( 8), ggml_turbo4_sym_centroid( 9),
+    ggml_turbo4_sym_centroid(10), ggml_turbo4_sym_centroid(11),
+    ggml_turbo4_sym_centroid(12), ggml_turbo4_sym_centroid(13),
+    ggml_turbo4_sym_centroid(14), ggml_turbo4_sym_centroid(15),
 };
 
 // ---- Midpoints for nearest 4-bit centroid lookup ----

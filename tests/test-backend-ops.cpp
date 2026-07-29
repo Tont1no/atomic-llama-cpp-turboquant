@@ -9455,6 +9455,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
+    // Focused private-Turbo4 VEC coverage. On CUDA with Ada-or-newer and nb=1
+    // this exercises inline Turbo4 K/V dequantization without requiring a model.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 1, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 128, 1, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 1, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 1, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

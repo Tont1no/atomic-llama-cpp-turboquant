@@ -245,6 +245,25 @@ llama_build_and_test(test-backend-ops.cpp)
 
 llama_build_and_test(test-turbo-kv-policy.cpp)
 target_include_directories(test-turbo-kv-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-turbo4-sym-lut.cpp)
+target_include_directories(test-turbo4-sym-lut PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda
+)
+if (GGML_CUDA AND GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(
+        NAME test-turbo4-sym-lut-cuda
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-turbo4-sym-lut-cuda.py
+                --backend-ops $<TARGET_FILE:test-backend-ops>
+    )
+    set_tests_properties(test-turbo4-sym-lut-cuda PROPERTIES
+        LABELS "cuda"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 420
+    )
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

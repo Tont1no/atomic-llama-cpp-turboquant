@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
+#include "turbo4-sym-lut-policy.h"
 
 static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
     return 128;
@@ -16,7 +17,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool use_turbo4_sym_lut> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 2)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -144,11 +145,18 @@ static __global__ void flash_attn_ext_vec(
 
     // Shared-memory LUT for turbo KQ scoring: precompute Q[d] * centroid[c] once,
     // then the hot loop does turbo_lut[d][idx] (shmem read, no multiply).
-    // turbo4 excluded: 16 centroids × D exceeds shmem budget.
-    // Stride = n_centroids+1 to avoid bank conflicts.
+    // The default Turbo4 path deliberately remains excluded: 16 centroids x D
+    // exceeds the intended shared-memory budget. The SM89 experiment reconstructs
+    // the sign around an 8-entry positive-magnitude LUT.
+    // Turbo4 uses a 10-half (20-byte) row stride. On 32-bit shared-memory
+    // banks this advances rows by five banks; gcd(5, 32) == 1, so all 32 banks
+    // are visited before the pattern repeats. The former 9-half stride did not
+    // provide that conflict-free row progression for half values.
     constexpr int n_centroids_lut = (D <= 256 && type_K == GGML_TYPE_TURBO3_0) ? 8 :
-                                    (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 : 0;
-    constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
+                                    (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 :
+                                    (D <= 256 && type_K == GGML_TYPE_TURBO4_0 && use_turbo4_sym_lut) ? 8 : 0;
+    constexpr int lut_stride = n_centroids_lut > 0 ?
+        n_centroids_lut + ((type_K == GGML_TYPE_TURBO4_0 && use_turbo4_sym_lut) ? 2 : 1) : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
@@ -279,13 +287,17 @@ static __global__ void flash_attn_ext_vec(
 
     // Build shared-memory LUT: turbo_lut[d][c] = half(Q[d] * scale * centroid[c])
     if constexpr (n_centroids_lut > 0 && ncols == 1) {
-        const float * centroids_ptr = (type_K == GGML_TYPE_TURBO3_0) ? TURBO_CENTROIDS_3BIT :
-                                      TURBO_CENTROIDS_2BIT;
         const float * Q_f = (const float *)(Q + 0*nb01);
         for (int d = tid; d < D; d += nthreads) {
             const float q_val = Q_f[d] * scale;
             for (int c = 0; c < n_centroids_lut; c++) {
-                turbo_lut[d][c] = __float2half(q_val * centroids_ptr[c]);
+                if constexpr (type_K == GGML_TYPE_TURBO4_0 && use_turbo4_sym_lut) {
+                    turbo_lut[d][c] = __float2half(q_val * ggml_turbo4_sym_magnitude(c));
+                } else {
+                    const float * centroids_ptr = (type_K == GGML_TYPE_TURBO3_0) ?
+                        TURBO_CENTROIDS_3BIT : TURBO_CENTROIDS_2BIT;
+                    turbo_lut[d][c] = __float2half(q_val * centroids_ptr[c]);
+                }
             }
         }
         __syncthreads();
@@ -353,6 +365,36 @@ static __global__ void flash_attn_ext_vec(
                                 __half2float(turbo_lut[d0+5][(qs1>>2)&3]) +
                                 __half2float(turbo_lut[d0+6][(qs1>>4)&3]) +
                                 __half2float(turbo_lut[d0+7][(qs1>>6)&3])) * norm;
+                    }
+                } else if constexpr (n_centroids_lut > 0 && ncols == 1 &&
+                                     type_K == GGML_TYPE_TURBO4_0 && use_turbo4_sym_lut) {
+                    // Experimental SM89-only Turbo4 K scoring. Each packed nibble
+                    // selects one of eight magnitudes and carries its sign in the
+                    // lower/upper half of the original 16-entry centroid index.
+                    const block_turbo4_0 * K_turbo = (const block_turbo4_0 *)(K + i_KQ*nb11);
+                    sum = 0.0f;
+                    for (int d0 = 0; d0 < D; d0 += 8) {
+                        const int ib = d0 / QK_TURBO4;
+                        const int jj = d0 % QK_TURBO4;
+                        const float norm = __half2float(K_turbo[ib].norm);
+                        const uint8_t qs0 = K_turbo[ib].qs[jj / 2 + 0];
+                        const uint8_t qs1 = K_turbo[ib].qs[jj / 2 + 1];
+                        const uint8_t qs2 = K_turbo[ib].qs[jj / 2 + 2];
+                        const uint8_t qs3 = K_turbo[ib].qs[jj / 2 + 3];
+                        const uint8_t idx[8] = {
+                            uint8_t(qs0 & 0x0f), uint8_t(qs0 >> 4),
+                            uint8_t(qs1 & 0x0f), uint8_t(qs1 >> 4),
+                            uint8_t(qs2 & 0x0f), uint8_t(qs2 >> 4),
+                            uint8_t(qs3 & 0x0f), uint8_t(qs3 >> 4),
+                        };
+                        float block_sum = 0.0f;
+#pragma unroll
+                        for (int lane = 0; lane < 8; ++lane) {
+                            const float value = __half2float(
+                                turbo_lut[d0 + lane][ggml_turbo4_sym_magnitude_index(idx[lane])]);
+                            block_sum += ggml_turbo4_sym_is_negative(idx[lane]) ? -value : value;
+                        }
+                        sum += block_sum * norm;
                     }
                 } else {
                     sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
@@ -760,17 +802,46 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
-template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap, bool use_turbo4_sym_lut>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+    fattn_kernel_t fattn_kernel =
+        flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, use_turbo4_sym_lut>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+}
+
+static bool ggml_cuda_turbo4_sym_lut_requested(const int cc) {
+    const char * value = getenv("GGML_CUDA_TURBO4_SYM_LUT");
+    constexpr bool compiled =
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT
+        true;
+#else
+        false;
+#endif
+    switch (ggml_turbo4_sym_lut_policy(value, compiled, cc)) {
+    case ggml_turbo4_sym_lut_decision::disabled:
+        return false;
+    case ggml_turbo4_sym_lut_decision::invalid_value:
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT must be exactly 0 or 1");
+    case ggml_turbo4_sym_lut_decision::unavailable_in_build:
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 requested, but the binary was built without "
+                   "GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT");
+    case ggml_turbo4_sym_lut_decision::unsupported_compute_capability:
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT=1 is an SM89-only experiment; current compute capability is %d", cc);
+    case ggml_turbo4_sym_lut_decision::enabled:
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT
+        return true;
+#else
+        GGML_ABORT("unreachable Turbo4 symmetric-LUT policy state");
+#endif
+    }
+    GGML_ABORT("unreachable Turbo4 symmetric-LUT policy decision");
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
@@ -783,23 +854,51 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT
+        if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+            if (ggml_cuda_turbo4_sym_lut_requested(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                constexpr bool use_turbo4_sym_lut = true;
+                if (logit_softcap == 0.0f) {
+                    constexpr bool use_logit_softcap = false;
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+                        use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+                } else {
+                    constexpr bool use_logit_softcap = true;
+                    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+                        use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+                }
+                return;
+            }
+        }
+#else
+        if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+            GGML_UNUSED(ggml_cuda_turbo4_sym_lut_requested(
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc));
+        }
+#endif
+        constexpr bool use_turbo4_sym_lut = false;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+                use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
         } else {
             constexpr bool use_logit_softcap = true;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+                use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
         }
         return;
     }
 
     constexpr int cols_per_block = 2;
+    constexpr bool use_turbo4_sym_lut = false;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+            use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
     } else {
         constexpr bool use_logit_softcap = true;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+            use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
     }
 }
 

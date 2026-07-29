@@ -172,6 +172,10 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_NO_FA)
     endif()
 
+    if (GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT)
+    endif()
+
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
     endif()
