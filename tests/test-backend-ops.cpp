@@ -9487,6 +9487,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 3, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
+    // Cover the live N=4/N=8 widths explicitly. The ncols2 kernel processes
+    // these in pairs, so both even widths must stay numerically bound to the
+    // CPU reference instead of relying on the nb=2 fixture alone.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 4, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 128, 4, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 4, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 4, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 8, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 128, 8, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 8, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 128, 8, true, false, 0, 0,
+                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

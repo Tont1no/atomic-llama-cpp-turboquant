@@ -67,7 +67,7 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
         "-b",
         "CUDA0",
         "-p",
-        r"hsk=(128|256).*nb=[23].*type_K=turbo4",
+        r"hsk=(128|256).*nb=(2|3|4|8).*type_K=turbo4",
         "-j",
         "1",
     ]
@@ -86,9 +86,9 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
             f"with exit code {result.returncode}"
         )
     match = re.search(r"(\d+)/(\d+) tests passed", output)
-    if match is None or match.group(1) != "8" or match.group(2) != "8":
+    if match is None or match.group(1) != "16" or match.group(2) != "16":
         raise RuntimeError(
-            f"expected exactly 8 Turbo4 nb=2/3 parity cases, got "
+            f"expected exactly 16 Turbo4 nb=2/3/4/8 parity cases, got "
             f"{match.group(0) if match else 'no test summary'}"
         )
     marker_present = ACTIVATION_MARKER in output
@@ -115,6 +115,14 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
                 (256, 3, 1, "turbo4"): 1,
                 (128, 3, 1, "q8_0"): 1,
                 (128, 3, 1, "f16"): 1,
+                (128, 4, 0, "turbo4"): 1,
+                (256, 4, 0, "turbo4"): 1,
+                (128, 4, 0, "q8_0"): 1,
+                (128, 4, 0, "f16"): 1,
+                (128, 8, 0, "turbo4"): 1,
+                (256, 8, 0, "turbo4"): 1,
+                (128, 8, 0, "q8_0"): 1,
+                (128, 8, 0, "f16"): 1,
             }
         )
         if kernel_hits != expected_hits:
@@ -212,8 +220,9 @@ def main() -> int:
     run_unsupported_head_rejection(args.backend_ops, device_uuid)
     run_mixed_visible_device_rejection(args.backend_ops, devices, device_uuid)
     print(
-        "PASS: SM89 Turbo4 ncols=2 baseline and opt-in each matched the CPU reference in 8/8 cases; "
+        "PASS: SM89 Turbo4 ncols=2 baseline and opt-in each matched the CPU reference in 16/16 cases; "
         "all opt-in cases emitted exact kernel-hit evidence, including four real nb=3 odd tails; "
+        "live N=2/N=4/N=8 widths were covered explicitly; "
         "unsupported D=64 rejected fail-closed"
     )
     return 0
