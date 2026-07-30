@@ -58,6 +58,28 @@ static constexpr bool ggml_turbo4_sym_lut_ncols2_head_size_supported(const int h
     return head_size == 128 || head_size == 256;
 }
 
+// Selector contract for the CUDA VEC path. Keeping it independent of ggml
+// types makes the default-off routing policy testable without a CUDA compiler.
+// The experiment owns only multi-column Turbo4 K shapes on exact SM89; N=1
+// remains on the existing baseline selector and N>8 remains on MMA/TILE.
+static constexpr bool ggml_turbo4_sym_lut_ncols2_vec_candidate(
+        const bool experiment_enabled,
+        const int compute_capability,
+        const bool key_is_turbo4,
+        const bool value_type_supported,
+        const int head_size,
+        const int64_t query_columns,
+        const bool vector_kernel_shape_supported) {
+    return experiment_enabled &&
+        ggml_turbo4_sym_lut_ncols2_device_supported(compute_capability) &&
+        key_is_turbo4 &&
+        value_type_supported &&
+        ggml_turbo4_sym_lut_ncols2_head_size_supported(head_size) &&
+        query_columns >= GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS &&
+        query_columns <= 8 &&
+        vector_kernel_shape_supported;
+}
+
 static constexpr size_t ggml_turbo4_sym_lut_ncols2_shared_bytes(const int head_size) {
     return size_t(GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS) * size_t(head_size) *
         size_t(GGML_TURBO4_SYM_LUT_MAGNITUDES + GGML_TURBO4_SYM_LUT_PADDING) * sizeof(uint16_t);

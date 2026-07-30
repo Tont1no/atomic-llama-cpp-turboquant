@@ -45,6 +45,27 @@ int main() {
     CHECK( ggml_turbo4_sym_lut_ncols2_head_size_supported(256));
     CHECK(!ggml_turbo4_sym_lut_ncols2_head_size_supported(512));
 
+    // Default OFF and all non-SM89/non-Turbo4/unsupported-shape cases retain
+    // their existing selector. The experiment expands only N=2..8.
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(false, 890, true, true, 128, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  860, true, true, 128, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true, 1200, true, true, 128, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, false, true, 128, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, false, 128, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true,  64, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true, 192, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true, 512, 2, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true, 128, 1, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true, 128, 9, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true, 128, INT64_MAX, true));
+    CHECK(!ggml_turbo4_sym_lut_ncols2_vec_candidate(true,  890, true, true, 128, 2, false));
+    for (int columns = 2; columns <= 8; ++columns) {
+        CHECK(ggml_turbo4_sym_lut_ncols2_vec_candidate(
+            true, 890, true, true, 128, columns, true));
+        CHECK(ggml_turbo4_sym_lut_ncols2_vec_candidate(
+            true, 890, true, true, 256, columns, true));
+    }
+
     // Two independent 10-half rows per dimension preserve the bank-friendly
     // stride of the one-column experiment. D=256 is the largest specialization
     // and consumes exactly 10 KiB for the new LUT.

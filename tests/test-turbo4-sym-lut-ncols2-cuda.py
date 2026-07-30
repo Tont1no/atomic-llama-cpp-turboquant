@@ -166,6 +166,45 @@ def run_unsupported_head_rejection(binary: str, device_uuid: str) -> None:
         raise RuntimeError("unsupported Turbo4 D=64 request reached the candidate kernel before rejection")
 
 
+def run_single_column_non_candidate(binary: str, device_uuid: str) -> None:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = device_uuid
+    env["GGML_CUDA_TURBO4_SYM_LUT"] = "0"
+    env["GGML_CUDA_TURBO4_SYM_LUT_NCOLS2"] = "1"
+    env["GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_TRACE"] = "1"
+    result = subprocess.run(
+        [
+            binary,
+            "test",
+            "-o",
+            "FLASH_ATTN_EXT",
+            "-b",
+            "CUDA0",
+            "-p",
+            r"hsk=(128|256).*nb=1.*type_K=turbo4",
+            "-j",
+            "1",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = result.stdout + result.stderr
+    sys.stdout.write(output)
+    if result.returncode != 0:
+        raise RuntimeError("Turbo4 N=1 non-candidate reference cases failed")
+    match = re.search(r"(\d+)/(\d+) tests passed", output)
+    if match is None or match.group(1) != "4" or match.group(2) != "4":
+        raise RuntimeError("expected exactly four Turbo4 N=1 non-candidate cases")
+    if ACTIVATION_MARKER not in output:
+        raise RuntimeError("N=1 gate did not prove the ncols2 experiment was enabled")
+    if ONE_COLUMN_MARKER in output:
+        raise RuntimeError("N=1 gate unexpectedly enabled the separate one-column experiment")
+    if KERNEL_HIT_PATTERN.search(output):
+        raise RuntimeError("N=1 incorrectly reached the ncols2 candidate kernel")
+
+
 def run_mixed_visible_device_rejection(
     binary: str, devices: List[Tuple[str, str]], sm89_uuid: str
 ) -> None:
@@ -217,12 +256,13 @@ def main() -> int:
 
     run_parity(args.backend_ops, device_uuid, enabled=False)
     run_parity(args.backend_ops, device_uuid, enabled=True)
+    run_single_column_non_candidate(args.backend_ops, device_uuid)
     run_unsupported_head_rejection(args.backend_ops, device_uuid)
     run_mixed_visible_device_rejection(args.backend_ops, devices, device_uuid)
     print(
         "PASS: SM89 Turbo4 ncols=2 baseline and opt-in each matched the CPU reference in 16/16 cases; "
         "all opt-in cases emitted exact kernel-hit evidence, including four real nb=3 odd tails; "
-        "live N=2/N=4/N=8 widths were covered explicitly; "
+        "N=1 remained outside the ncols2 candidate while N=2/N=4/N=8 were covered explicitly; "
         "unsupported D=64 rejected fail-closed"
     )
     return 0

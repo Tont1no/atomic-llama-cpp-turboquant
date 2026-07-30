@@ -574,10 +574,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    const bool turbo4_ncols2_odd_tail =
-                        ggml_cuda_info().turbo4_sym_lut_ncols2_enabled &&
-                        K->type == GGML_TYPE_TURBO4_0 && Q->ne[1] == 3;
-                    if (Q->ne[1] <= 2 || turbo4_ncols2_odd_tail) {
+                    bool turbo4_ncols2_vec_candidate = false;
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+                    turbo4_ncols2_vec_candidate =
+                        ggml_turbo4_sym_lut_ncols2_vec_candidate(
+                            ggml_cuda_info().turbo4_sym_lut_ncols2_enabled,
+                            cc,
+                            K->type == GGML_TYPE_TURBO4_0,
+                            V->type == GGML_TYPE_TURBO4_0 ||
+                                V->type == GGML_TYPE_Q8_0 ||
+                                V->type == GGML_TYPE_F16,
+                            Q->ne[0],
+                            Q->ne[1],
+                            can_use_vector_kernel);
+#endif
+                    if (Q->ne[1] <= 2 || turbo4_ncols2_vec_candidate) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
