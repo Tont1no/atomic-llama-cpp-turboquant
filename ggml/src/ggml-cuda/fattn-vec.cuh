@@ -54,7 +54,8 @@ static __global__ void flash_attn_ext_vec(
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
     // Skip unused kernel variants for faster compilation:
-    if (use_logit_softcap && !(D == 128 || D == 256)) {
+    if (use_logit_softcap && !(D == 128 || D == 256 ||
+            (D == 512 && type_K == GGML_TYPE_TURBO4_0 && use_turbo4_sym_lut))) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
@@ -136,13 +137,26 @@ static __global__ void flash_attn_ext_vec(
 
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
+    constexpr int ne_KQ_workspace = ne_KQ > ne_combine ? ne_KQ : ne_combine;
+    constexpr bool d512_dynamic_kq =
+        D == 512 &&
+        ncols == GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS &&
+        type_K == GGML_TYPE_TURBO4_0 &&
+        use_turbo4_sym_lut;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     half2            VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ half   KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    using kq_storage_t = half;
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
-    __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
+    using kq_storage_t = float;
 #endif // V_DOT2_F32_F16_AVAILABLE
+    __shared__ kq_storage_t KQ_static[d512_dynamic_kq ? 1 : ne_KQ_workspace];
+    extern __shared__ float fattn_dynamic_workspace[];
+    kq_storage_t * KQ = d512_dynamic_kq ?
+        reinterpret_cast<kq_storage_t *>(fattn_dynamic_workspace) :
+        KQ_static;
+    constexpr size_t dynamic_kq_bytes =
+        d512_dynamic_kq ? size_t(ne_KQ_workspace)*sizeof(kq_storage_t) : 0;
 
     // Shared-memory LUT for turbo KQ scoring: precompute Q[d] * centroid[c] once,
     // then the hot loop does turbo_lut[d][idx] (shmem read, no multiply).
@@ -164,18 +178,33 @@ static __global__ void flash_attn_ext_vec(
     // dispatch is independent, and ncols=1 continues to launch with zero
     // dynamic shared memory.
     constexpr int n_centroids_lut_ncols2 =
-        (D == 128 || D == 256) &&
+        ggml_turbo4_sym_lut_ncols2_head_size_supported(D) &&
         ncols == GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS &&
         type_K == GGML_TYPE_TURBO4_0 && use_turbo4_sym_lut ?
         GGML_TURBO4_SYM_LUT_MAGNITUDES : 0;
     constexpr int lut_stride_ncols2 = n_centroids_lut_ncols2 > 0 ?
         GGML_TURBO4_SYM_LUT_MAGNITUDES + GGML_TURBO4_SYM_LUT_PADDING : 1;
-    extern __shared__ half turbo_lut_ncols2[];
+    half * turbo_lut_ncols2 = reinterpret_cast<half *>(
+        reinterpret_cast<unsigned char *>(fattn_dynamic_workspace) +
+        dynamic_kq_bytes);
     static_assert(
         n_centroids_lut_ncols2 == 0 ||
-        (type_K == GGML_TYPE_TURBO4_0 && (D == 128 || D == 256) &&
+        (type_K == GGML_TYPE_TURBO4_0 &&
+         ggml_turbo4_sym_lut_ncols2_head_size_supported(D) &&
          ncols == GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS),
         "Turbo4 two-column symmetric LUT escaped its supported kernel contract");
+    static_assert(
+        n_centroids_lut_ncols2 == 0 || D != 512 ||
+        dynamic_kq_bytes +
+                ggml_turbo4_sym_lut_ncols2_shared_bytes(D) +
+                GGML_TURBO4_SYM_LUT_NCOLS2_STATIC_OVERHEAD_BOUND <=
+            GGML_TURBO4_SYM_LUT_NCOLS2_SM89_OPTIN_SHARED_LIMIT,
+        "Turbo4 D=512 dynamic workspace exceeds the SM89 opt-in shared-memory contract");
+    static_assert(
+        n_centroids_lut_ncols2 == 0 || D != 512 ||
+        dynamic_kq_bytes ==
+            size_t(ne_KQ_workspace)*sizeof(kq_storage_t),
+        "compiled Turbo4 D=512 KQ workspace size does not match its dynamic layout");
 
     // Sparse V: skip V dequant for positions with negligible attention weights.
     // At long context, most V positions contribute < 1e-6 to the output — skipping
@@ -876,11 +905,27 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
         flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap, use_turbo4_sym_lut>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
+    constexpr int d512_value_cols_per_iter =
+        type_V == GGML_TYPE_TURBO4_0 ? 8 :
+        type_V == GGML_TYPE_F16 ? 4 :
+        type_V == GGML_TYPE_Q8_0 ? 1 : 0;
     constexpr size_t nbytes_shared =
         use_turbo4_sym_lut && type_K == GGML_TYPE_TURBO4_0 &&
         cols_per_block == GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS &&
         ggml_turbo4_sym_lut_ncols2_head_size_supported(D) ?
-        ggml_turbo4_sym_lut_ncols2_shared_bytes(D) : 0;
+        ggml_turbo4_sym_lut_ncols2_dynamic_shared_bytes(
+            D, d512_value_cols_per_iter) : 0;
+    static_assert(
+        D != 512 || nbytes_shared == 0 || d512_value_cols_per_iter > 0,
+        "Turbo4 D=512 ncols2 instantiated for an unsupported value-cache type");
+    if constexpr (D == 512 && nbytes_shared > 0) {
+        // D=512 moves KQ/combine plus the symmetric LUT into dynamic shared
+        // memory: 84 KiB for Turbo4 V, 52 KiB for F16 V, and 28 KiB for Q8_0
+        // V. Explicitly set the exact specialization's limit before its
+        // occupancy query and launch. CUDA_CHECK makes a denied opt-in fail
+        // closed instead of silently routing a partially qualified arm.
+        CUDA_SET_SHARED_MEMORY_LIMIT(fattn_kernel, nbytes_shared);
+    }
     launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
 }
 
@@ -892,7 +937,35 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
+    if constexpr (D == 512) {
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+        if (!ggml_cuda_info().turbo4_sym_lut_ncols2_enabled ||
+            Q->ne[1] < GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS ||
+            Q->ne[1] > GGML_TURBO4_SYM_LUT_NCOLS2_MAX_QUERY_COLUMNS) {
+            GGML_ABORT("Turbo4 D=512 VEC escaped the enabled ncols2 selector");
+        }
+        if (ggml_cuda_info().turbo4_sym_lut_ncols2_trace) {
+            GGML_LOG_INFO(
+                "CUDA: Turbo4 ncols2 kernel-hit: D=%d q_columns=%lld odd_tail=%d type_V=%s\n",
+                D, (long long) Q->ne[1], int(Q->ne[1] % GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS),
+                ggml_type_name(type_V));
+        }
+        constexpr int cols_per_block = GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS;
+        constexpr bool use_turbo4_sym_lut = true;
+        if (logit_softcap == 0.0f) {
+            constexpr bool use_logit_softcap = false;
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+                use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+        } else {
+            constexpr bool use_logit_softcap = true;
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
+                use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+        }
+#else
+        GGML_ABORT("Turbo4 D=512 VEC is unavailable in this build");
+#endif
+        return;
+    } else if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
 #ifdef GGML_CUDA_TURBO4_SYM_LUT_EXPERIMENT
         if constexpr (type_K == GGML_TYPE_TURBO4_0) {
@@ -918,49 +991,48 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
                 use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
         } else {
             constexpr bool use_logit_softcap = true;
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
-                use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap,
+                                                   use_turbo4_sym_lut>(ctx, dst);
         }
         return;
-    }
-
-    constexpr int cols_per_block = 2;
+    } else {
+        constexpr int cols_per_block = 2;
 #ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
-    if constexpr (type_K == GGML_TYPE_TURBO4_0) {
-        if (ggml_cuda_info().turbo4_sym_lut_ncols2_enabled) {
-            if constexpr (!ggml_turbo4_sym_lut_ncols2_head_size_supported(D)) {
-                GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 reached unsupported Turbo4 head size %d", D);
-            } else {
-                if (ggml_cuda_info().turbo4_sym_lut_ncols2_trace) {
-                    GGML_LOG_INFO(
-                        "CUDA: Turbo4 ncols2 kernel-hit: D=%d q_columns=%lld odd_tail=%d type_V=%s\n",
-                        D, (long long) Q->ne[1], int(Q->ne[1] % GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS),
-                        ggml_type_name(type_V));
-                }
-                constexpr bool use_turbo4_sym_lut = true;
-                if (logit_softcap == 0.0f) {
-                    constexpr bool use_logit_softcap = false;
-                    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
-                        use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+        if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+            if (ggml_cuda_info().turbo4_sym_lut_ncols2_enabled) {
+                if constexpr (!ggml_turbo4_sym_lut_ncols2_head_size_supported(D)) {
+                    GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 reached unsupported Turbo4 head size %d", D);
                 } else {
-                    constexpr bool use_logit_softcap = true;
-                    ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
-                        use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+                    if (ggml_cuda_info().turbo4_sym_lut_ncols2_trace) {
+                        GGML_LOG_INFO("CUDA: Turbo4 ncols2 kernel-hit: D=%d q_columns=%lld odd_tail=%d type_V=%s\n", D,
+                                      (long long) Q->ne[1], int(Q->ne[1] % GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS),
+                                      ggml_type_name(type_V));
+                    }
+                    constexpr bool use_turbo4_sym_lut = true;
+                    if (logit_softcap == 0.0f) {
+                        constexpr bool use_logit_softcap = false;
+                        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap,
+                                                               use_turbo4_sym_lut>(ctx, dst);
+                    } else {
+                        constexpr bool use_logit_softcap = true;
+                        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap,
+                                                               use_turbo4_sym_lut>(ctx, dst);
+                    }
+                    return;
                 }
-                return;
             }
         }
-    }
 #endif
-    constexpr bool use_turbo4_sym_lut = false;
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
-            use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
-    } else {
-        constexpr bool use_logit_softcap = true;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V,
-            use_logit_softcap, use_turbo4_sym_lut>(ctx, dst);
+        constexpr bool use_turbo4_sym_lut = false;
+        if (logit_softcap == 0.0f) {
+            constexpr bool use_logit_softcap = false;
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap,
+                                                   use_turbo4_sym_lut>(ctx, dst);
+        } else {
+            constexpr bool use_logit_softcap = true;
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap,
+                                                   use_turbo4_sym_lut>(ctx, dst);
+        }
     }
 }
 
@@ -1060,11 +1132,17 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+#endif
 
 // Mixed turbo4/q8_0 KV cache types
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0);
+#endif
 
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
@@ -1078,6 +1156,9 @@ extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
 extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
 extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+extern DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16);
+#endif
 
 // Mixed turbo4/turbo3 KV cache types
 extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0);

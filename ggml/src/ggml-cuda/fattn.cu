@@ -273,6 +273,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K, type_V)       \
     FATTN_VEC_CASE(256, type_K, type_V)       \
 
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+#define FATTN_VEC_TURBO4_NCOLS2_D512_CASE(type_V) \
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, type_V)
+#else
+#define FATTN_VEC_TURBO4_NCOLS2_D512_CASE(type_V)
+#endif
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
@@ -385,6 +392,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // Mixed turbo4/turbo2 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
+
+    // The experimental D=512 VEC path is instantiated only for the three
+    // value-cache types admitted by the ncols2 selector. Default builds retain
+    // the existing D<=256 VEC surface and D=512 MMA path.
+    FATTN_VEC_TURBO4_NCOLS2_D512_CASE(GGML_TYPE_TURBO4_0)
+    FATTN_VEC_TURBO4_NCOLS2_D512_CASE(GGML_TYPE_Q8_0)
+    FATTN_VEC_TURBO4_NCOLS2_D512_CASE(GGML_TYPE_F16)
 
     GGML_ABORT("fatal error");
 }
@@ -535,7 +549,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
             break;
         case GGML_TYPE_TURBO4_0:
-            // turbo4 VEC kernel instantiated for D in {64, 128, 256}.
+            // The default Turbo4 VEC surface is D in {64, 128, 256}. The
+            // separately gated ncols2 experiment adds exact D=512 instances.
             if (K->ne[0] % 64 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
@@ -550,7 +565,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool experimental_turbo4_d512_vec = false;
+#ifdef GGML_CUDA_TURBO4_SYM_LUT_NCOLS2_EXPERIMENT
+    experimental_turbo4_d512_vec =
+        ggml_cuda_info().turbo4_sym_lut_ncols2_enabled &&
+        Q->ne[0] == 512 &&
+        Q->ne[1] >= GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS &&
+        Q->ne[1] <= GGML_TURBO4_SYM_LUT_NCOLS2_MAX_QUERY_COLUMNS &&
+        K->type == GGML_TYPE_TURBO4_0 &&
+        (V->type == GGML_TYPE_TURBO4_0 ||
+         V->type == GGML_TYPE_Q8_0 ||
+         V->type == GGML_TYPE_F16);
+#endif
+    const bool can_use_vector_kernel =
+        ((Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192) ||
+         experimental_turbo4_d512_vec) &&
+        K->ne[1] % FATTN_KQ_STRIDE == 0;
 
 #ifdef GGML_USE_HIP
     // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate large f16 temp buffers for

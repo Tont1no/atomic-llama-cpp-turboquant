@@ -9469,16 +9469,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
+    // D=512 coverage for every admitted value-cache type and every qualified
+    // query width. nb=3 exercises the padded odd tail at the largest head
+    // dimension and all cases retain the standard 5e-4 NMSE CPU-reference
+    // tolerance of test_flash_attn_ext.
+    for (const int64_t nb : {2, 3, 4, 8}) {
+        for (const ggml_type type_V : {GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 256, nb, true, false, 0, 0,
+                                                           GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_V));
+        }
+    }
+
     // Negative-gate fixtures. Turbo4 rows are padded to QK_TURBO4=128, so an
     // apparent hsk=64 case is actually D=128 at dispatch and cannot prove the
     // unsupported-head guard. D=384 is representable and proves that an
     // unsupported shape is rejected before the generic head-size switch can
-    // return NONE. D=512 with GQA=2 additionally stays on the otherwise
-    // supported Flash Attention path. The enabled experiment must reject both
-    // fail-closed.
+    // return NONE. D=640 is also representable and stays on an otherwise
+    // supported Flash Attention path with V=512. The enabled experiment must
+    // reject both fail-closed.
     test_cases.emplace_back(new test_flash_attn_ext(384, 384, 4, {1, 1}, 256, 2, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 256, 2, true, false, 0, 0,
+    test_cases.emplace_back(new test_flash_attn_ext(640, 512, 4, {2, 1}, 256, 2, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 2, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));

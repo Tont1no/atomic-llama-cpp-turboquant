@@ -4,6 +4,12 @@
 #include <cstdint>
 #include <cstring>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define GGML_TURBO4_NCOLS2_HOST_DEVICE __host__ __device__
+#else
+#define GGML_TURBO4_NCOLS2_HOST_DEVICE
+#endif
+
 enum class ggml_turbo4_sym_lut_ncols2_decision {
     disabled,
     enabled,
@@ -51,11 +57,13 @@ static inline int ggml_turbo4_sym_lut_ncols2_first_unsupported_device(
 }
 
 static constexpr int GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS = 2;
+static constexpr int GGML_TURBO4_SYM_LUT_NCOLS2_MAX_QUERY_COLUMNS = 8;
 static constexpr int GGML_TURBO4_SYM_LUT_MAGNITUDES = 8;
 static constexpr int GGML_TURBO4_SYM_LUT_PADDING = 2;
 
+GGML_TURBO4_NCOLS2_HOST_DEVICE
 static constexpr bool ggml_turbo4_sym_lut_ncols2_head_size_supported(const int head_size) {
-    return head_size == 128 || head_size == 256;
+    return head_size == 128 || head_size == 256 || head_size == 512;
 }
 
 // Selector contract for the CUDA VEC path. Keeping it independent of ggml
@@ -76,11 +84,39 @@ static constexpr bool ggml_turbo4_sym_lut_ncols2_vec_candidate(
         value_type_supported &&
         ggml_turbo4_sym_lut_ncols2_head_size_supported(head_size) &&
         query_columns >= GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS &&
-        query_columns <= 8 &&
+        query_columns <= GGML_TURBO4_SYM_LUT_NCOLS2_MAX_QUERY_COLUMNS &&
         vector_kernel_shape_supported;
 }
 
+GGML_TURBO4_NCOLS2_HOST_DEVICE
 static constexpr size_t ggml_turbo4_sym_lut_ncols2_shared_bytes(const int head_size) {
     return size_t(GGML_TURBO4_SYM_LUT_NCOLS2_COLUMNS) * size_t(head_size) *
         size_t(GGML_TURBO4_SYM_LUT_MAGNITUDES + GGML_TURBO4_SYM_LUT_PADDING) * sizeof(uint16_t);
 }
+
+// CUDA cannot opt a kernel with more than 48 KiB of statically declared shared
+// memory into Ada's larger per-block budget. D=512 therefore places its KQ
+// combine buffer in the same dynamic workspace as the LUT. value_cols_per_iter
+// is 8 for Turbo4 V, 4 for F16 V, and 1 for Q8_0 V.
+GGML_TURBO4_NCOLS2_HOST_DEVICE
+static constexpr size_t ggml_turbo4_sym_lut_ncols2_d512_kq_bytes(
+        const int head_size, const int value_cols_per_iter) {
+    return head_size == 512 ?
+        size_t(4) * size_t(value_cols_per_iter) * size_t(head_size) * sizeof(uint32_t) :
+        0;
+}
+
+GGML_TURBO4_NCOLS2_HOST_DEVICE
+static constexpr size_t ggml_turbo4_sym_lut_ncols2_dynamic_shared_bytes(
+        const int head_size, const int value_cols_per_iter) {
+    return ggml_turbo4_sym_lut_ncols2_shared_bytes(head_size) +
+        ggml_turbo4_sym_lut_ncols2_d512_kq_bytes(head_size, value_cols_per_iter);
+}
+
+static constexpr size_t GGML_TURBO4_SYM_LUT_NCOLS2_SM89_OPTIN_SHARED_LIMIT = 99u * 1024u;
+// KQ_max/KQ_sum consume 512 bytes in the D=512 ncols2 specialization. The
+// one-element fallback KQ/LUT arrays and compiler alignment stay well within
+// this conservative additional bound.
+static constexpr size_t GGML_TURBO4_SYM_LUT_NCOLS2_STATIC_OVERHEAD_BOUND = 1024u;
+
+#undef GGML_TURBO4_NCOLS2_HOST_DEVICE
