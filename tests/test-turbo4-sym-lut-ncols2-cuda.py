@@ -67,7 +67,7 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
         "-b",
         "CUDA0",
         "-p",
-        r"hsk=(128|256|512).*nb=(2|3|4|8).*type_K=turbo4",
+        r"hsk=(128|256|512).*nb=(2|3|4|5|6|7|8).*type_K=turbo4",
         "-j",
         "1",
     ]
@@ -86,9 +86,9 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
             f"with exit code {result.returncode}"
         )
     match = re.search(r"(\d+)/(\d+) tests passed", output)
-    if match is None or match.group(1) != "28" or match.group(2) != "28":
+    if match is None or match.group(1) != "49" or match.group(2) != "49":
         raise RuntimeError(
-            f"expected exactly 28 Turbo4 nb=2/3/4/8 parity cases, got "
+            f"expected exactly 49 Turbo4 nb=2..8 parity cases, got "
             f"{match.group(0) if match else 'no test summary'}"
         )
     marker_present = ACTIVATION_MARKER in output
@@ -115,8 +115,8 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
             (512, "f16"),
         )
         expected_hits = Counter(
-            (head_size, width, 1 if width == 3 else 0, value_type)
-            for width in (2, 3, 4, 8)
+            (head_size, width, width % 2, value_type)
+            for width in range(2, 9)
             for head_size, value_type in expected_shapes
         )
         if kernel_hits != expected_hits:
@@ -273,10 +273,10 @@ def main() -> int:
     )
     run_mixed_visible_device_rejection(args.backend_ops, devices, device_uuid)
     print(
-        "PASS: SM89 Turbo4 ncols=2 baseline and opt-in each matched the CPU reference in 28/28 cases; "
-        "D=512 covered Turbo4/Q8_0/F16 values at nb=2/3/4/8; all opt-in cases emitted exact "
-        "kernel-hit evidence, including seven real nb=3 odd tails; "
-        "N=1 remained outside the ncols2 candidate while N=2/N=4/N=8 were covered explicitly; "
+        "PASS: SM89 Turbo4 ncols=2 baseline and opt-in each matched the CPU reference in 49/49 cases; "
+        "D=512 covered Turbo4/Q8_0/F16 values at every nb=2..8; all opt-in cases emitted exact "
+        "kernel-hit evidence, including every nb=3/5/7 odd tail; "
+        "N=1 remained outside the ncols2 candidate while the complete N=2..8 surface was covered; "
         "unsupported D=384/D=640 rejected fail-closed"
     )
     return 0

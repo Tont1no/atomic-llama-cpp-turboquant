@@ -9456,7 +9456,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
     // Focused private-Turbo4 VEC coverage. On CUDA with Ada-or-newer, nb=1
-    // stays outside this experiment while nb=2/3/4/8 exercise the separately
+    // stays outside this experiment while every admitted nb=2..8 exercises the separately
     // gated pairwise-query experiment without requiring a model.
     // Use one full FATTN_KQ_STRIDE (256) of KV rows. A shorter 128-row
     // fixture cannot enter the CUDA VEC selector, so it can pass numerically
@@ -9469,11 +9469,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
-    // D=512 coverage for every admitted value-cache type and every qualified
-    // query width. nb=3 exercises the padded odd tail at the largest head
+    // D=512 coverage for every admitted value-cache type and every admitted
+    // query width. nb=3/5/7 exercise padded odd tails at the largest head
     // dimension and all cases retain the standard 5e-4 NMSE CPU-reference
     // tolerance of test_flash_attn_ext.
-    for (const int64_t nb : {2, 3, 4, 8}) {
+    for (const int64_t nb : {2, 3, 4, 5, 6, 7, 8}) {
         for (const ggml_type type_V : {GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 256, nb, true, false, 0, 0,
                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_V));
@@ -9491,41 +9491,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(640, 512, 4, {2, 1}, 256, 2, true, false, 0, 0,
                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 2, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 2, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 2, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 2, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 3, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 3, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 3, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 3, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
-    // Cover the live N=4/N=8 widths explicitly. The ncols2 kernel processes
-    // these in pairs, so both even widths must stay numerically bound to the
-    // CPU reference instead of relying on the nb=2 fixture alone.
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 4, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 4, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 4, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 4, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, 8, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 8, true, false, 0, 0,
-                                                   GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
+    // The production selector exposes the complete nb=2..8 surface. Bind every
+    // width, including all odd tails, to the CPU reference for the pre-D512
+    // specializations as well.
+    for (const int64_t nb : {2, 3, 4, 5, 6, 7, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, nb, true, false, 0, 0,
+                                                       GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 256, nb, true, false, 0, 0,
+                                                       GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, nb, true, false, 0, 0,
+                                                       GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, nb, true, false, 0, 0,
+                                                       GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_F16));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
