@@ -17,6 +17,7 @@
 #include "chat.h"
 #include "common.h"
 #include "diffusion-answer-metrics.h"
+#include "diffusion-prefix-cache.h"
 #include "llama.h"
 #include "log.h"
 #ifdef GGML_USE_CUDA
@@ -124,12 +125,16 @@ struct diffusion_request {
     bool     topk_tail     = false;
     bool     ignore_eos    = false; // run all max_canvases blocks (don't stop at end-of-text)
     uint32_t seed          = 1234;
+    // Opaque HMAC scope supplied only by the authenticated AI-Loader boundary.
+    // It is never logged or included in response/metrics JSON.
+    std::string prompt_cache_scope;
 };
 
 struct diffusion_result {
     std::string answer;            // final response text (post channel-split / eog truncation)
     std::string full;             // full detokenized canvas (thought + response)
     int    prompt_tokens   = 0;    // prompt prefix tokens processed (encoder prefill)
+    int    cached_prompt_tokens = 0; // prompt tokens reused from a valid isolated KV prefix
     int    answer_tokens   = 0;    // tokens in the extracted answer
     int    n_blocks        = 0;    // canvas blocks run
     int    n_steps_total   = 0;    // denoising steps across all blocks
@@ -151,6 +156,7 @@ struct server_metrics {
     // cumulative counters
     uint64_t n_requests_total           = 0;
     uint64_t n_prompt_tokens_total      = 0;
+    uint64_t n_prompt_tokens_cached_total = 0;
     double   t_prompt_ms_total          = 0.0;
     uint64_t n_tokens_predicted_total   = 0;   // answer tokens
     double   t_predicted_ms_total       = 0.0; // denoise time
@@ -172,6 +178,7 @@ struct server_metrics {
         std::lock_guard<std::mutex> lk(mu);
         n_requests_total          += 1;
         n_prompt_tokens_total     += r.prompt_tokens;
+        n_prompt_tokens_cached_total += r.cached_prompt_tokens;
         t_prompt_ms_total         += r.prefill_ms;
         n_tokens_predicted_total  += r.answer_tokens;
         t_predicted_ms_total      += r.gen_ms;
@@ -218,6 +225,33 @@ struct diffusion_server {
 
     server_metrics metrics;
     std::mutex gen_mutex;            // serialize generation (ctx is single-threaded == one slot)
+    diffusion_prompt_prefix_cache<llama_token> prompt_cache;
+
+    void invalidate_prompt_cache() {
+        prompt_cache.invalidate();
+        llama_memory_clear(mem, true);
+    }
+
+    std::string prompt_cache_config(const diffusion_request & rq) const {
+        // The running process already pins model weights, template code, context,
+        // K/V types, and launch settings. Include every request-varying generation
+        // knob too: a drift is conservatively a miss even when it would not alter
+        // the causal encoder KV.
+        return std::string("diffusion-gemma-chat-template-v1") +
+            "\x1f" + model_path +
+            "\x1f" + model_id +
+            "\x1f" + std::to_string(n_ctx) +
+            "\x1f" + std::to_string(n_ub) +
+            "\x1f" + std::to_string(rq.canvas_length) +
+            "\x1f" + std::to_string(rq.n_steps) +
+            "\x1f" + std::to_string(rq.max_canvases) +
+            "\x1f" + std::to_string(rq.topk_fixed) +
+            "\x1f" + std::to_string(rq.topk_start) +
+            "\x1f" + std::to_string(rq.topk_end) +
+            "\x1f" + std::to_string(rq.topk_tail ? 1 : 0) +
+            "\x1f" + std::to_string(rq.ignore_eos ? 1 : 0) +
+            "\x1f" + std::to_string(rq.seed);
+    }
 
     std::string format_messages(const json & messages) const {
         common_chat_templates_inputs inputs;
@@ -257,6 +291,16 @@ struct diffusion_server {
         diffusion_result out;
         const int prefix_len = (int) prompt_tokens.size();
         int n_decode = 0;
+        bool cache_committed = false;
+        struct cache_rollback {
+            diffusion_server & server;
+            bool & committed;
+            ~cache_rollback() {
+                if (!committed) {
+                    server.invalidate_prompt_cache();
+                }
+            }
+        } rollback{*this, cache_committed};
 
         int max_canvases = rq.max_canvases;
         const int n_steps = std::max(rq.n_steps, 1);
@@ -269,7 +313,22 @@ struct diffusion_server {
         if (max_canvases > fit) max_canvases = fit;
         if (max_canvases < 1)   max_canvases = 1;
 
-        llama_memory_clear(mem, true);
+        const std::string cache_config = prompt_cache_config(rq);
+        const auto cache_plan =
+            prompt_cache.plan(rq.prompt_cache_scope, cache_config, prompt_tokens);
+        int cached_prompt_tokens = static_cast<int>(cache_plan.cached_tokens);
+        if (!cache_plan.exact_scope || !cache_plan.exact_config ||
+            cached_prompt_tokens <= 0) {
+            invalidate_prompt_cache();
+            cached_prompt_tokens = 0;
+        } else if (!llama_memory_seq_rm(mem, 0, cached_prompt_tokens, -1)) {
+            // Unsupported/failed partial KV removal cannot be treated as a hit.
+            invalidate_prompt_cache();
+            cached_prompt_tokens = 0;
+        }
+        // Metadata is invalid while generation mutates the one physical context.
+        // Any error path therefore leaves neither a stale identity nor stale KV.
+        prompt_cache.invalidate();
 
         std::mt19937 rng(rq.seed);
         std::uniform_int_distribution<int> rand_tok(0, n_vocab - 1);
@@ -277,9 +336,11 @@ struct diffusion_server {
 
         // ---- ENCODER phase: prefill the prompt prefix (causal, no self-conditioning) ----
         const auto t_prefill0 = std::chrono::steady_clock::now();
-        int n_past = 0;
-        if (prefix_len > 0) {
-            if (!prefill_causal(prompt_tokens, 0, &n_decode)) {
+        int n_past = cached_prompt_tokens;
+        if (prefix_len > cached_prompt_tokens) {
+            const std::vector<llama_token> suffix(
+                prompt_tokens.begin() + cached_prompt_tokens, prompt_tokens.end());
+            if (!prefill_causal(suffix, cached_prompt_tokens, &n_decode)) {
                 out.error = "prompt prefill (encoder) decode failed";
                 return out;
             }
@@ -599,6 +660,7 @@ struct diffusion_server {
 
         out.answer        = visible.text;
         out.prompt_tokens = prefix_len;
+        out.cached_prompt_tokens = cached_prompt_tokens;
         // Count the final client-visible answer, not the fixed canvas and not a
         // duplicate suffix removed by normalize().
         out.answer_tokens = visible.token_count;
@@ -606,6 +668,15 @@ struct diffusion_server {
         out.n_steps_total = n_steps_total;
         out.canvas_tokens = n_blocks_run * canvas_length;
         out.n_decode      = n_decode;
+        // Earlier canvas commits are useful only inside this generation. Keep
+        // exactly the current prompt KV for the next turn; never retain generated
+        // canvas, reasoning, or answer tokens.
+        if (!llama_memory_seq_rm(mem, 0, prefix_len, -1)) {
+            invalidate_prompt_cache();
+        } else {
+            prompt_cache.commit(rq.prompt_cache_scope, cache_config, prompt_tokens);
+        }
+        cache_committed = true;
         out.ok            = true;
         return out;
     }
@@ -623,15 +694,16 @@ static json error_json(const std::string & msg, const std::string & type, int co
 // llama-server `timings` object, with diffusion fields. prompt_* describes the encoder prefill;
 // predicted_* describes the answer tokens; the nested `diffusion` object describes the denoising.
 static json timings_json(const diffusion_result & r) {
-    const double ppt = r.prompt_tokens > 0 ? r.prefill_ms / r.prompt_tokens : 0.0;
-    const double pps = r.prefill_ms    > 0 ? r.prompt_tokens * 1e3 / r.prefill_ms : 0.0;
+    const int prompt_evaluated = std::max(r.prompt_tokens - r.cached_prompt_tokens, 0);
+    const double ppt = prompt_evaluated > 0 ? r.prefill_ms / prompt_evaluated : 0.0;
+    const double pps = r.prefill_ms > 0 ? prompt_evaluated * 1e3 / r.prefill_ms : 0.0;
     const double dpt = r.answer_tokens > 0 ? r.gen_ms / r.answer_tokens : 0.0;
     const double dps = r.gen_ms        > 0 ? r.answer_tokens * 1e3 / r.gen_ms : 0.0;
     const double sps = r.gen_ms        > 0 ? r.n_steps_total * 1e3 / r.gen_ms : 0.0;
     const double cps = r.gen_ms        > 0 ? r.canvas_tokens * 1e3 / r.gen_ms : 0.0;
     const double mps = r.n_steps_total > 0 ? r.gen_ms / r.n_steps_total : 0.0;
     return json{
-        {"cache_n", 0},
+        {"cache_n", r.cached_prompt_tokens},
         {"prompt_n", r.prompt_tokens},
         {"prompt_ms", r.prefill_ms},
         {"prompt_per_token_ms", ppt},
@@ -658,20 +730,21 @@ static json usage_json(const diffusion_result & r) {
         {"prompt_tokens", r.prompt_tokens},
         {"completion_tokens", r.canvas_tokens},
         {"total_tokens", r.prompt_tokens + r.canvas_tokens},
-        {"prompt_tokens_details", {{"cached_tokens", 0}}},
+        {"prompt_tokens_details", {{"cached_tokens", r.cached_prompt_tokens}}},
         {"completion_tokens_details", {{"reasoning_tokens", reasoning > 0 ? reasoning : 0}}},
     };
 }
 
 // per-request timing log, llama_perf-style but with the denoise phase substituted for AR eval
 static void log_timings(const diffusion_result & r) {
-    const double ppt = r.prompt_tokens > 0 ? r.prefill_ms / r.prompt_tokens : 0.0;
-    const double pps = r.prefill_ms    > 0 ? r.prompt_tokens * 1e3 / r.prefill_ms : 0.0;
+    const int prompt_evaluated = std::max(r.prompt_tokens - r.cached_prompt_tokens, 0);
+    const double ppt = prompt_evaluated > 0 ? r.prefill_ms / prompt_evaluated : 0.0;
+    const double pps = r.prefill_ms > 0 ? prompt_evaluated * 1e3 / r.prefill_ms : 0.0;
     const double mps = r.n_steps_total > 0 ? r.gen_ms / r.n_steps_total : 0.0;
     const double sps = r.gen_ms        > 0 ? r.n_steps_total * 1e3 / r.gen_ms : 0.0;
     const double cps = r.gen_ms        > 0 ? r.canvas_tokens * 1e3 / r.gen_ms : 0.0;
-    SLT_INF(0, "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-            r.prefill_ms, r.prompt_tokens, ppt, pps);
+    SLT_INF(0, "prompt eval time = %10.2f ms / %5d evaluated + %5d cached tokens (%8.2f ms per evaluated token, %8.2f tokens per second)\n",
+            r.prefill_ms, prompt_evaluated, r.cached_prompt_tokens, ppt, pps);
     SLT_INF(0, "    denoise time = %10.2f ms / %5d steps  (%8.2f ms per step,  %8.2f steps per second)\n",
             r.gen_ms, r.n_steps_total, mps, sps);
     SLT_INF(0, "      gen tokens = %5d answer | %5d canvas over %d block(s) (%8.2f canvas tok/s)\n",
@@ -717,6 +790,23 @@ static diffusion_request request_from_body(const json & body, const diffusion_se
     if (body.contains("seed")  && body["seed"].is_number_integer()) rq.seed = (uint32_t) body["seed"].get<int64_t>();
     if (body.contains("ignore_eos") && body["ignore_eos"].is_boolean()) rq.ignore_eos = body["ignore_eos"].get<bool>();
     return rq;
+}
+
+static std::string prompt_cache_scope_from_request(const httplib::Request & req) {
+    // The AI-Loader sends a versioned lowercase HMAC in a private HTTP header.
+    // Reject everything else instead of allowing a local caller to smuggle a
+    // raw tenant/user/session identifier into cache state or diagnostics.
+    const std::string scope = req.get_header_value("X-AI-Loader-Prompt-Cache-Scope");
+    if (scope.size() != 67 || scope.compare(0, 3, "v1_") != 0) {
+        return {};
+    }
+    for (size_t i = 3; i < scope.size(); ++i) {
+        const char c = scope[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return {};
+        }
+    }
+    return scope;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -979,6 +1069,9 @@ int main(int argc, char ** argv) {
                 "# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.\n"
                 "# TYPE llamacpp:prompt_tokens_total counter\n"
                 "llamacpp:prompt_tokens_total %llu\n"
+                "# HELP llamacpp:prompt_tokens_cached_total Number of prompt tokens reused from an isolated warm prefix.\n"
+                "# TYPE llamacpp:prompt_tokens_cached_total counter\n"
+                "llamacpp:prompt_tokens_cached_total %llu\n"
                 "# HELP llamacpp:prompt_seconds_total Prompt (encoder prefill) process time.\n"
                 "# TYPE llamacpp:prompt_seconds_total counter\n"
                 "llamacpp:prompt_seconds_total %.3f\n"
@@ -1023,6 +1116,7 @@ int main(int argc, char ** argv) {
                 "# TYPE llamacpp:requests_processing gauge\n"
                 "llamacpp:requests_processing %d\n",
                 (unsigned long long) m.n_prompt_tokens_total,
+                (unsigned long long) m.n_prompt_tokens_cached_total,
                 m.t_prompt_ms_total / 1000.0,
                 (unsigned long long) m.n_tokens_predicted_total,
                 m.t_predicted_ms_total / 1000.0,
@@ -1080,8 +1174,12 @@ int main(int argc, char ** argv) {
     }
 
     // shared: run one generation (under the slot mutex), update metrics, print timing log
-    auto run_for_body = [&srv, default_seed](const json & body, const std::vector<llama_token> & prompt_tokens) {
+    auto run_for_body = [&srv, default_seed](
+            const httplib::Request & http_request,
+            const json & body,
+            const std::vector<llama_token> & prompt_tokens) {
         diffusion_request rq = request_from_body(body, srv, default_seed);
+        rq.prompt_cache_scope = prompt_cache_scope_from_request(http_request);
         srv.metrics.n_processing.fetch_add(1);
         std::unique_lock<std::mutex> lock(srv.gen_mutex);
         diffusion_result r = srv.generate(prompt_tokens, rq);
@@ -1106,7 +1204,7 @@ int main(int argc, char ** argv) {
         const std::vector<llama_token> prompt_tokens = common_tokenize(srv.vocab, prompt, true, true);
         const bool stream = body.value("stream", false);
 
-        const diffusion_result r = run_for_body(body, prompt_tokens);
+        const diffusion_result r = run_for_body(req, body, prompt_tokens);
         if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
 
         if (!stream) {
@@ -1158,7 +1256,7 @@ int main(int argc, char ** argv) {
         const std::string prompt = body["prompt"].get<std::string>();
         const std::vector<llama_token> prompt_tokens = common_tokenize(srv.vocab, prompt, true, true);
 
-        const diffusion_result r = run_for_body(body, prompt_tokens);
+        const diffusion_result r = run_for_body(req, body, prompt_tokens);
         if (!r.ok) { res.status = 500; res.set_content(error_json(r.error, "server_error", 500).dump(), "application/json"); return; }
         json out{
             {"id", gen_id("cmpl")}, {"object", "text_completion"}, {"created", (int64_t) std::time(nullptr)}, {"model", srv.model_id},
