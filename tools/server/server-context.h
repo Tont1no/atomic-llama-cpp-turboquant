@@ -128,6 +128,7 @@ struct server_routes {
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
+    server_http_context::handler_t get_benchmark_evidence;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;
@@ -157,6 +158,8 @@ struct server_routes {
     json get_model_info() const;
 
 private:
+    bool benchmark_evidence_enabled = false;
+
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
             server_task_type type,

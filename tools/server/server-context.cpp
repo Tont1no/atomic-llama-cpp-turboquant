@@ -22,8 +22,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
+#include <deque>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <filesystem>
 #include <utility>
 #include <unordered_map>
@@ -41,6 +44,61 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static std::mutex benchmark_evidence_mutex;
+static std::deque<json> benchmark_evidence_records;
+static uint64_t benchmark_evidence_sequence = 0;
+
+static bool benchmark_evidence_is_enabled() {
+    const char * enabled = std::getenv("AI_LOADER_QWEN_BENCHMARK_EVIDENCE");
+    return enabled != nullptr && std::string(enabled) == "1";
+}
+
+static void benchmark_evidence_admit(
+        int id_task,
+        int id_slot,
+        const std::string & completion_id,
+        int prompt_tokens,
+        int64_t started_at_us) {
+    if (!benchmark_evidence_is_enabled() || completion_id.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(benchmark_evidence_mutex);
+    benchmark_evidence_records.push_back({
+        {"sequence", ++benchmark_evidence_sequence},
+        {"completion_id", completion_id},
+        {"id_task", id_task},
+        {"id_slot", id_slot},
+        {"started_at_us", started_at_us},
+        {"finished_at_us", 0},
+        {"prompt_tokens", prompt_tokens},
+        {"cache_reused_tokens", -1},
+        {"generated_tokens", -1},
+    });
+    while (benchmark_evidence_records.size() > 64) {
+        benchmark_evidence_records.pop_front();
+    }
+}
+
+static void benchmark_evidence_complete(
+        int id_task,
+        int64_t finished_at_us,
+        int cache_reused_tokens,
+        int generated_tokens) {
+    if (!benchmark_evidence_is_enabled()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(benchmark_evidence_mutex);
+    for (auto it = benchmark_evidence_records.rbegin();
+            it != benchmark_evidence_records.rend(); ++it) {
+        if ((*it)["id_task"].get<int>() == id_task) {
+            (*it)["finished_at_us"] = finished_at_us;
+            (*it)["cache_reused_tokens"] = cache_reused_tokens;
+            (*it)["generated_tokens"] = generated_tokens;
+            return;
+        }
+    }
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -2217,6 +2275,12 @@ private:
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
         res->n_tokens_cached       = slot.prompt.n_tokens();
+        const int64_t benchmark_finished_at_us = ggml_time_us();
+        benchmark_evidence_complete(
+            res->id,
+            benchmark_finished_at_us,
+            res->n_prompt_tokens_cache,
+            res->n_decoded);
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
@@ -3165,6 +3229,12 @@ private:
                         slot.t_start_generation = 0;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+                        benchmark_evidence_admit(
+                            slot.task->id,
+                            slot.id,
+                            slot.task->params.oaicompat_cmpl_id,
+                            slot.task->n_tokens(),
+                            slot.t_start_process_prompt);
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4418,6 +4488,7 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
+    benchmark_evidence_enabled = benchmark_evidence_is_enabled();
     init_routes();
 }
 
@@ -4540,6 +4611,23 @@ void server_routes::init_routes() {
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;
         res->data = prometheus.str();
+        return res;
+    };
+
+    this->get_benchmark_evidence = [this](const server_http_req &) {
+        auto res = create_response(true);
+        if (!benchmark_evidence_enabled) {
+            res->error(format_error_response(
+                "Benchmark evidence is disabled",
+                ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(benchmark_evidence_mutex);
+        res->ok({
+            {"schema", "ai-loader-llama-benchmark-evidence/v1"},
+            {"latest_sequence", benchmark_evidence_sequence},
+            {"records", benchmark_evidence_records},
+        });
         return res;
     };
 
