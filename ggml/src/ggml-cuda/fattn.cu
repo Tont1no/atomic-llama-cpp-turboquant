@@ -433,6 +433,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
+    // An explicitly enabled Turbo4 ncols2 experiment owns every multi-column
+    // Turbo4 request. Reject unsupported head sizes before any generic
+    // Flash-Attention support check can return NONE and silently fall back.
+    if (ggml_cuda_info().turbo4_sym_lut_ncols2_enabled &&
+        K->type == GGML_TYPE_TURBO4_0 && Q->ne[1] > 1 &&
+        !ggml_turbo4_sym_lut_ncols2_head_size_supported(Q->ne[0])) {
+        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 reached unsupported Turbo4 head size %lld",
+                   (long long) Q->ne[0]);
+    }
+
     switch (K->ne[0]) {
         case  40:
         case  64:
@@ -541,13 +551,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
-
-    if (ggml_cuda_info().turbo4_sym_lut_ncols2_enabled &&
-        K->type == GGML_TYPE_TURBO4_0 && Q->ne[1] > 1 &&
-        !ggml_turbo4_sym_lut_ncols2_head_size_supported(Q->ne[0])) {
-        GGML_ABORT("GGML_CUDA_TURBO4_SYM_LUT_NCOLS2=1 reached unsupported Turbo4 head size %lld",
-                   (long long) Q->ne[0]);
-    }
 
 #ifdef GGML_USE_HIP
     // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate large f16 temp buffers for

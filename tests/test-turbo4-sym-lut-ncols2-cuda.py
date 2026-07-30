@@ -132,7 +132,9 @@ def run_parity(binary: str, device_uuid: str, enabled: bool) -> None:
             )
 
 
-def run_unsupported_head_rejection(binary: str, device_uuid: str) -> None:
+def run_unsupported_head_rejection(
+    binary: str, device_uuid: str, head_size: int, params_filter: str
+) -> None:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = device_uuid
     env["GGML_CUDA_TURBO4_SYM_LUT"] = "0"
@@ -147,7 +149,7 @@ def run_unsupported_head_rejection(binary: str, device_uuid: str) -> None:
             "-b",
             "CUDA0",
             "-p",
-            r"hsk=64.*nb=2.*type_K=turbo4",
+            params_filter,
             "-j",
             "1",
         ],
@@ -159,11 +161,17 @@ def run_unsupported_head_rejection(binary: str, device_uuid: str) -> None:
     output = result.stdout + result.stderr
     sys.stdout.write(output)
     if result.returncode == 0:
-        raise RuntimeError("unsupported Turbo4 D=64 request silently succeeded with the ncols=2 experiment enabled")
-    if "reached unsupported Turbo4 head size 64" not in output:
-        raise RuntimeError("unsupported Turbo4 D=64 request failed without the fail-closed shape diagnostic")
+        raise RuntimeError(
+            f"unsupported Turbo4 D={head_size} request silently succeeded with the ncols=2 experiment enabled"
+        )
+    if f"reached unsupported Turbo4 head size {head_size}" not in output:
+        raise RuntimeError(
+            f"unsupported Turbo4 D={head_size} request failed without the fail-closed shape diagnostic"
+        )
     if KERNEL_HIT_PATTERN.search(output):
-        raise RuntimeError("unsupported Turbo4 D=64 request reached the candidate kernel before rejection")
+        raise RuntimeError(
+            f"unsupported Turbo4 D={head_size} request reached the candidate kernel before rejection"
+        )
 
 
 def run_single_column_non_candidate(binary: str, device_uuid: str) -> None:
@@ -257,13 +265,24 @@ def main() -> int:
     run_parity(args.backend_ops, device_uuid, enabled=False)
     run_parity(args.backend_ops, device_uuid, enabled=True)
     run_single_column_non_candidate(args.backend_ops, device_uuid)
-    run_unsupported_head_rejection(args.backend_ops, device_uuid)
+    run_unsupported_head_rejection(
+        args.backend_ops,
+        device_uuid,
+        384,
+        r"hsk=384.*nr23=\[1,1\].*nb=2.*type_K=turbo4",
+    )
+    run_unsupported_head_rejection(
+        args.backend_ops,
+        device_uuid,
+        512,
+        r"hsk=512.*nr23=\[2,1\].*nb=2.*type_K=turbo4",
+    )
     run_mixed_visible_device_rejection(args.backend_ops, devices, device_uuid)
     print(
         "PASS: SM89 Turbo4 ncols=2 baseline and opt-in each matched the CPU reference in 16/16 cases; "
         "all opt-in cases emitted exact kernel-hit evidence, including four real nb=3 odd tails; "
         "N=1 remained outside the ncols2 candidate while N=2/N=4/N=8 were covered explicitly; "
-        "unsupported D=64 rejected fail-closed"
+        "unsupported D=384/D=512 rejected fail-closed"
     )
     return 0
 
