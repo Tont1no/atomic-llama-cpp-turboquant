@@ -220,6 +220,36 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_test(
         test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-rs3-full
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf" --full-restore-only --test-rs-seq 3
+    )
+    set_tests_properties(test-recurrent-state-rollback-rs3-full PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-rs3-full-f16
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf" --full-restore-only --test-rs-seq 3 --recurrent-cache-type f16
+    )
+    set_tests_properties(test-recurrent-state-rollback-rs3-full-f16 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    add_test(
+        NAME test-recurrent-state-rollback-invalid-rs2
+        COMMAND ${CMAKE_COMMAND}
+            "-DTEST_EXE=$<TARGET_FILE:test-recurrent-state-rollback>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/test-recurrent-state-rollback-invalid-rs2.cmake"
+    )
+    set_tests_properties(test-recurrent-state-rollback-invalid-rs2 PROPERTIES
+        LABELS main
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
         NAME test-recurrent-state-rollback-nemotron-h
         LABEL main
         ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"

@@ -3,20 +3,79 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <string>
 #include <vector>
 
-static llama_context * make_ctx(const common_params & params, llama_model * model) {
+#ifdef _WIN32
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#    include <shellapi.h>
+#endif
+
+constexpr uint32_t TEST_RS_SEQ_MIN = 3;
+constexpr uint32_t TEST_RS_SEQ_MAX = (uint32_t) std::numeric_limits<int32_t>::max() - 1;
+
+#ifdef _WIN32
+struct test_utf8_argv {
+    std::vector<std::string> buf;
+    std::vector<char *> ptrs;
+};
+
+static test_utf8_argv make_test_utf8_argv() {
+    test_utf8_argv out;
+    int wargc = 0;
+    LPWSTR * wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == nullptr) {
+        return out;
+    }
+
+    out.buf.reserve(wargc);
+    for (int i = 0; i < wargc; ++i) {
+        const int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 0) {
+            out.buf.emplace_back();
+            continue;
+        }
+        auto & s = out.buf.emplace_back();
+        s.resize((size_t) n - 1);
+        (void) WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), n, nullptr, nullptr);
+    }
+    LocalFree(wargv);
+
+    out.ptrs.reserve(out.buf.size());
+    for (auto & s : out.buf) {
+        out.ptrs.push_back(s.data());
+    }
+    return out;
+}
+#endif
+
+static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t test_rs_seq) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = 1;
-    cparams.n_rs_seq  = 8;
+    cparams.n_rs_seq  = test_rs_seq;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
     return llama_init_from_model_with_recurrent_cache_type(
             model, cparams, common_params_get_recurrent_cache_type(params));
+}
+
+static void print_test_usage(int, char **) {
+    fprintf(stderr, "\nrecurrent rollback test options:\n");
+    fprintf(stderr, "  --full-restore-only  test the valid full-checkpoint paths and skip the second rollback\n");
+    fprintf(stderr, "  --test-rs-seq N      recurrent snapshot count for test contexts (range: %u-%u, default: 8)\n",
+            TEST_RS_SEQ_MIN, TEST_RS_SEQ_MAX);
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -40,16 +99,44 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+#ifdef _WIN32
+    auto utf8_argv = make_test_utf8_argv();
+    if ((int) utf8_argv.ptrs.size() == argc) {
+        argv = utf8_argv.ptrs.data();
+    }
+#endif
+
     // The complete test also exercises a second rollback/replay cycle. Some
     // architectures currently fail that independent baseline behavior. Keep a
     // narrow mode for validating one rollback plus a full checkpoint roundtrip.
     bool full_restore_only = false;
+    uint32_t test_rs_seq = 8;
     std::vector<char *> common_argv;
     common_argv.reserve(argc);
     common_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--full-restore-only") == 0) {
             full_restore_only = true;
+        } else if (strcmp(argv[i], "--test-rs-seq") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "error: --test-rs-seq requires a value\n");
+                return 1;
+            }
+
+            const char * value_arg = argv[i];
+            const bool all_digits = value_arg[0] != '\0' && std::all_of(
+                    value_arg, value_arg + strlen(value_arg),
+                    [](unsigned char c) { return std::isdigit(c) != 0; });
+            char * end = nullptr;
+            errno = 0;
+            const unsigned long value = strtoul(value_arg, &end, 10);
+            if (!all_digits || errno != 0 || end == value_arg || *end != '\0' ||
+                value < TEST_RS_SEQ_MIN || value > TEST_RS_SEQ_MAX) {
+                fprintf(stderr, "error: --test-rs-seq must be an integer in [3, %u]\n",
+                        TEST_RS_SEQ_MAX);
+                return 1;
+            }
+            test_rs_seq = (uint32_t) value;
         } else {
             common_argv.push_back(argv[i]);
         }
@@ -61,13 +148,14 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse((int) common_argv.size(), common_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse(
+                (int) common_argv.size(), common_argv.data(), params, LLAMA_EXAMPLE_COMMON, print_test_usage)) {
         return 1;
     }
 
     ggml_backend_load_all();
 
-    common_init_result_ptr llama_init = common_init_from_params(params);
+    common_init_result_ptr llama_init = common_init_from_params(params, true);
     llama_model * model = llama_init->model();
     if (model == nullptr) {
         fprintf(stderr, "%s : failed to init model\n", __func__);
@@ -82,8 +170,8 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
-    llama_context * ctx_src = make_ctx(params, model);
-    llama_context * ctx_dst = make_ctx(params, model);
+    llama_context * ctx_src = make_ctx(params, model, test_rs_seq);
+    llama_context * ctx_dst = make_ctx(params, model, test_rs_seq);
     if (ctx_src == nullptr || ctx_dst == nullptr) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
@@ -180,10 +268,17 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // The narrow GPU gate no longer needs the fresh destination. Release it
+    // before allocating the dirty destination so at most two contexts coexist.
+    if (full_restore_only) {
+        llama_free(ctx_dst);
+        ctx_dst = nullptr;
+    }
+
     // Repeat the load into a context that already has its own rollback state:
     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
     // non-zero at load time. The restore must wipe that state and still match.
-    llama_context * ctx_dirty = make_ctx(params, model);
+    llama_context * ctx_dirty = make_ctx(params, model, test_rs_seq);
     if (ctx_dirty == nullptr) {
         fprintf(stderr, "%s : failed to init dirty ctx\n", __func__);
         return 1;
@@ -234,7 +329,6 @@ int main(int argc, char ** argv) {
     if (full_restore_only) {
         fprintf(stderr, "%s : recurrent full rollback checkpoint restored successfully\n", __func__);
         llama_free(ctx_src);
-        llama_free(ctx_dst);
         return 0;
     }
 
