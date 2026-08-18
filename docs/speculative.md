@@ -110,6 +110,42 @@ See:
 
 - #25173
 
+#### Adaptive DFlash/DSpark proposal length (server)
+
+`llama-server` can choose a smaller proposal block as concurrent generation load rises. This is
+opt-in; without `--spec-draft-adaptive`, fixed-depth behavior is unchanged.
+The adaptive server path requires exactly one configured speculative type,
+`draft-dflash` or `draft-dspark`; mixed speculative chains keep fixed-depth behavior.
+
+```bash
+llama-server ... --spec-type draft-dspark --spec-draft-n-max 7 \
+    --spec-draft-adaptive \
+    --spec-draft-load-caps 7,3,2,1,1,1,1,0
+```
+
+The load-cap list maps one active generating slot to its first entry, two slots to its second,
+and so on; the final entry is reused at higher loads. The initial safe arms are `0,1,2,3,7`.
+A selected zero permanently disables DFlash/DSpark maintenance for the rest of that request and
+falls back to normal target decoding. On release, the server clears that slot's asymmetric
+target/draft state before a later request starts enabled again; it never saves the asymmetric
+state as a reusable prompt-cache entry.
+The server passes the selected bound into DFlash/DSpark before their block decode, so shorter
+per-sequence bounds avoid computing a full block merely to truncate it later.
+
+Acceptance feedback is optional. Enable it by setting a nonzero EMA weight, for example:
+
+```bash
+--spec-draft-acceptance-ema 0.20 \
+--spec-draft-acceptance-threshold 0.55 \
+--spec-draft-acceptance-warmup 8
+```
+
+After warm-up, the scheduler only keeps an arm when every sufficiently observed position in
+that arm meets the prefix-acceptance threshold. Invalid runtime state and invalid cap tables
+fail closed to a zero-token proposal. `/metrics` exposes offered and accepted counters per
+position plus adaptive proposal-length choice counters; these denominators remain correct when
+different sequences use different proposal lengths.
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -234,6 +270,22 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-adaptive, --no-spec-draft-adaptive
+                                        adapt DFlash/DSpark proposal length to active server load (default: disabled)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_ADAPTIVE)
+--spec-draft-load-caps                  N1,N2,...
+                                        adaptive proposal cap per active generating-slot count
+                                        (default: 7,3,2,1,1,1,1,0)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_LOAD_CAPS)
+--spec-draft-acceptance-ema             ALPHA
+                                        EMA weight for new acceptance samples; 0 disables (default: 0.00)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_EMA)
+--spec-draft-acceptance-threshold       P
+                                        minimum warmed-up per-position EMA (default: 0.55)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_THRESHOLD)
+--spec-draft-acceptance-warmup          N
+                                        offers before a position can reduce depth (default: 8)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_WARMUP)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

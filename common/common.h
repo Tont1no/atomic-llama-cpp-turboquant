@@ -325,6 +325,17 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // Server-side adaptive draft length. Disabled by default so existing command lines
+    // retain their exact fixed-depth behavior. Each load-cap entry applies to the
+    // corresponding active generating-slot count (1-based); the last entry is reused
+    // for larger loads. Values are deliberately restricted to the low-risk arms
+    // supported by the first scheduler implementation.
+    bool adaptive = false;
+    std::vector<int32_t> adaptive_load_caps = { 7, 3, 2, 1, 1, 1, 1, 0 };
+    float adaptive_ema_alpha     = 0.0f; // 0 disables acceptance-based adaptation
+    float adaptive_ema_threshold = 0.55f;
+    uint32_t adaptive_ema_warmup = 8;
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

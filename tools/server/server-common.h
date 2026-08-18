@@ -467,7 +467,9 @@ struct server_metrics {
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
+    std::vector<uint64_t> n_drafted_per_pos;  // Offered tokens per draft position
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
+    std::vector<uint64_t> n_adaptive_draft_choices; // Adaptive selections, indexed by proposal length
 
     void init() {
         t_start = ggml_time_us();
