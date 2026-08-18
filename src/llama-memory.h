@@ -82,6 +82,17 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
+    // Prepare storage whose shape depends on the incoming logical batch.
+    // This runs between decode ticks, before scheduler reservation and before
+    // init_batch() mutates cache metadata. Most memory implementations have a
+    // fixed layout and need no work here.
+    virtual bool prepare_batch(
+            llama_context *,
+            const llama_batch &,
+            bool) {
+        return true;
+    }
+
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result
