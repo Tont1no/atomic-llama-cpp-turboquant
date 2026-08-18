@@ -910,6 +910,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
+    llama_batch batch_device; // metadata-only batch for device-resident target features
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -928,6 +929,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+
+    bool device_fastpath_reported = false;
+    bool device_fallback_reported = false;
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -979,6 +983,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        batch_device = llama_batch_init(llama_n_batch(ctx_dft), n_embd_enc, n_seq);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1009,6 +1014,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
+        llama_set_embeddings_layer_inp_device(ctx_tgt, true);
 
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
@@ -1029,6 +1035,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+        llama_batch_free(batch_device);
+
+        if (params.ctx_tgt) {
+            llama_set_embeddings_layer_inp_device(params.ctx_tgt, false);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1086,6 +1097,47 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        // Safe generation fast path: one logical ubatch and token input. The
+        // context API uses the retained target ubatch order for both features
+        // and KV metadata, and verifies shape and CUDA device identity.
+        bool device_candidate = has_tokens && n_tokens <= n_ubatch &&
+                n_tokens <= (int32_t) llama_n_ubatch(ctx_tgt) &&
+                batch_in.pos && batch_in.n_seq_id && batch_in.seq_id;
+
+        if (device_candidate) {
+            batch_device.n_tokens = n_tokens;
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                if (batch_in.n_seq_id[i] != 1) {
+                    device_candidate = false;
+                    break;
+                }
+                batch_device.pos[i]       = batch_in.pos[i];
+                batch_device.n_seq_id[i]  = 1;
+                batch_device.seq_id[i][0] = batch_in.seq_id[i][0];
+                batch_device.logits[i]    = false;
+            }
+        }
+
+        if (device_candidate) {
+            int32_t rc = 0;
+            if (llama_decode_dflash_features(ctx_dft, ctx_tgt, batch_device, &rc)) {
+                if (rc != 0) {
+                    LOG_ERR("%s: device-resident DFlash injection failed rc=%d (n_tokens=%d)\n",
+                            __func__, rc, n_tokens);
+                    return false;
+                }
+                if (!device_fastpath_reported) {
+                    LOG_INF("%s: device-resident DFlash feature injection active\n", __func__);
+                    device_fastpath_reported = true;
+                }
+                return true;
+            }
+            if (!device_fallback_reported) {
+                LOG_INF("%s: device-resident DFlash injection unavailable; using host fallback\n", __func__);
+                device_fallback_reported = true;
+            }
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
