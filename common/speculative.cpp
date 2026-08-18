@@ -932,6 +932,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    // scratch row map used by the multi-sequence DFlash injection fast path
+    std::vector<int32_t> inject_rows;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1067,6 +1070,95 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        bool all_rows_need_logits = true;
+        for (int32_t k = 0; k < n_tokens; ++k) {
+            all_rows_need_logits = all_rows_need_logits && batch_in.logits[k] != 0;
+        }
+
+        // Generation batches are small enough to project and inject all active
+        // sequences together. The DFlash encoder is row-independent and the
+        // injection graph already takes a position and sequence id per row, so
+        // preserving the input row order is sufficient for sequence isolation.
+        // This replaces up to 2*n_seq graph submissions with one encode and one
+        // decode. Prompt and mixed batches retain the established per-sequence
+        // path so this optimization remains scoped to speculative verification.
+        if (all_rows_need_logits && n_tokens <= n_ubatch) {
+            inject_rows.clear();
+            inject_rows.reserve(n_tokens);
+
+            for (int32_t k = 0; k < n_tokens; ++k) {
+                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
+                const llama_seq_id seq_id = batch_in.seq_id[k][0];
+                if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+                    inject_rows.push_back(k);
+                }
+            }
+
+            const int32_t n_rows = (int32_t) inject_rows.size();
+            if (n_rows == 0) {
+                return true;
+            }
+
+            features_buf.resize((size_t) n_rows * n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+
+                for (int32_t i = 0; i < n_rows; ++i) {
+                    float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) inject_rows[i] * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_rows,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ features_buf.data(),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc = llama_encode(ctx_dft, enc_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: batched llama_encode(ctx_dft) failed rc=%d (n_tokens=%d)\n",
+                        __func__, rc, (int) n_rows);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            batch_inject.n_tokens = n_rows;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_rows * n_embd_dec * sizeof(float));
+
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const int32_t row = inject_rows[i];
+                batch_inject.pos[i]       = batch_in.pos[row];
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = batch_in.seq_id[row][0];
+                batch_inject.logits[i]    = false;
+            }
+
+            rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: batched llama_decode(ctx_dft) failed rc=%d (n_tokens=%d)\n",
+                        __func__, rc, (int) n_rows);
+                return false;
+            }
+
+            return true;
+        }
+
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
@@ -1081,11 +1173,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 i_batch_beg[seq_id] = k;
             }
         }
-
-        auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
-
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
