@@ -80,6 +80,7 @@ static bool decode_ragged_and_compare(
     }
     llama_batch_free(batch);
     const size_t bytes_depth_three = context_memory_bytes(ctx_batched);
+    const bool uses_compact_storage = bytes_depth_three > bytes_depth_zero;
 
     constexpr float eps = 1e-5f;
     const auto compare_outputs = [&](
@@ -108,7 +109,8 @@ static bool decode_ragged_and_compare(
     }
 
     // Follow the 1/2/4-row ragged batch with one row per sequence. This forces
-    // active depth 3 -> 0 while preserving the full max-sized allocation.
+    // active depth 3 -> 0 immediately while physical shrink is deferred.
+    llama_set_recurrent_load_hint(ctx_batched, 3);
     llama_batch one_each = llama_batch_init(3, 0, 3);
     for (llama_seq_id seq = 0; seq < 3; ++seq) {
         const llama_token token = (llama_token) ((8 + seq) % n_vocab);
@@ -127,8 +129,58 @@ static bool decode_ragged_and_compare(
     }
     llama_batch_free(one_each);
 
+    if (!compare_outputs("depth-zero-first", { 0, 1, 2 }, { 0, 0, 0 })) {
+        return false;
+    }
+    const llama_recurrent_resize_stats pending_first = llama_get_recurrent_resize_stats(ctx_batched);
+    if (uses_compact_storage && (context_memory_bytes(ctx_batched) != bytes_depth_three ||
+            pending_first.resident_depth != 3 || pending_first.pending_depth != 0 ||
+            pending_first.stable_ticks != 1)) {
+        fprintf(stderr, "%s : first low-depth epoch did not defer shrink\n", __func__);
+        return false;
+    }
+
+    // A second decode chunk in the same scheduling epoch must not satisfy the
+    // hysteresis dwell by itself.
+    llama_batch same_epoch = llama_batch_init(3, 0, 3);
+    for (llama_seq_id seq = 0; seq < 3; ++seq) {
+        const llama_token token = (llama_token) ((11 + seq) % n_vocab);
+        const llama_pos pos = (llama_pos) rows[seq].size() + 1;
+        common_batch_add(same_epoch, token, pos, { seq }, true);
+        if (!decode_one(ctx_ref[seq], token, pos)) {
+            llama_batch_free(same_epoch);
+            return false;
+        }
+    }
+    if (llama_decode(ctx_batched, same_epoch) != 0) {
+        llama_batch_free(same_epoch);
+        return false;
+    }
+    llama_batch_free(same_epoch);
+    if (uses_compact_storage && context_memory_bytes(ctx_batched) != bytes_depth_three) {
+        fprintf(stderr, "%s : repeated chunk in one epoch shrank storage early\n", __func__);
+        return false;
+    }
+
+    // The next stable scheduling epoch performs the single coalesced shrink.
+    llama_set_recurrent_load_hint(ctx_batched, 3);
+    llama_batch next_epoch = llama_batch_init(3, 0, 3);
+    for (llama_seq_id seq = 0; seq < 3; ++seq) {
+        const llama_token token = (llama_token) ((14 + seq) % n_vocab);
+        const llama_pos pos = (llama_pos) rows[seq].size() + 2;
+        common_batch_add(next_epoch, token, pos, { seq }, true);
+        if (!decode_one(ctx_ref[seq], token, pos)) {
+            llama_batch_free(next_epoch);
+            return false;
+        }
+    }
+    if (llama_decode(ctx_batched, next_epoch) != 0) {
+        llama_batch_free(next_epoch);
+        return false;
+    }
+    llama_batch_free(next_epoch);
+
     const size_t bytes_depth_zero_again = context_memory_bytes(ctx_batched);
-    const bool uses_compact_storage = bytes_depth_three > bytes_depth_zero;
     if (uses_compact_storage && bytes_depth_zero_again != bytes_depth_zero) {
         fprintf(stderr, "%s : compact recurrent storage did not return to depth-zero size (%zu != %zu)\n",
                 __func__, bytes_depth_zero_again, bytes_depth_zero);
@@ -139,7 +191,15 @@ static bool decode_ragged_and_compare(
                 __func__, bytes_depth_zero, bytes_depth_three, bytes_depth_zero_again);
     }
 
-    bool ok = compare_outputs("depth-zero", { 0, 1, 2 }, { 0, 0, 0 });
+    bool ok = compare_outputs("depth-zero-final", { 0, 1, 2 }, { 0, 0, 0 });
+    const llama_recurrent_resize_stats final_stats = llama_get_recurrent_resize_stats(ctx_batched);
+    if (ok && uses_compact_storage && (final_stats.count != 2 || final_stats.resident_depth != 0 ||
+            final_stats.pending_depth != UINT32_MAX)) {
+        fprintf(stderr, "%s : unexpected resize telemetry count=%llu resident=%u pending=%u\n",
+                __func__, (unsigned long long) final_stats.count,
+                final_stats.resident_depth, final_stats.pending_depth);
+        ok = false;
+    }
     if (ok && llama_memory_seq_rm(llama_get_memory(ctx_batched), 2, 4, -1)) {
         fprintf(stderr, "%s : depth-zero graph incorrectly allowed rollback into a stale snapshot plane\n", __func__);
         ok = false;
@@ -241,6 +301,30 @@ static bool decode_multi_rollback_shrink(
     }
     llama_batch_free(replay);
 
+    if (!compare_last_logits("multi rollback seq0", ctx, 0, refs[0], n_vocab) ||
+            !compare_last_logits("multi rollback seq1", ctx, 1, refs[1], n_vocab)) {
+        return false;
+    }
+    if (context_memory_bytes(ctx) == bytes_depth_zero) {
+        fprintf(stderr, "%s : first cap0 tick shrank before hysteresis dwell\n", __func__);
+        return false;
+    }
+
+    llama_batch settle = llama_batch_init(2, 0, 2);
+    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+        const llama_token token = (llama_token) ((tokens[seq][rollback_pos] + 5) % n_vocab);
+        common_batch_add(settle, token, rollback_pos + 1, { seq }, true);
+        if (!decode_one(refs[seq], token, rollback_pos + 1)) {
+            llama_batch_free(settle);
+            return false;
+        }
+    }
+    if (llama_decode(ctx, settle) != 0) {
+        llama_batch_free(settle);
+        return false;
+    }
+    llama_batch_free(settle);
+
     const size_t bytes_depth_zero_again = context_memory_bytes(ctx);
     const bool ok = compare_last_logits("multi rollback seq0", ctx, 0, refs[0], n_vocab) &&
                     compare_last_logits("multi rollback seq1", ctx, 1, refs[1], n_vocab) &&
@@ -312,8 +396,8 @@ static bool decode_shared_rollback_shrink(
         return false;
     }
 
-    // A second cap0 tick has no pending index and can return to the one-plane
-    // allocation without changing either independently split state.
+    // A second cap0 tick has no pending index and arms the lower shrink target
+    // without changing either independently split state.
     llama_batch second = llama_batch_init(2, 0, 2);
     const llama_token rollback_next = (llama_token) ((tokens[rollback_pos] + 3) % n_vocab);
     const llama_token sibling_next  = (llama_token) ((sibling_token + 3) % n_vocab);
@@ -327,6 +411,28 @@ static bool decode_shared_rollback_shrink(
         return false;
     }
     llama_batch_free(second);
+    if (!compare_last_logits("shared second seq0", ctx, 0, ref_rollback, n_vocab) ||
+            !compare_last_logits("shared second seq1", ctx, 1, ref_sibling, n_vocab)) {
+        return false;
+    }
+    if (context_memory_bytes(ctx) <= bytes_depth_zero) {
+        fprintf(stderr, "%s : changed shrink target did not restart dwell\n", __func__);
+        return false;
+    }
+
+    llama_batch third = llama_batch_init(2, 0, 2);
+    const llama_token rollback_final = (llama_token) ((rollback_next + 3) % n_vocab);
+    const llama_token sibling_final  = (llama_token) ((sibling_next + 3) % n_vocab);
+    common_batch_add(third, rollback_final, rollback_pos + 2, { 0 }, true);
+    common_batch_add(third, sibling_final, count + 2, { 1 }, true);
+    if (!decode_one(ref_rollback, rollback_final, rollback_pos + 2) ||
+            !decode_one(ref_sibling, sibling_final, count + 2) ||
+            llama_decode(ctx, third) != 0) {
+        fprintf(stderr, "%s : third cap0 decode failed\n", __func__);
+        llama_batch_free(third);
+        return false;
+    }
+    llama_batch_free(third);
     const size_t bytes_depth_zero_again = context_memory_bytes(ctx);
     const bool ok = compare_last_logits("shared shrink seq0", ctx, 0, ref_rollback, n_vocab) &&
                     compare_last_logits("shared shrink seq1", ctx, 1, ref_sibling, n_vocab) &&

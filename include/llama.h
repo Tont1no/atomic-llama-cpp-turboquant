@@ -565,6 +565,21 @@ extern "C" {
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
+    struct llama_recurrent_resize_stats {
+        uint64_t count;
+        uint64_t time_us;
+        uint32_t resident_depth;
+        uint32_t configured_depth;
+        uint32_t pending_depth;  // UINT32_MAX when no shrink is pending
+        uint32_t stable_ticks;
+        uint32_t required_depth;
+    };
+
+    // Telemetry and an advisory logical-scheduling epoch for dynamic recurrent
+    // snapshot storage. The load hint may delay shrink but never caps growth.
+    LLAMA_API struct llama_recurrent_resize_stats llama_get_recurrent_resize_stats(const struct llama_context * ctx);
+    LLAMA_API void llama_set_recurrent_load_hint(struct llama_context * ctx, uint32_t load);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");

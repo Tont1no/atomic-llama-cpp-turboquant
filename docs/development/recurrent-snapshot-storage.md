@@ -10,9 +10,13 @@ existing plane-major addressing:
 row = plane * n_seq_max + cell
 ```
 
-Only `1 + max_active_depth` planes are resident. A cap-zero context therefore
-owns exactly the baseline recurrent state plane. Storage changes only at the
-start of a logical decode batch:
+Only `1 + max_active_depth` planes are resident once a shrink settles. A
+cap-zero context therefore owns exactly the baseline recurrent state plane.
+Logical execution depth changes immediately, while physical shrink requires
+the same safe target in two distinct server scheduling epochs. Target or load
+changes re-arm the dwell, so transient admission waves do not cause repeated
+20-70 ms reallocations. Required growth remains immediate and N1 startup does
+not wait. Storage changes only at the start of a logical decode batch:
 
 1. synchronize the scheduler;
 2. materialize a pending rollback plane into plane zero if the new allocation
@@ -26,6 +30,17 @@ Snapshots for sequences absent from a batch keep the allocation from
 shrinking below their last valid depth. Malformed metadata fails closed to the
 configured maximum. Non-Qwen and non-dynamic contexts retain the original
 fixed allocation.
+
+The server's adaptive load estimate includes every assigned non-idle slot and
+the inference-slot demand still queued for admission. Prompt, waiting-child,
+and newly started slots therefore contribute before they reach `GENERATING`.
+The load estimate selects the speculative cap and identifies scheduling
+epochs, but it never lowers the batch-derived correctness depth.
+
+Resize count, cumulative synchronized resize time, resident/required/pending
+depth, and stable-epoch count are available through
+`llama_get_recurrent_resize_stats()` and the `/metrics` recurrent snapshot
+series.
 
 This layout exactly serves the homogeneous server shapes used by DFlash
 (all active slots at cap 0, 1, 2, or 3). A mixed-depth batch still allocates

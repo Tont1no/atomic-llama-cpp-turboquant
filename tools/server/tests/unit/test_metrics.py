@@ -62,6 +62,8 @@ def test_metrics_prometheus_format():
         "llamacpp:spec_decode_num_draft_tokens_total",
         "llamacpp:spec_decode_num_accepted_tokens_total",
         "llamacpp:spec_decode_num_drafts_total",
+        "llamacpp:recurrent_snapshot_resizes_total",
+        "llamacpp:recurrent_snapshot_resize_seconds_total",
     ]
     expected_gauges = [
         "llamacpp:prompt_tokens_seconds",
@@ -69,6 +71,10 @@ def test_metrics_prometheus_format():
         "llamacpp:requests_processing",
         "llamacpp:requests_deferred",
         "llamacpp:n_busy_slots_per_decode",
+        "llamacpp:recurrent_snapshot_resident_depth",
+        "llamacpp:recurrent_snapshot_required_depth",
+        "llamacpp:recurrent_snapshot_pending_depth",
+        "llamacpp:recurrent_snapshot_shrink_stable_ticks",
     ]
 
     for name in expected_counters:

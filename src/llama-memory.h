@@ -27,6 +27,16 @@ struct llama_memory_params {
     llama_memory_t mem_other;
 };
 
+struct llama_memory_recurrent_resize_stats {
+    uint64_t count            = 0;
+    uint64_t time_us          = 0;
+    uint32_t resident_depth   = 0;
+    uint32_t configured_depth = 0;
+    uint32_t pending_depth    = UINT32_MAX;
+    uint32_t stable_ticks     = 0;
+    uint32_t required_depth   = 0;
+};
+
 enum llama_memory_status {
     LLAMA_MEMORY_STATUS_SUCCESS = 0,
     LLAMA_MEMORY_STATUS_NO_UPDATE,
@@ -128,6 +138,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    virtual llama_memory_recurrent_resize_stats recurrent_resize_stats() const {
+        return {};
+    }
 
     //
     // state write/read

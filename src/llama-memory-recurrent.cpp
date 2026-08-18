@@ -378,11 +378,54 @@ bool llama_memory_recurrent::prepare_batch(
         }
     }
     desired = std::min(desired, n_rs_seq);
+    rs_last_required_depth = desired;
+
+    const uint64_t hinted_epoch = lctx->get_recurrent_load_epoch();
+    const uint64_t observation_epoch = hinted_epoch != 0 ? hinted_epoch : ++rs_standalone_epoch;
+    const uint32_t observation_load = hinted_epoch != 0 ? lctx->get_recurrent_load_hint() : 0;
+
+    auto cancel_pending_shrink = [&]() {
+        rs_shrink_pending_depth = UINT32_MAX;
+        rs_shrink_pending_load  = UINT32_MAX;
+        rs_shrink_stable_ticks  = 0;
+        rs_shrink_last_epoch    = UINT64_MAX;
+    };
 
     if (desired == n_rs_seq_alloc) {
+        cancel_pending_shrink();
         return true;
     }
 
+    if (desired < n_rs_seq_alloc) {
+        if (rs_shrink_pending_depth != desired ||
+                (hinted_epoch != 0 && rs_shrink_pending_load != observation_load)) {
+            rs_shrink_pending_depth = desired;
+            rs_shrink_pending_load  = observation_load;
+            rs_shrink_stable_ticks  = 1;
+            rs_shrink_last_epoch    = observation_epoch;
+            LLAMA_LOG_DEBUG("%s: defer recurrent snapshot shrink %u -> %u (stable 1/%u)\n",
+                    __func__, n_rs_seq_alloc, desired, rs_shrink_dwell_ticks);
+            return true;
+        }
+
+        // A server scheduling epoch can contain multiple decode chunks and
+        // retries. They are one load observation, not multiple dwell ticks.
+        if (rs_shrink_last_epoch == observation_epoch) {
+            return true;
+        }
+        rs_shrink_last_epoch = observation_epoch;
+        rs_shrink_stable_ticks++;
+        if (rs_shrink_stable_ticks < rs_shrink_dwell_ticks) {
+            return true;
+        }
+    } else {
+        // A graph that genuinely needs more planes cannot be deferred. The
+        // server-side load estimate prevents speculative low-load growth while
+        // other assigned/queued requests are already known.
+        cancel_pending_shrink();
+    }
+
+    const int64_t resize_start_us = ggml_time_us();
     lctx->synchronize();
     if (!materialize_pending_rollbacks(desired)) {
         return false;
@@ -398,6 +441,10 @@ bool llama_memory_recurrent::prepare_batch(
                 __func__, old_depth, desired);
         return false;
     }
+
+    rs_resize_count++;
+    rs_resize_time_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - resize_start_us);
+    cancel_pending_shrink();
     // Plane removal happens before init_batch()/find_slot(). If later decode
     // preparation fails, a participating sequence must not retain a logical
     // rollback depth that is no longer physically resident.
@@ -451,6 +498,11 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+    rs_shrink_pending_depth = UINT32_MAX;
+    rs_shrink_pending_load  = UINT32_MAX;
+    rs_shrink_stable_ticks  = 0;
+    rs_shrink_last_epoch    = UINT64_MAX;
+    rs_last_required_depth  = 0;
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -763,6 +815,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
         ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
     }
     return ret;
+}
+
+llama_memory_recurrent_resize_stats llama_memory_recurrent::recurrent_resize_stats() const {
+    llama_memory_recurrent_resize_stats result;
+    if (!rs_seq_compact) {
+        return result;
+    }
+    result.count            = rs_resize_count;
+    result.time_us          = rs_resize_time_us;
+    result.resident_depth   = n_rs_seq_alloc;
+    result.configured_depth = n_rs_seq;
+    result.pending_depth    = rs_shrink_pending_depth;
+    result.stable_ticks     = rs_shrink_stable_ticks;
+    result.required_depth   = rs_last_required_depth;
+    return result;
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

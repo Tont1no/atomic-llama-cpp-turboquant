@@ -2970,7 +2970,18 @@ private:
 
         const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
                 common_speculative_is_only_dflash_family(params_base.speculative.types);
-        const int32_t active_slots = (int32_t) generating.size();
+        int32_t assigned_slots = 0;
+        iterate(slots, [&](server_slot & slot) {
+            assigned_slots += slot.is_processing() ? 1 : 0;
+        });
+        const size_t queued_slot_demand = queue_tasks.queue_inference_slot_demand();
+        const int32_t estimated_load = std::max<int32_t>(
+                (int32_t) generating.size(),
+                std::min<int32_t>((int32_t) slots.size(),
+                        assigned_slots + (int32_t) std::min<size_t>(queued_slot_demand, slots.size())));
+        if (adaptive_dflash) {
+            llama_set_recurrent_load_hint(ctx_tgt, (uint32_t) estimated_load);
+        }
 
         for (server_slot * slot : generating) {
             if (!spec) {
@@ -3004,7 +3015,7 @@ private:
                 n_draft_max = slot->spec_adaptive_disabled ? 0 :
                         common_speculative_adaptive_n_max(
                             params_base.speculative.draft,
-                            active_slots,
+                            estimated_load,
                             hard_cap,
                             slot->spec_acceptance_ema,
                             slot->n_drafted_per_pos);
@@ -3014,8 +3025,8 @@ private:
                 }
                 slot->spec_adaptive_choices[n_draft_max]++;
 
-                SLT_DBG(*slot, "adaptive draft length: active_slots=%d hard_cap=%d selected=%d\n",
-                        active_slots, hard_cap, n_draft_max);
+                SLT_DBG(*slot, "adaptive draft length: generating=%zu assigned=%d queued=%zu estimated_load=%d hard_cap=%d selected=%d\n",
+                        generating.size(), assigned_slots, queued_slot_demand, estimated_load, hard_cap, n_draft_max);
 
                 if (n_draft_max == 0) {
                     if (!slot->spec_adaptive_disabled) {
@@ -4073,7 +4084,18 @@ private:
     //
 
     // call before submitting a decode, so that the queued prompt stats can be timed
+    void metrics_update_recurrent() {
+        const llama_recurrent_resize_stats rs_stats = llama_get_recurrent_resize_stats(ctx_tgt);
+        metrics.n_recurrent_resizes            = rs_stats.count;
+        metrics.t_recurrent_resize_us          = rs_stats.time_us;
+        metrics.recurrent_resident_depth       = rs_stats.resident_depth;
+        metrics.recurrent_required_depth       = rs_stats.required_depth;
+        metrics.recurrent_pending_depth        = rs_stats.pending_depth;
+        metrics.recurrent_shrink_stable_ticks  = rs_stats.stable_ticks;
+    }
+
     void metrics_pre_decode() {
+        metrics_update_recurrent();
         t_decode_start = ggml_time_us();
     }
 
@@ -4099,6 +4121,7 @@ private:
 
     // has_output is computed by the caller, which also already synchronized the context if it is set
     void metrics_post_decode(int32_t off, int32_t n_tokens, bool has_output) {
+        metrics_update_recurrent();
         metrics.n_decode++;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {

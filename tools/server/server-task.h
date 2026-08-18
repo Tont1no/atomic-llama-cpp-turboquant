@@ -29,6 +29,18 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
 };
 
+inline size_t server_inference_slot_demand(server_task_type type, size_t n_children) {
+    switch (type) {
+        case SERVER_TASK_TYPE_COMPLETION:
+        case SERVER_TASK_TYPE_EMBEDDING:
+        case SERVER_TASK_TYPE_RERANK:
+        case SERVER_TASK_TYPE_INFILL:
+            return 1 + n_children;
+        default:
+            return 0;
+    }
+}
+
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
 enum task_response_type {
     TASK_RESPONSE_TYPE_NONE, // llama.cpp native format
