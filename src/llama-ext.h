@@ -110,6 +110,18 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// Defer host extraction for single-ubatch decode batches so a DFlash context
+// can consume selected layer inputs directly on the same CUDA GPU.
+LLAMA_API void llama_set_embeddings_layer_inp_device(struct llama_context * ctx, bool value);
+
+// Fuse target features and inject the DFlash KV cache in one device graph.
+// Returns false when the guarded fast path is unsupported; ret then remains 0.
+LLAMA_API bool llama_decode_dflash_features(
+        struct llama_context * ctx_dft,
+        struct llama_context * ctx_tgt,
+            struct llama_batch batch,
+                       int32_t * ret);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);

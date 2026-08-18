@@ -115,6 +115,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_device(bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -142,6 +143,11 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    bool decode_dflash_features(
+            llama_context & ctx_tgt,
+        const llama_batch & batch_inp,
+                  int32_t & ret);
 
     //
     // state save/load
@@ -233,6 +239,7 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void materialize_layer_inputs_host();
 
     //
     // graph
@@ -303,6 +310,16 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    std::vector<bool> embd_layer_inp_host_ready;
+
+    bool embeddings_layer_inp_device = false;
+    bool embd_layer_inp_device_ready  = false;
+    bool defer_layer_inp_host         = false;
+
+    std::vector<ggml_tensor *> external_layer_inputs;
+    std::vector<llama_seq_id> device_layer_inp_seq_ids;
+    std::vector<llama_pos>    device_layer_inp_pos;
+    bool external_layer_inputs_rejected = false;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -377,6 +394,7 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    bool dflash_external_graph_reported = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

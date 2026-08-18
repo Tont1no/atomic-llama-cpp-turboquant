@@ -753,6 +753,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // Preallocated layer activations owned by another context. DFlash uses
+    // these as graph leaves to keep feature fusion and KV injection on-device.
+    std::vector<ggml_tensor *> external_layer_inputs;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -837,6 +841,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (external_layer_inputs != other.external_layer_inputs) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -869,6 +877,7 @@ public:
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+    const llama_ubatch & get_ubatch() const { return params.ubatch; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }

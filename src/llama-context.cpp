@@ -13,12 +13,14 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 //
 // llama_context
@@ -124,6 +126,7 @@ llama_context::llama_context(
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    embd_layer_inp_host_ready.resize(hparams.n_layer() + 1, false);
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -972,9 +975,19 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
 }
 
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
-    output_reorder();
-
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
+
+    if (!embd_layer_inp_host_ready[lid]) {
+        // Materialize every selected layer together. output_reorder() consumes
+        // its swap list once, so fetching only this layer first would leave
+        // subsequent layers in the retained target-ubatch order.
+        materialize_layer_inputs_host();
+        if (!embd_layer_inp_host_ready[lid]) {
+            return nullptr;
+        }
+    }
+
+    output_reorder();
 
     return embd_layer_inp[lid].data;
 }
@@ -1177,6 +1190,11 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_embeddings_layer_inp_device(bool enable) {
+    embeddings_layer_inp_device = enable;
+    embd_layer_inp_device_ready = false;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1363,6 +1381,76 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (!external_layer_inputs.empty()) {
+            std::vector<bool> imported(external_layer_inputs.size(), false);
+            bool source_reachable = false;
+            int n_leafs_reachable = 0;
+
+            auto inspect = [&](ggml_tensor * tensor) {
+                bool no_sources = true;
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    no_sources = no_sources && tensor->src[j] == nullptr;
+                }
+                const bool detached_leaf = tensor->op == GGML_OP_NONE && tensor->view_src == nullptr && no_sources;
+                n_leafs_reachable += detached_leaf;
+
+                for (size_t i = 0; i < external_layer_inputs.size(); ++i) {
+                    const ggml_tensor * source = external_layer_inputs[i];
+                    if (tensor == source) {
+                        source_reachable = true;
+                    }
+                    if (detached_leaf && tensor != source &&
+                            tensor->view_src == nullptr && tensor->buffer == source->buffer &&
+                            tensor->data == source->data && ggml_are_same_shape(tensor, source)) {
+                        imported[i] = true;
+                    }
+                }
+            };
+
+            // ggml_cgraph is opaque here. Walk every graph node and all of its
+            // sources instead of importing ggml's private leaf arrays. This
+            // also catches a raw target tensor anywhere in the ancestry.
+            std::vector<ggml_tensor *> pending;
+            std::unordered_set<ggml_tensor *> visited;
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            pending.reserve(n_nodes + external_layer_inputs.size());
+            for (int i = 0; i < n_nodes; ++i) {
+                pending.push_back(ggml_graph_node(gf, i));
+            }
+            while (!pending.empty()) {
+                ggml_tensor * tensor = pending.back();
+                pending.pop_back();
+                if (!tensor || !visited.insert(tensor).second) {
+                    continue;
+                }
+                inspect(tensor);
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (tensor->src[i]) {
+                        pending.push_back(tensor->src[i]);
+                    }
+                }
+            }
+
+            int n_imported = 0;
+            for (bool value : imported) {
+                n_imported += value;
+            }
+            const bool all_imported = n_imported == (int) imported.size();
+            if (source_reachable || !all_imported) {
+                LLAMA_LOG_ERROR("%s: unsafe DFlash external graph (nodes=%d, leafs=%d, imported=%d/%d, source_reachable=%d)\n",
+                        __func__, n_nodes, n_leafs_reachable, n_imported,
+                        (int) imported.size(), (int) source_reachable);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            if (!dflash_external_graph_reported) {
+                LLAMA_LOG_INFO("%s: DFlash external graph validated: nodes=%d, leafs=%d, imported=%d, target_ancestors=0\n",
+                        __func__, n_nodes, n_leafs_reachable, n_imported);
+                dflash_external_graph_reported = true;
+            }
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1647,12 +1735,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    embd_layer_inp_device_ready = false;
+    defer_layer_inp_host = false;
+    external_layer_inputs_rejected = false;
+    std::fill(embd_layer_inp_host_ready.begin(), embd_layer_inp_host_ready.end(), false);
+    device_layer_inp_seq_ids.clear();
+    device_layer_inp_pos.clear();
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    const bool mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const bool dflash_external = model.arch == LLM_ARCH_DFLASH && batch_inp.embd && !external_layer_inputs.empty();
+    const int64_t n_embd = dflash_external ? hparams.n_embd_inp_enc() :
+                           mtp_embd         ? hparams.n_embd_out()     : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -1698,6 +1795,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    // The imported activations must all come from one retained graph.
+    defer_layer_inp_host = embeddings_layer_inp_device && n_tokens_all <= cparams.n_ubatch;
 
     if (output_all) {
         // require that all tokens are output
@@ -1778,6 +1878,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    if (!external_layer_inputs.empty()) {
+        const llama_ubatch & actual = mctx->get_ubatch();
+        bool exact_single_ubatch = actual.embd && actual.n_tokens == n_tokens_all &&
+                n_tokens_all == (uint32_t) batch_inp.n_tokens &&
+                actual.n_pos == 1 && actual.pos && actual.n_seq_id && actual.seq_id &&
+                batch_inp.pos && batch_inp.n_seq_id && batch_inp.seq_id;
+
+        // Full target tensors can only be aliased when the draft memory keeps
+        // every row in exactly the supplied target-ubatch order. Checking the
+        // actual prepared mctx here covers iSWA's split_simple -> split_equal
+        // fallback under cache fragmentation. No cache state has been applied
+        // and no graph has run yet, so rejection is safe for the host fallback.
+        for (uint32_t i = 0; exact_single_ubatch && i < n_tokens_all; ++i) {
+            exact_single_ubatch = actual.seq_id[i] && batch_inp.seq_id[i] &&
+                    actual.n_seq_id[i] == 1 && batch_inp.n_seq_id[i] == 1 &&
+                    actual.seq_id[i][0] == batch_inp.seq_id[i][0] && actual.pos[i] == batch_inp.pos[i];
+        }
+
+        if (!exact_single_ubatch) {
+            external_layer_inputs_rejected = true;
+            return -1;
+        }
+    }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -1794,6 +1918,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        // Some memory implementations split even a small logical batch. Do
+        // not defer in that case because only the final graph is retained.
+        if (defer_layer_inp_host && (n_tokens_prev != 0 || ubatch.n_tokens != n_tokens_all)) {
+            defer_layer_inp_host = false;
+        }
 
         // count the outputs in this ubatch
         {
@@ -1969,6 +2099,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
+    if (defer_layer_inp_host && n_tokens_prev == n_tokens_all) {
+        const llama_ubatch & ubatch = gf_res_prev->get_ubatch();
+        if (ubatch.n_pos == 1 && ubatch.n_tokens == n_tokens_all && ubatch.pos && ubatch.n_seq_id && ubatch.seq_id) {
+            device_layer_inp_seq_ids.reserve(n_tokens_all);
+            device_layer_inp_pos.reserve(n_tokens_all);
+            embd_layer_inp_device_ready = true;
+            for (uint32_t i = 0; i < n_tokens_all; ++i) {
+                if (ubatch.n_seq_id[i] != 1) {
+                    embd_layer_inp_device_ready = false;
+                    break;
+                }
+                device_layer_inp_seq_ids.push_back(ubatch.seq_id[i][0]);
+                device_layer_inp_pos.push_back(ubatch.pos[i]);
+            }
+        }
+        if (!embd_layer_inp_device_ready) {
+            materialize_layer_inputs_host();
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -2023,6 +2173,132 @@ int llama_context::decode(const llama_batch & batch_inp) {
     //synchronize();
 
     return 0;
+}
+
+bool llama_context::decode_dflash_features(
+        llama_context & ctx_tgt,
+    const llama_batch & batch_inp,
+              int32_t & ret) {
+    ret = 0;
+
+    auto reject = [&ctx_tgt]() {
+        ctx_tgt.materialize_layer_inputs_host();
+        return false;
+    };
+
+    // The decode path additionally validates the actual prepared draft mctx
+    // before cache application because iSWA can fall back to an equal split
+    // after its initial simple split fails under cache fragmentation.
+    if (model.arch != LLM_ARCH_DFLASH || !cparams.kv_unified || model.hparams.dsv4_hc_mult > 0 ||
+            !batch_inp.embd || batch_inp.token ||
+            batch_inp.n_tokens <= 0 || (uint32_t) batch_inp.n_tokens > cparams.n_ubatch ||
+            !batch_inp.pos || !batch_inp.n_seq_id || !batch_inp.seq_id) {
+        return reject();
+    }
+
+    if (!ctx_tgt.embd_layer_inp_device_ready || !ctx_tgt.gf_res_prev ||
+            ctx_tgt.device_layer_inp_seq_ids.size() != (size_t) batch_inp.n_tokens ||
+            ctx_tgt.device_layer_inp_pos.size() != (size_t) batch_inp.n_tokens) {
+        return reject();
+    }
+
+    std::vector<std::pair<llama_seq_id, llama_pos>> source_rows;
+    std::vector<std::pair<llama_seq_id, llama_pos>> input_rows;
+    source_rows.reserve(batch_inp.n_tokens);
+    input_rows.reserve(batch_inp.n_tokens);
+    for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+        if (batch_inp.n_seq_id[i] != 1) {
+            return reject();
+        }
+        source_rows.emplace_back(ctx_tgt.device_layer_inp_seq_ids[i], ctx_tgt.device_layer_inp_pos[i]);
+        input_rows.emplace_back(batch_inp.seq_id[i][0], batch_inp.pos[i]);
+    }
+    std::sort(source_rows.begin(), source_rows.end());
+    std::sort(input_rows.begin(), input_rows.end());
+    if (source_rows != input_rows) {
+        return reject();
+    }
+
+    if (!model.fc || !model.fc->buffer || model.target_layer_ids.empty()) {
+        return reject();
+    }
+
+    auto tensor_device = [](const ggml_tensor * tensor) -> ggml_backend_dev_t {
+        if (!tensor || !tensor->buffer) {
+            return nullptr;
+        }
+        return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+    };
+
+    ggml_backend_dev_t dft_device = tensor_device(model.fc);
+    if (!dft_device || ggml_backend_dev_type(dft_device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return reject();
+    }
+
+    ggml_backend_reg_t dft_reg = ggml_backend_dev_backend_reg(dft_device);
+    if (!dft_reg || std::strcmp(ggml_backend_reg_name(dft_reg), "CUDA") != 0) {
+        return reject();
+    }
+
+    const int64_t n_embd_tgt = ctx_tgt.model.hparams.n_embd;
+    if ((int64_t) model.target_layer_ids.size() * n_embd_tgt != model.hparams.n_embd_inp_enc()) {
+        return reject();
+    }
+
+    std::vector<ggml_tensor *> layer_inputs;
+    layer_inputs.reserve(model.target_layer_ids.size());
+    for (int32_t il : model.target_layer_ids) {
+        if (il < 0 || il > (int32_t) ctx_tgt.model.hparams.n_layer() ||
+                !ctx_tgt.cparams.embeddings_layer_inp[il]) {
+            return reject();
+        }
+
+        ggml_tensor * tensor = ctx_tgt.gf_res_prev->get_layer_inp(il);
+        if (!tensor || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+                tensor->ne[0] != n_embd_tgt || tensor->ne[1] != batch_inp.n_tokens ||
+                tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor_device(tensor) != dft_device) {
+            return reject();
+        }
+        layer_inputs.push_back(tensor);
+    }
+
+    // The target scheduler owns the source buffers. Complete target writes
+    // before importing them, then complete the draft graph before returning so
+    // the target context is free to reuse its compute buffers.
+    ctx_tgt.synchronize();
+
+    std::vector<llama_pos> positions = ctx_tgt.device_layer_inp_pos;
+    std::vector<int32_t> n_seq_id(batch_inp.n_tokens, 1);
+    std::vector<llama_seq_id> seq_id_data = ctx_tgt.device_layer_inp_seq_ids;
+    std::vector<llama_seq_id *> seq_id(batch_inp.n_tokens);
+    std::vector<int8_t> logits(batch_inp.n_tokens, 0);
+    for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+        seq_id[i] = &seq_id_data[i];
+    }
+
+    llama_batch device_batch = batch_inp;
+    device_batch.pos      = positions.data();
+    device_batch.n_seq_id = n_seq_id.data();
+    device_batch.seq_id   = seq_id.data();
+    device_batch.logits   = logits.data();
+
+    external_layer_inputs = std::move(layer_inputs);
+    ret = decode(device_batch);
+    const bool rejected = external_layer_inputs_rejected;
+    if (!rejected) {
+        // decode() may have queued CUDA work before reporting an error. The
+        // external aliases remain valid only while the target context owns its
+        // retained compute buffers, so always drain an attempted graph before
+        // releasing that ownership boundary.
+        synchronize();
+    }
+    external_layer_inputs.clear();
+    if (rejected) {
+        ret = 0;
+        return reject();
+    }
+
+    return true;
 }
 
 //
@@ -2192,6 +2468,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (defer_layer_inp_host) {
+        return;
+    }
+
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2216,7 +2496,19 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        embd_layer_inp_host_ready[il] = true;
     }
+}
+
+void llama_context::materialize_layer_inputs_host() {
+    if ((!defer_layer_inp_host && !embd_layer_inp_device_ready) || !gf_res_prev) {
+        return;
+    }
+
+    const llama_ubatch & ubatch = gf_res_prev->get_ubatch();
+    defer_layer_inp_host = false;
+    embd_layer_inp_device_ready = false;
+    extract_layer_inputs(gf_res_prev.get(), 0, ubatch.n_tokens);
 }
 
 void llama_context::output_reorder() {
@@ -2464,6 +2756,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.external_layer_inputs =*/ external_layer_inputs,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3779,6 +4072,30 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_embeddings_layer_inp_device(llama_context * ctx, bool value) {
+    ctx->set_embeddings_layer_inp_device(value);
+}
+
+bool llama_decode_dflash_features(
+        llama_context * ctx_dft,
+        llama_context * ctx_tgt,
+           llama_batch   batch,
+              int32_t * ret) {
+    if (!ctx_dft || !ctx_tgt) {
+        if (ret) {
+            *ret = 0;
+        }
+        return false;
+    }
+
+    int32_t rc = 0;
+    const bool supported = ctx_dft->decode_dflash_features(*ctx_tgt, batch, rc);
+    if (ret) {
+        *ret = rc;
+    }
+    return supported;
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

@@ -224,6 +224,24 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
+static ggml_tensor * dflash_import_external_leaf(ggml_context * ctx, const ggml_tensor * source) {
+    GGML_ASSERT(source && source->buffer && source->data && ggml_is_contiguous(source));
+
+    ggml_tensor * leaf = ggml_dup_tensor(ctx, source);
+    leaf->buffer = source->buffer;
+    leaf->data   = source->data;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        leaf->nb[d] = source->nb[d];
+    }
+
+    GGML_ASSERT(leaf->op == GGML_OP_NONE && leaf->view_src == nullptr);
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        GGML_ASSERT(leaf->src[i] == nullptr);
+    }
+
+    return leaf;
+}
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
@@ -338,15 +356,32 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        ggml_tensor * inp_g = nullptr;
+        if (!params.external_layer_inputs.empty()) {
+            GGML_ASSERT(params.external_layer_inputs.size() == model.target_layer_ids.size());
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
+            inp_g = dflash_import_external_leaf(ctx0, params.external_layer_inputs[0]);
+            for (size_t i = 1; i < params.external_layer_inputs.size(); ++i) {
+                ggml_tensor * leaf = dflash_import_external_leaf(ctx0, params.external_layer_inputs[i]);
+                inp_g = ggml_concat(ctx0, inp_g, leaf, 0);
+            }
+            cb(inp_g, "inp_target_features", -1);
 
-        ggml_tensor * inp_g = inp->embd;
-        cb(inp_g, "inp_g_embeddings", -1);
+            inp_g = build_lora_mm(model.fc, inp_g, model.fc_s);
+            cb(inp_g, "fc_out", -1);
+            inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+            cb(inp_g, "enc_norm_out", -1);
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-        res->add_input(std::move(inp));
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_g = inp->embd;
+            cb(inp_g, "inp_g_embeddings", -1);
+
+            res->add_input(std::move(inp));
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -523,15 +558,32 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+        ggml_tensor * inp_g = nullptr;
+        if (!params.external_layer_inputs.empty()) {
+            GGML_ASSERT(params.external_layer_inputs.size() == model.target_layer_ids.size());
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(inp->embd);
+            inp_g = dflash_import_external_leaf(ctx0, params.external_layer_inputs[0]);
+            for (size_t i = 1; i < params.external_layer_inputs.size(); ++i) {
+                ggml_tensor * leaf = dflash_import_external_leaf(ctx0, params.external_layer_inputs[i]);
+                inp_g = ggml_concat(ctx0, inp_g, leaf, 0);
+            }
+            cb(inp_g, "inp_target_features", -1);
 
-        ggml_tensor * inp_g = inp->embd;
-        cb(inp_g, "inp_g_embeddings", -1);
+            inp_g = build_lora_mm(model.fc, inp_g, model.fc_s);
+            cb(inp_g, "fc_out", -1);
+            inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
+            cb(inp_g, "enc_norm_out", -1);
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
 
-        res->add_input(std::move(inp));
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_g = inp->embd;
+            cb(inp_g, "inp_g_embeddings", -1);
+
+            res->add_input(std::move(inp));
+        }
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
