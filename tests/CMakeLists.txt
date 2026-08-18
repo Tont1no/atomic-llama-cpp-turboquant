@@ -242,6 +242,11 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-log.cpp)
+# Model-specific manual regression harness. It is built only with CUDA and is
+# not registered with ctest because it requires external target and DFlash GGUFs.
+if (GGML_CUDA)
+    llama_build(test-dflash-fusion-determinism.cpp)
+endif()
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

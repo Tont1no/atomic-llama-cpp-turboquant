@@ -336,6 +336,10 @@ struct common_params_speculative_draft {
     float adaptive_ema_threshold = 0.55f;
     uint32_t adaptive_ema_warmup = 8;
 
+    // Internal draft sampler seed. The default preserves existing random-seed
+    // behavior; deterministic in-process regressions set an explicit value.
+    uint32_t seed = LLAMA_DEFAULT_SEED;
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

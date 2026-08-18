@@ -65,7 +65,7 @@ performance result:
 $env:GGML_CUDA_DFLASH_K_VALIDATE = '1'
 $env:GGML_CUDA_DISABLE_GRAPHS = '1'
 & .\build-fused-sm120\bin\Release\test-backend-ops.exe `
-  -b CUDA -o RMS_NORM_MUL_ROPE `
+  -b CUDA0 -o RMS_NORM_MUL_ROPE `
   -p 'cache_type=(q4_0|q8_0).*use_fwht=1,cache_rows=37'
 Remove-Item Env:GGML_CUDA_DFLASH_K_VALIDATE
 Remove-Item Env:GGML_CUDA_DISABLE_GRAPHS
@@ -73,6 +73,42 @@ Remove-Item Env:GGML_CUDA_DISABLE_GRAPHS
 
 A `DFlash-K raw cache validation PASS` line is the byte-identity signal.  The
 ordinary numerical backend result alone is not sufficient for this gate.
+
+`CUDA0` is intentional: `-b CUDA` does not match the numbered backend name and
+can report success after running zero focused cases.
+
+## Deterministic multi-sequence regression
+
+`test-dflash-fusion-determinism` runs the fallback and fused implementations
+sequentially in one process with independent CUDA contexts. It fixes both the
+target and DFlash sampler seeds and directly constructs the same ragged N4 and
+N8 prompt/verification batches, positions, and sequence IDs in each arm. The
+test compares draft tokens, bitwise draft and target logits, accepted
+prefix/final tokens, and serialized per-sequence draft KV state after both the
+noise-block draft and verified-feature injection.
+
+The kill switch controls only the new tagged eight-node FWHT writer; the older
+five-node fusion remains identical in both arms. The harness also rejects a
+false pass unless OFF observes the tagged fallback and ON observes both the
+exact FWHT-fusion marker and raw-cache validation with no tagged fallback.
+
+Run it with the real target and DFlash GGUFs on SM120. The draft K cache must be
+Q4_0 or Q8_0; run both commands when qualifying both formats:
+
+```powershell
+& .\build-fused-sm120\bin\Release\test-dflash-fusion-determinism.exe `
+  -m <target.gguf> -md <dflash.gguf> --spec-type draft-dflash `
+  -ngl 999 -ngld 999 -ctkd q4_0 -ctvd q4_0
+
+& .\build-fused-sm120\bin\Release\test-dflash-fusion-determinism.exe `
+  -m <target.gguf> -md <dflash.gguf> --spec-type draft-dflash `
+  -ngl 999 -ngld 999 -ctkd q8_0 -ctvd q8_0
+```
+
+The final acceptance signal is `DFlash deterministic regression PASS` with
+nonzero ON `active` and `raw` marker counts. This bounded fixture exercises
+ragged and permuted unified-cache allocation, but does not force a complete
+physical iSWA ring wrap; that remains a separate long-context qualification.
 
 DSpark is intentionally not enabled here.  Its DSV4 graph currently expresses
 full-head normal RoPE as a zero-length NOPE split plus RoPE and concat.  A safe
@@ -89,6 +125,8 @@ cmake --build build-fused-sm120 --config Release --target test-backend-ops -j 8
 cmake --build build-fused-sm120 --config Release --target llama-server -j 8
 ```
 
-Before promotion, run the focused `RMS_NORM_MUL_ROPE` backend cases on SM120,
-then an end-to-end DFlash parity and N1/N4/N8 throughput A/B with the fallback
-environment variable above.  This branch intentionally performed no GPU run.
+Before promotion, run the focused `RMS_NORM_MUL_ROPE` backend cases and the
+deterministic in-process regression on SM120, then run N1/N4/N8 throughput A/B.
+Fresh-server output hashes are not a correctness oracle because request
+admission and batching can vary between runs. This branch intentionally
+performed no GPU run.
