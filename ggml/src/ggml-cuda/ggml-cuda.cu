@@ -79,6 +79,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -703,6 +704,14 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    const uint64_t dflash_k_fused = dflash_k_fused_dispatches.load(std::memory_order_relaxed);
+    const uint64_t dflash_k_fallback = dflash_k_fallback_dispatches.load(std::memory_order_relaxed);
+    if (dflash_k_fused != 0 || dflash_k_fallback != 0) {
+        GGML_LOG_INFO("ggml_cuda: DFlash-K model summary on %s: FWHT fused dispatches = %" PRIu64
+                      ", fallback SET_ROWS dispatches = %" PRIu64 "\n",
+                      name.c_str(), dflash_k_fused, dflash_k_fallback);
+    }
 
     ggml_cuda_fp8_cache_clear(this);
 
@@ -2707,6 +2716,42 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+static constexpr char GGML_CUDA_DFLASH_K_WRITE_TAG[] = "dflash_k_cache_write_";
+
+static bool ggml_cuda_is_dflash_k_model_write(const ggml_tensor * set_rows) {
+    return set_rows != nullptr && set_rows->op == GGML_OP_SET_ROWS &&
+           std::strncmp(set_rows->name, GGML_CUDA_DFLASH_K_WRITE_TAG,
+                        sizeof(GGML_CUDA_DFLASH_K_WRITE_TAG) - 1) == 0;
+}
+
+static void ggml_cuda_record_dflash_k_dispatch(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_tensor * set_rows,
+        bool fused,
+        bool apply_fwht) {
+    // The model-side tag is the important part of this qualification marker:
+    // a synthetic RMSNorm/RoPE/SET_ROWS backend test has the same math shape,
+    // but cannot make the end-to-end DFlash marker appear without this tag.
+    if (!ggml_cuda_is_dflash_k_model_write(set_rows)) {
+        return;
+    }
+
+    std::atomic<uint64_t> & count = fused
+        ? cuda_ctx->dflash_k_fused_dispatches
+        : cuda_ctx->dflash_k_fallback_dispatches;
+    const uint64_t previous = count.fetch_add(1, std::memory_order_relaxed);
+    if (previous == 0) {
+        if (fused) {
+            GGML_LOG_INFO("ggml_cuda: DFlash-K FWHT cache fusion active on %s: cache = %s, FWHT = %d, node = %s\n",
+                          cuda_ctx->name.c_str(), ggml_type_name(set_rows->type), apply_fwht, set_rows->name);
+        } else {
+            GGML_LOG_INFO("ggml_cuda: DFlash-K model fusion fallback on %s: cache = %s, node = %s "
+                          "(disabled or runtime guards did not match)\n",
+                          cuda_ctx->name.c_str(), ggml_type_name(set_rows->type), set_rows->name);
+        }
+    }
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -4079,6 +4124,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL) {
             ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
                     cgraph->nodes[i + 2], cgraph->nodes[i + 7], true);
+            ggml_cuda_record_dflash_k_dispatch(
+                    cuda_ctx, cgraph->nodes[i + 7], /*fused=*/ true, /*apply_fwht=*/ true);
             return 7;
         }
     }
@@ -4317,6 +4364,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (ok) {
+                    ggml_cuda_record_dflash_k_dispatch(
+                            cuda_ctx, node, /*fused=*/ false, /*apply_fwht=*/ false);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

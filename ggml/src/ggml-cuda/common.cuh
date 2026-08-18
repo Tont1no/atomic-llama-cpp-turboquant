@@ -24,6 +24,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
@@ -1424,6 +1425,13 @@ struct ggml_backend_cuda_context {
 #endif
 
     int curr_stream_no = 0;
+
+    // Release-visible DFlash qualification counters.  Only model graphs tagged
+    // by src/models/dflash.cpp update these, so generic backend-op tests cannot
+    // make an end-to-end run appear fused.  Counts are host dispatches (CUDA
+    // graph capture is counted; subsequent graph replays are not).
+    std::atomic<uint64_t> dflash_k_fused_dispatches   {0};
+    std::atomic<uint64_t> dflash_k_fallback_dispatches{0};
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

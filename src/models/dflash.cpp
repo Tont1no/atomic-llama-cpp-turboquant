@@ -422,7 +422,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (v_rot) {
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
                 }
-                ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
+                ggml_tensor * k_write = kv->cpy_k(ctx0, Kcur, k_idxs, il);
+                ggml_format_name(k_write, "dflash_k_cache_write_%d", il);
+                ggml_build_forward_expand(gf, k_write);
                 ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
             } else {
                 // rotate K/V into the cache's rotated space
@@ -432,7 +434,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (inp_attn->self_v_rot) {
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
                 }
-                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+                ggml_tensor * k_write = inp_attn->mctx->cpy_k(
+                        ctx0, Kcur, inp_attn->get_k_idxs(), il);
+                ggml_format_name(k_write, "dflash_k_cache_write_%d", il);
+                ggml_build_forward_expand(gf, k_write);
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
             }
         }
