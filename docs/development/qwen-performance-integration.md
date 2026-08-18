@@ -101,7 +101,8 @@ Visual Studio may silently use the system CUDA toolkit:
 ```powershell
 $Cuda132Root = 'C:\Users\pasca\Documents\GitHub\Ai-Loader\.codex-deploy\cuda-13.2\toolkit'
 cmake -S . -B build-integration-cuda132-vs17 -G "Visual Studio 17 2022" -A x64 `
-  -T "cuda=$Cuda132Root" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 `
+  -T "cuda=$Cuda132Root" -DCUDAToolkit_ROOT="$Cuda132Root" `
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 `
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON
 cmake --build build-integration-cuda132-vs17 --config Release `
   --target llama-cli test-fp8-e4m3 -j 8
