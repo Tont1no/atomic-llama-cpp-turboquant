@@ -398,6 +398,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        // Execute only the recurrent rollback depth required by each batch; allocation remains n_rs_seq.
+        // Only enable when partial rollback is limited to speculative rows from the same decode batch.
+        bool rs_seq_dynamic; // [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

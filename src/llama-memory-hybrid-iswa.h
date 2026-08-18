@@ -35,6 +35,7 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                     bool   rs_seq_dynamic,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -111,7 +112,8 @@ public:
            llama_memory_hybrid_iswa * mem,
                     slot_info_vec_t   sinfos_base,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches);
+          std::vector<llama_ubatch>   ubatches,
+                           uint32_t   active_n_rs_seq);
 
     ~llama_memory_hybrid_iswa_context() = default;
 

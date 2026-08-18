@@ -3,18 +3,129 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
 #include <vector>
 
-static llama_context * make_ctx(const common_params & params, llama_model * model) {
+static llama_context * make_ctx(
+        const common_params & params,
+        llama_model * model,
+        uint32_t n_seq_max = 1,
+        bool rs_seq_dynamic = false) {
     auto cparams = common_context_params_to_llama(params);
-    cparams.n_seq_max = 1;
+    cparams.n_seq_max = n_seq_max;
     cparams.n_rs_seq  = 8;
+    cparams.rs_seq_dynamic = rs_seq_dynamic;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
     return llama_init_from_model(model, cparams);
+}
+
+static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count);
+static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos);
+
+static bool decode_ragged_and_compare(
+        const common_params & params,
+        llama_model * model,
+        int n_vocab) {
+    llama_context * ctx_batched = make_ctx(params, model, 3, true);
+    llama_context * ctx_ref[3] = {
+        make_ctx(params, model, 1, true),
+        make_ctx(params, model, 1, true),
+        make_ctx(params, model, 1, true),
+    };
+    if (ctx_batched == nullptr || ctx_ref[0] == nullptr || ctx_ref[1] == nullptr || ctx_ref[2] == nullptr) {
+        fprintf(stderr, "%s : failed to create ragged contexts\n", __func__);
+        return false;
+    }
+
+    std::vector<std::vector<llama_token>> rows = {
+        { 1 },
+        { 2, 3 },
+        { 4, 5, 6, 7 },
+    };
+    for (auto & seq : rows) {
+        for (auto & token : seq) {
+            token %= n_vocab;
+        }
+    }
+
+    llama_batch batch = llama_batch_init(7, 0, 3);
+    for (llama_seq_id seq = 0; seq < 3; ++seq) {
+        for (llama_pos pos = 0; pos < (llama_pos) rows[seq].size(); ++pos) {
+            common_batch_add(batch, rows[seq][pos], pos, { seq }, pos + 1 == (llama_pos) rows[seq].size());
+        }
+        if (!decode_tokens(ctx_ref[seq], rows[seq], (uint32_t) rows[seq].size())) {
+            fprintf(stderr, "%s : reference ragged decode failed for sequence %d\n", __func__, seq);
+            llama_batch_free(batch);
+            return false;
+        }
+    }
+    if (llama_decode(ctx_batched, batch) != 0) {
+        fprintf(stderr, "%s : batched ragged decode failed\n", __func__);
+        llama_batch_free(batch);
+        return false;
+    }
+    llama_batch_free(batch);
+
+    constexpr float eps = 1e-5f;
+    const auto compare_outputs = [&](
+            const char * phase,
+            const std::array<int32_t, 3> & batched_idxs,
+            const std::array<int32_t, 3> & ref_idxs) {
+        for (int seq = 0; seq < 3; ++seq) {
+            const float * actual   = llama_get_logits_ith(ctx_batched, batched_idxs[seq]);
+            const float * expected = llama_get_logits_ith(ctx_ref[seq], ref_idxs[seq]);
+            if (actual == nullptr || expected == nullptr) {
+                fprintf(stderr, "%s : missing %s logits for sequence %d\n", __func__, phase, seq);
+                return false;
+            }
+            for (int token = 0; token < n_vocab; ++token) {
+                if (std::fabs(actual[token] - expected[token]) > eps) {
+                    fprintf(stderr, "%s : %s mismatch for sequence %d token %d (%g != %g)\n",
+                            __func__, phase, seq, token, (double) actual[token], (double) expected[token]);
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    if (!compare_outputs("ragged", { 0, 2, 6 }, { 0, 1, 3 })) {
+        return false;
+    }
+
+    // Follow the 1/2/4-row ragged batch with one row per sequence. This forces
+    // active depth 3 -> 0 while preserving the full max-sized allocation.
+    llama_batch one_each = llama_batch_init(3, 0, 3);
+    for (llama_seq_id seq = 0; seq < 3; ++seq) {
+        const llama_token token = (llama_token) ((8 + seq) % n_vocab);
+        const llama_pos pos = (llama_pos) rows[seq].size();
+        common_batch_add(one_each, token, pos, { seq }, true);
+        if (!decode_one(ctx_ref[seq], token, pos)) {
+            fprintf(stderr, "%s : reference depth-zero decode failed for sequence %d\n", __func__, seq);
+            llama_batch_free(one_each);
+            return false;
+        }
+    }
+    if (llama_decode(ctx_batched, one_each) != 0) {
+        fprintf(stderr, "%s : batched depth-zero decode failed\n", __func__);
+        llama_batch_free(one_each);
+        return false;
+    }
+    llama_batch_free(one_each);
+
+    bool ok = compare_outputs("depth-zero", { 0, 1, 2 }, { 0, 0, 0 });
+    if (ok && llama_memory_seq_rm(llama_get_memory(ctx_batched), 2, 4, -1)) {
+        fprintf(stderr, "%s : depth-zero graph incorrectly allowed rollback into a stale snapshot plane\n", __func__);
+        ok = false;
+    }
+    llama_free(ctx_batched);
+    for (auto * ctx : ctx_ref) {
+        llama_free(ctx);
+    }
+    return ok;
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
@@ -64,6 +175,10 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
+
+    if (!decode_ragged_and_compare(params, model, n_vocab)) {
+        return 1;
+    }
 
     llama_context * ctx_src = make_ctx(params, model);
     llama_context * ctx_dst = make_ctx(params, model);

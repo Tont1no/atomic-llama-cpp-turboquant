@@ -17,6 +17,63 @@
 // llama_memory_recurrent
 //
 
+uint32_t llama_recurrent_batch_active_rs_depth(
+        const llama_batch & batch,
+        uint32_t configured_max,
+        uint32_t n_seq_max,
+        bool * used_fallback) {
+    auto fallback = [&]() {
+        if (used_fallback) {
+            *used_fallback = true;
+        }
+        return configured_max;
+    };
+
+    if (used_fallback) {
+        *used_fallback = false;
+    }
+    if (configured_max == 0) {
+        return 0;
+    }
+    if (batch.n_tokens <= 0 || n_seq_max == 0 || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return fallback();
+    }
+
+    std::vector<uint32_t> rows_per_seq(n_seq_max, 0);
+    uint32_t max_rows = 0;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const int32_t n_ids = batch.n_seq_id[i];
+        if (n_ids <= 0 || n_ids > (int32_t) n_seq_max || batch.seq_id[i] == nullptr) {
+            return fallback();
+        }
+
+        // A duplicate sequence id on one token is ambiguous metadata. Do not
+        // under-estimate the required rollback window in that case.
+        for (int32_t j = 0; j < n_ids; ++j) {
+            const llama_seq_id seq_id = batch.seq_id[i][j];
+            if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+                return fallback();
+            }
+            for (int32_t k = 0; k < j; ++k) {
+                if (batch.seq_id[i][k] == seq_id) {
+                    return fallback();
+                }
+            }
+
+            uint32_t & rows = rows_per_seq[(size_t) seq_id];
+            if (rows == UINT32_MAX) {
+                return fallback();
+            }
+            max_rows = std::max(max_rows, ++rows);
+        }
+    }
+
+    if (max_rows == 0) {
+        return fallback();
+    }
+    return std::min(configured_max, max_rows - 1);
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -25,7 +82,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+                     bool   rs_seq_dynamic,
+    const layer_filter_cb & filter) : rs_seq_dynamic(rs_seq_dynamic && n_rs_seq > 0), hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -34,6 +92,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_valid_depth.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -127,6 +186,26 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+uint32_t llama_memory_recurrent::active_rs_depth(const llama_batch & batch, bool embd_all, bool * used_fallback) {
+    bool fallback = false;
+    const uint32_t active = !rs_seq_dynamic || embd_all ? n_rs_seq :
+            llama_recurrent_batch_active_rs_depth(batch, n_rs_seq, n_seq_max, &fallback);
+
+    if (used_fallback) {
+        *used_fallback = fallback;
+    }
+    if (fallback) {
+        LLAMA_LOG_WARN("%s: invalid batch metadata; using configured recurrent rollback depth %u\n",
+                __func__, n_rs_seq);
+    }
+    if (rs_seq_dynamic && active != last_reported_active_n_rs_seq) {
+        LLAMA_LOG_DEBUG("%s: active recurrent rollback depth = %u/%u%s\n",
+                __func__, active, n_rs_seq, fallback ? " (fallback)" : "");
+        last_reported_active_n_rs_seq = active;
+    }
+    return active;
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
@@ -145,6 +224,7 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -162,8 +242,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (rm_all) {
         if (seq_id >= 0) {
             set_rs_idx(seq_id, 0);
+            if ((size_t) seq_id < rs_valid_depth.size()) {
+                rs_valid_depth[seq_id] = 0;
+            }
         } else {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
+            std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
         }
     }
 
@@ -182,7 +266,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    if (rs_seq_dynamic && ((size_t) seq_id >= rs_valid_depth.size() ||
+                            rollback > (llama_pos) rs_valid_depth[seq_id])) {
+                        return false;
+                    }
                     set_rs_idx(seq_id, (uint32_t) rollback);
+                    if (rs_seq_dynamic) {
+                        rs_valid_depth[seq_id] = 0;
+                    }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -191,6 +282,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                if ((size_t) seq_id < rs_valid_depth.size()) {
+                    rs_valid_depth[seq_id] = 0;
+                }
             }
         }
     } else {
@@ -246,6 +340,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 
     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
+        if ((size_t) seq_id_dst < rs_valid_depth.size() && (size_t) seq_id_src < rs_valid_depth.size()) {
+            rs_valid_depth[seq_id_dst] = rs_valid_depth[seq_id_src];
+        }
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
         if (tail_dst.tail >= 0) {
@@ -292,6 +389,12 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
         } else {
             cells[i].seq_id.clear();
             cells[i].seq_id.insert(seq_id);
+        }
+    }
+
+    for (size_t i = 0; i < rs_valid_depth.size(); ++i) {
+        if ((llama_seq_id) i != seq_id) {
+            rs_valid_depth[i] = 0;
         }
     }
 
@@ -396,6 +499,34 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
+void llama_memory_recurrent::commit_rs_depth(const llama_ubatch & ubatch, uint32_t active_depth) {
+    if (!rs_seq_dynamic) {
+        return;
+    }
+    const uint32_t depth = std::min(active_depth, n_rs_seq);
+    if (!ubatch.equal_seqs() || ubatch.n_seq_tokens == 0 || ubatch.n_seqs == 0 ||
+            (uint64_t) ubatch.n_tokens != (uint64_t) ubatch.n_seq_tokens * ubatch.n_seqs) {
+        std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+        return;
+    }
+
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s * ubatch.n_seq_tokens;
+        if (ubatch.n_seq_id[i] <= 0 || ubatch.seq_id[i] == nullptr) {
+            std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+            return;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id < 0 || (size_t) seq_id >= rs_valid_depth.size()) {
+                std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+                return;
+            }
+            rs_valid_depth[seq_id] = depth;
+        }
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -406,6 +537,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
+        const uint32_t active_n_rs_seq = active_rs_depth(balloc.get_batch(), embd_all);
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
@@ -421,7 +553,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, true, active_n_rs_seq > 0 ? active_n_rs_seq + 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -440,7 +572,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
             break;
         }
 
-        return std::make_unique<llama_memory_recurrent_context>(this, std::move(ubatches));
+        return std::make_unique<llama_memory_recurrent_context>(this, std::move(ubatches), active_n_rs_seq);
     } while (false);
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -838,8 +970,12 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     if (n_rs_seq != 0) {
         if (seq_id == -1) {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
+            std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
         } else {
             set_rs_idx(seq_id, 0);
+            if ((size_t) seq_id < rs_valid_depth.size()) {
+                rs_valid_depth[seq_id] = 0;
+            }
         }
     }
 }
@@ -1179,7 +1315,12 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
 
 llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
+        std::vector<llama_ubatch> ubatches,
+        uint32_t active_n_rs_seq) :
+    status(LLAMA_MEMORY_STATUS_SUCCESS),
+    mem(mem),
+    ubatches(std::move(ubatches)),
+    active_n_rs_seq(std::min(active_n_rs_seq, mem->n_rs_seq)) {}
 
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
@@ -1204,7 +1345,10 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    if (!mem->find_slot(ubatches[i_next])) {
+        return false;
+    }
+    mem->commit_rs_depth(ubatches[i_next], get_active_n_rs_seq());
 
     return true;
 }
@@ -1221,6 +1365,22 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
     return is_full ? mem->size : mem->n;
+}
+
+uint32_t llama_memory_recurrent_context::get_active_n_rs_seq() const {
+    if (is_full || ubatches.empty()) {
+        return mem->n_rs_seq;
+    }
+
+    const llama_ubatch & ubatch = ubatches[i_next];
+    if (!ubatch.equal_seqs() || ubatch.n_seq_tokens == 0 || ubatch.n_seqs == 0 ||
+            (uint64_t) ubatch.n_tokens != (uint64_t) ubatch.n_seq_tokens * ubatch.n_seqs) {
+        return mem->n_rs_seq;
+    }
+
+    // Ragged logical batches are split into equal-row ubatches. A shorter
+    // group needs fewer snapshots than the maximum selected for splitting.
+    return std::min(active_n_rs_seq, ubatch.n_seq_tokens - 1);
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
