@@ -359,6 +359,24 @@ static bool spec_types_is_default(const common_params & params) {
     return params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE};
 }
 
+static void spec_types_append(common_params & params, const std::vector<common_speculative_type> & types) {
+    auto & dst = params.speculative.types;
+
+    // "none" is a sentinel, not a chain member. An explicit none resets the
+    // selection; any real type replaces the default sentinel.
+    if (types == std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_NONE }) {
+        dst = types;
+        return;
+    }
+
+    dst.erase(std::remove(dst.begin(), dst.end(), COMMON_SPECULATIVE_TYPE_NONE), dst.end());
+    for (const auto type : types) {
+        if (std::find(dst.begin(), dst.end(), type) == dst.end()) {
+            dst.push_back(type);
+        }
+    }
+}
+
 common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
     common_download_hf_plan plan;
     common_download_hf_plan plan_spec;
@@ -3039,21 +3057,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--mtp"},
         "also download the multi-token prediction (MTP) head, if available (default: unused)",
         [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+            spec_types_append(params, { COMMON_SPECULATIVE_TYPE_DRAFT_MTP });
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
         {"--dflash"},
         "also download the DFlash sidecar, if available (default: unused)",
         [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+            spec_types_append(params, { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH });
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
         {"--eagle3"},
         "also download the Eagle3 sidecar, if available (default: unused)",
         [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
+            spec_types_append(params, { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 });
         }
     ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
     add_opt(common_arg(
@@ -4247,8 +4265,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             common_speculative_type_name_str(params.speculative.types).c_str()),
         [](common_params & params, const std::string & value) {
             const auto types_str = string_split<std::string>(value, ',');
-            auto types = common_speculative_types_from_names(types_str);
-            params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+            spec_types_append(params, common_speculative_types_from_names(types_str));
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
     add_opt(common_arg(
@@ -4719,7 +4736,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-default"},
         string_format("enable default speculative decoding config"),
         [](common_params & params) {
-            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+            spec_types_append(params, { COMMON_SPECULATIVE_TYPE_NGRAM_MOD });
             params.speculative.ngram_mod.n_match = 24;
             params.speculative.ngram_mod.n_min = 48;
             params.speculative.ngram_mod.n_max = 64;

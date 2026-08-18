@@ -14,6 +14,10 @@ const char * common_speculative_all_types_str();
 // parse user provided types
 std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
 
+// Return true when the effective chain contains exactly one non-NONE type and
+// it is DFlash or DSpark. NONE is a configuration sentinel and is ignored.
+bool common_speculative_is_only_dflash_family(const std::vector<enum common_speculative_type> & types);
+
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 

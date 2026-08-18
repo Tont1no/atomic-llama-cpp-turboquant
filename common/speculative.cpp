@@ -2480,20 +2480,45 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
 std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {
     std::vector<common_speculative_type> types;
     types.reserve(names.size());
+    bool has_none = false;
 
     for (const auto & name : names) {
         auto type = common_speculative_type_from_name_map.find(name);
         if (type != common_speculative_type_from_name_map.end()) {
             if (type->second == COMMON_SPECULATIVE_TYPE_NONE) {
-                return std::vector<common_speculative_type> { COMMON_SPECULATIVE_TYPE_NONE };
+                has_none = true;
+            } else {
+                types.push_back(type->second);
             }
-            types.push_back(type->second);
             continue;
         }
         throw std::invalid_argument("unknown speculative type: " + name);
     }
 
+    if (has_none) {
+        if (!types.empty()) {
+            throw std::invalid_argument("speculative type 'none' cannot be combined with another type");
+        }
+        return { COMMON_SPECULATIVE_TYPE_NONE };
+    }
+
     return types;
+}
+
+bool common_speculative_is_only_dflash_family(const std::vector<common_speculative_type> & types) {
+    common_speculative_type effective = COMMON_SPECULATIVE_TYPE_NONE;
+    for (const auto type : types) {
+        if (type == COMMON_SPECULATIVE_TYPE_NONE) {
+            continue;
+        }
+        if (effective != COMMON_SPECULATIVE_TYPE_NONE) {
+            return false;
+        }
+        effective = type;
+    }
+
+    return effective == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+           effective == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
 common_speculative_type common_speculative_type_from_name(const std::string & name) {
