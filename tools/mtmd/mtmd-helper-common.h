@@ -79,6 +79,7 @@ struct decode_embd_batch {
     std::vector<llama_seq_id>   seq_id_0;
     std::vector<llama_seq_id *> seq_ids;
     std::vector<int8_t>         logits;
+    std::vector<uint32_t>       rs_depth;
     llama_batch batch;
     decode_embd_batch(float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd) : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd) {
         GGML_ASSERT(n_tokens > 0 && n_pos_per_embd > 0 && n_mmproj_embd > 0);
@@ -86,6 +87,7 @@ struct decode_embd_batch {
         n_seq_id.resize(n_tokens);
         seq_ids .resize(n_tokens + 1);
         logits  .resize(n_tokens);
+        rs_depth.resize(n_tokens, 0);
         seq_id_0.resize(1);
         seq_ids [n_tokens] = nullptr;
         batch = {
@@ -96,6 +98,7 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ n_seq_id.data(),
             /*seq_id         =*/ seq_ids.data(),
             /*logits         =*/ logits.data(),
+            /*rs_depth       =*/ rs_depth.data(),
         };
     }
 
@@ -179,6 +182,7 @@ struct decode_embd_batch {
             /*n_seq_id       =*/ batch.n_seq_id + offset,
             /*seq_id         =*/ batch.seq_id   + offset,
             /*logits         =*/ batch.logits   + offset,
+            /*rs_depth       =*/ batch.rs_depth + offset,
         };
     }
 };

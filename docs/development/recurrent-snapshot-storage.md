@@ -37,6 +37,16 @@ and newly started slots therefore contribute before they reach `GENERATING`.
 The load estimate selects the speculative cap and identifies scheduling
 epochs, but it never lowers the batch-derived correctness depth.
 
+The server also supplies an explicit per-row `llama_batch::rs_depth` contract.
+Ordinary prompt, prefill, multimodal prompt, and target-only rows request depth
+zero. Every row in a speculative verification span requests the number of
+draft tokens in that span, clamped to the configured limit. Mixed batches use
+the maximum explicit verification depth, so prompt length can no longer be
+mistaken for rollback demand. A missing or invalid depth array remains a
+fail-closed request for the configured maximum for external callers.
+Because the experimental pointer extends the public by-value batch structure,
+the fork's library and all callers must be rebuilt together.
+
 Resize count, cumulative synchronized resize time, resident/required/pending
 depth, and stable-epoch count are available through
 `llama_get_recurrent_resize_stats()` and the `/metrics` recurrent snapshot
