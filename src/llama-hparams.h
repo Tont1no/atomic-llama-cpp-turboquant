@@ -256,6 +256,8 @@ struct llama_hparams {
     uint32_t dsv4_hc_mult              = 0;
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;
+    uint32_t dflash_stacked_kv_min_rows = 0; // 0 disables the optional stacked projection
+    bool     dflash_stacked_kv_min_rows_configured = false;
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;

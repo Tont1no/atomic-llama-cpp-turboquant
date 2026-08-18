@@ -131,7 +131,8 @@ class ModelBase:
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
-                 dflash_stacked_kv: bool = False):
+                 dflash_stacked_kv: bool = False,
+                 dflash_stacked_kv_min_rows: int | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -153,6 +154,7 @@ class ModelBase:
         self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self.dflash_stacked_kv = dflash_stacked_kv
+        self.dflash_stacked_kv_min_rows = dflash_stacked_kv_min_rows
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams

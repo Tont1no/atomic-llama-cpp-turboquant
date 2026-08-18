@@ -632,6 +632,7 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 @ModelBase.register("DFlashDraftModel")
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
+    stacked_kv_default_min_rows = 16
 
     @property
     def _stacked_kv_name(self) -> str:
@@ -687,6 +688,14 @@ class DFlashModel(Qwen3Model):
             is_swa = [lt == "sliding_attention" for lt in layer_types]
             self.gguf_writer.add_sliding_window(sliding_window)
             self.gguf_writer.add_sliding_window_pattern(is_swa)
+
+        if self.dflash_stacked_kv:
+            min_rows = self.dflash_stacked_kv_min_rows
+            if min_rows is None:
+                min_rows = self.stacked_kv_default_min_rows
+            self.gguf_writer.add_uint32(
+                gguf.Keys.LLM.DFLASH_STACKED_KV_MIN_ROWS.format(arch="dflash"), min_rows,
+            )
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -750,6 +759,7 @@ class DFlashModel(Qwen3Model):
 class DSparkModel(DFlashModel):
     # DSpark = DFlash + a semi-autoregressive Markov head
     model_arch = gguf.MODEL_ARCH.DFLASH
+    stacked_kv_default_min_rows = 0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

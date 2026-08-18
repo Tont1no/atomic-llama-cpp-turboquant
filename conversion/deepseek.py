@@ -1052,3 +1052,9 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
 
         self.gguf_writer.add_block_size(self.hparams["dspark_block_size"])
         self.gguf_writer.add_target_layers([layer + 1 for layer in self.hparams["dspark_target_layer_ids"]])
+        if self.dflash_stacked_kv:
+            min_rows = self.dflash_stacked_kv_min_rows
+            self.gguf_writer.add_uint32(
+                gguf.Keys.LLM.DFLASH_STACKED_KV_MIN_ROWS.format(arch="dflash"),
+                0 if min_rows is None else min_rows,
+            )

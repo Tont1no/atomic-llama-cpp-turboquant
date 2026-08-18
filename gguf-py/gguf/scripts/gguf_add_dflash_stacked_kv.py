@@ -29,6 +29,7 @@ import gguf
 
 logger = logging.getLogger("gguf-add-dflash-stacked-kv")
 STACKED_NAME = "dflash.attn_kv_stacked.weight"
+MIN_ROWS_KEY = "dflash.stacked_kv_min_rows"
 HASH_CHUNK_BYTES = 16 * 1024 * 1024
 
 
@@ -76,26 +77,36 @@ def hash_array(data: np.ndarray[Any, Any]) -> str:
     return digest.hexdigest()
 
 
-def validate_metadata(source: gguf.GGUFReader, output: gguf.GGUFReader) -> None:
+def validate_metadata(source: gguf.GGUFReader, output: gguf.GGUFReader, min_rows: int) -> None:
     source_fields = list(metadata_fields(source))
     output_fields = list(metadata_fields(output))
     source_names = [field.name for field in source_fields]
     output_names = [field.name for field in output_fields]
-    if output_names != source_names:
+    expected_names = source_names if MIN_ROWS_KEY in source_names else [*source_names, MIN_ROWS_KEY]
+    if output_names != expected_names:
         raise ValueError("metadata key order changed during repack")
 
-    for old, new in zip(source_fields, output_fields):
+    output_by_name = {field.name: field for field in output_fields}
+    for old in source_fields:
+        new = output_by_name[old.name]
+        if old.name == MIN_ROWS_KEY:
+            continue
         if old.types != new.types or old.contents() != new.contents():
             raise ValueError(f"metadata field {old.name!r} changed during repack")
+
+    threshold = output_by_name[MIN_ROWS_KEY]
+    if threshold.types != [gguf.GGUFValueType.UINT32] or int(threshold.contents()) != min_rows:
+        raise ValueError(f"metadata field {MIN_ROWS_KEY!r} has the wrong type or value")
 
 
 def validate_output(
         source: gguf.GGUFReader,
         output_path: Path,
         projections: list[gguf.ReaderTensor],
-        packed: np.ndarray[Any, Any]) -> dict[str, Any]:
+        packed: np.ndarray[Any, Any],
+        min_rows: int) -> dict[str, Any]:
     output = gguf.GGUFReader(output_path, "r")
-    validate_metadata(source, output)
+    validate_metadata(source, output, min_rows)
 
     old_names = [tensor.name for tensor in source.tensors]
     new_names = [tensor.name for tensor in output.tensors]
@@ -135,6 +146,7 @@ def validate_output(
         "packed_shape_ggml": [expected_ne0, expected_ne1],
         "packed_bytes": stacked.n_bytes,
         "packed_sha256": hash_array(stacked.data),
+        "stacked_kv_min_rows": min_rows,
     }
 
 
@@ -154,7 +166,10 @@ def publish_without_overwrite(temporary: Path, output: Path) -> None:
     temporary.unlink()
 
 
-def repack(input_path: Path, output_path: Path) -> dict[str, Any]:
+def repack(input_path: Path, output_path: Path, min_rows: int | None = None) -> dict[str, Any]:
+    if min_rows is not None and (min_rows < 0 or min_rows > 0xffffffff):
+        raise ValueError("min_rows must be between 0 and 4294967295")
+
     input_path = input_path.resolve(strict=True)
     output_path = output_path.resolve(strict=False)
     if input_path == output_path:
@@ -174,6 +189,17 @@ def repack(input_path: Path, output_path: Path) -> dict[str, Any]:
 
     block_count = int(field_value(reader, "dflash.block_count"))
     by_name = tensor_map(reader)
+    if min_rows is None:
+        existing_threshold = reader.get_field(MIN_ROWS_KEY)
+        if existing_threshold is not None:
+            if existing_threshold.types != [gguf.GGUFValueType.UINT32]:
+                raise ValueError(f"existing metadata {MIN_ROWS_KEY!r} must be UINT32")
+            min_rows = int(existing_threshold.contents())
+        else:
+            hc_field = reader.get_field("dflash.hyper_connection.count")
+            hc_count = int(hc_field.contents()) if hc_field is not None else 0
+            is_dspark = "markov_w1.weight" in by_name or hc_count > 0
+            min_rows = 0 if is_dspark else 16
     projections: list[gguf.ReaderTensor] = []
     for block in range(block_count):
         for kind in ("k", "v"):
@@ -226,6 +252,7 @@ def repack(input_path: Path, output_path: Path) -> dict[str, Any]:
         writer = gguf.GGUFWriter(temporary, arch="dflash", endianess=reader.endianess)
         writer.data_alignment = reader.alignment
         copy_metadata(reader, writer)
+        writer.add_uint32(MIN_ROWS_KEY, min_rows)
 
         for tensor in reader.tensors:
             writer.add_tensor_info(
@@ -252,7 +279,7 @@ def repack(input_path: Path, output_path: Path) -> dict[str, Any]:
         writer = None
 
         logger.info("Validating metadata, tensor order, descriptors, and SHA-256 payloads")
-        result = validate_output(reader, temporary, projections, packed)
+        result = validate_output(reader, temporary, projections, packed, min_rows)
         validated = True
         result.update({
             "input": str(input_path),
@@ -282,12 +309,16 @@ def main() -> None:
     )
     parser.add_argument("input", type=Path, help="existing single-file DFlash/DSpark Q8_0 GGUF")
     parser.add_argument("output", type=Path, help="new GGUF path; must not already exist")
+    parser.add_argument(
+        "--min-rows", type=int,
+        help="minimum logical rows for stacked projection; 0 disables (auto: DFlash 16, DSpark 0)",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s %(message)s")
 
     try:
-        result = repack(args.input, args.output)
+        result = repack(args.input, args.output, args.min_rows)
     except Exception as exc:
         if args.verbose:
             raise

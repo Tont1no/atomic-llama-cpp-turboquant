@@ -7,6 +7,11 @@
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
+    const bool is_dspark = ml.get_tensor_meta("markov_w1.weight") != nullptr || hparams.dsv4_hc_mult > 0;
+    hparams.dflash_stacked_kv_min_rows = is_dspark ? 0 : 16;
+    hparams.dflash_stacked_kv_min_rows_configured = ml.get_key(
+            LLM_KV_DFLASH_STACKED_KV_MIN_ROWS, hparams.dflash_stacked_kv_min_rows, false);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
@@ -24,7 +29,6 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: DFlash extract_layers = [%s]\n", __func__, layers.c_str());
 
     // DeepSeek-V4 DSpark backbone: stages are full DSV4 blocks, uniform sliding window (the draft KV ring)
-    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
         ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
         ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
@@ -118,8 +122,12 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
             tn(LLM_TENSOR_DFLASH_ATTN_KV_STACKED, "weight"),
             { n_embd, n_embd_kv_stacked }, TENSOR_NOT_REQUIRED);
     if (dflash_attn_kv_stacked) {
-        LLAMA_LOG_INFO("%s: using optional stacked DFlash KV projection, shape = [%lld, %lld]\n",
-                __func__, (long long) n_embd, (long long) n_embd_kv_stacked);
+        LLAMA_LOG_INFO(
+                "%s: optional stacked DFlash KV projection shape = [%lld, %lld], min_rows = %u%s, source = %s\n",
+                __func__, (long long) n_embd, (long long) n_embd_kv_stacked,
+                hparams.dflash_stacked_kv_min_rows,
+                hparams.dflash_stacked_kv_min_rows == 0 ? " (disabled)" : "",
+                hparams.dflash_stacked_kv_min_rows_configured ? "GGUF" : "default");
     }
 
     if (hparams.dsv4_hc_mult > 0) {
@@ -320,6 +328,16 @@ static bool dflash_can_use_stacked_dsv4(
     return true;
 }
 
+static constexpr bool dflash_should_use_stacked_kv(bool compatible, uint32_t min_rows, int64_t injection_rows) {
+    return compatible && min_rows > 0 && injection_rows >= min_rows;
+}
+
+static_assert(!dflash_should_use_stacked_kv(true, 0, 16));
+static_assert(!dflash_should_use_stacked_kv(true, 16, 15));
+static_assert( dflash_should_use_stacked_kv(true, 16, 16));
+static_assert( dflash_should_use_stacked_kv(true, 16, 17));
+static_assert(!dflash_should_use_stacked_kv(false, 16, 16));
+
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
 static void build_dspark_markov_head(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
     ggml_context * ctx0 = g.ctx0;
@@ -463,8 +481,25 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
 
         ggml_tensor * kv_stacked = nullptr;
-        const bool use_stacked_kv = dflash_can_use_stacked_qwen(
+        const bool stacked_compatible = dflash_can_use_stacked_qwen(
                 model, loras, n_embd, n_embd_k_gqa, n_embd_v_gqa, n_layer);
+        // n_tokens is the total number of injection rows across all sequences
+        // in this ubatch, i.e. the RHS columns projected by the combined GEMM.
+        const bool use_stacked_kv = dflash_should_use_stacked_kv(
+                stacked_compatible, hparams.dflash_stacked_kv_min_rows, n_tokens);
+        if (model.dflash_attn_kv_stacked) {
+            const char * injection_mode = ubatch.embd ? "embd" : "external";
+            if (use_stacked_kv) {
+                LLAMA_LOG_INFO(
+                        "%s: adaptive stacked DFlash Qwen KV decision=stacked, mode=%s, rows=%lld, min_rows=%u\n",
+                        __func__, injection_mode, (long long) n_tokens, hparams.dflash_stacked_kv_min_rows);
+            } else {
+                LLAMA_LOG_DEBUG(
+                        "%s: adaptive stacked DFlash Qwen KV decision=legacy, mode=%s, rows=%lld, min_rows=%u, compatible=%d\n",
+                        __func__, injection_mode, (long long) n_tokens, hparams.dflash_stacked_kv_min_rows,
+                        stacked_compatible ? 1 : 0);
+            }
+        }
         if (use_stacked_kv) {
             kv_stacked = ggml_mul_mat(ctx0, model.dflash_attn_kv_stacked, inp_g);
             cb(kv_stacked, "kv_stacked", -1);
@@ -688,8 +723,25 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         }
 
         ggml_tensor * kv_stacked = nullptr;
-        const bool use_stacked_kv = dflash_can_use_stacked_dsv4(
+        const bool stacked_compatible = dflash_can_use_stacked_dsv4(
                 model, loras, n_embd, n_embd_head, n_layer);
+        // n_tokens is the total number of injection rows across all sequences
+        // in this ubatch, i.e. the RHS columns projected by the combined GEMM.
+        const bool use_stacked_kv = dflash_should_use_stacked_kv(
+                stacked_compatible, hparams.dflash_stacked_kv_min_rows, n_tokens);
+        if (model.dflash_attn_kv_stacked) {
+            const char * injection_mode = ubatch.embd ? "embd" : "external";
+            if (use_stacked_kv) {
+                LLAMA_LOG_INFO(
+                        "%s: adaptive stacked DFlash DSV4 KV decision=stacked, mode=%s, rows=%lld, min_rows=%u\n",
+                        __func__, injection_mode, (long long) n_tokens, hparams.dflash_stacked_kv_min_rows);
+            } else {
+                LLAMA_LOG_DEBUG(
+                        "%s: adaptive stacked DFlash DSV4 KV decision=legacy, mode=%s, rows=%lld, min_rows=%u, compatible=%d\n",
+                        __func__, injection_mode, (long long) n_tokens, hparams.dflash_stacked_kv_min_rows,
+                        stacked_compatible ? 1 : 0);
+            }
+        }
         if (use_stacked_kv) {
             kv_stacked = ggml_mul_mat(ctx0, model.dflash_attn_kv_stacked, inp_g);
             cb(kv_stacked, "kv_stacked", -1);

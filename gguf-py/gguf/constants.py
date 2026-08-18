@@ -161,6 +161,7 @@ class Keys:
         DENSE_FEAT_OUT_SIZE               = "{arch}.{dense}_feat_out"
         TARGET_LAYERS                     = "{arch}.target_layers"
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
+        DFLASH_STACKED_KV_MIN_ROWS         = "{arch}.stacked_kv_min_rows"
         BLOCK_SIZE                        = "{arch}.block_size"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"

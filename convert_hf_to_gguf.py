@@ -172,8 +172,20 @@ def parse_args() -> argparse.Namespace:
             "compatible runtimes use one matmul during KV injection while GGUFs without it keep the legacy path"
         ),
     )
+    parser.add_argument(
+        "--dflash-stacked-kv-min-rows", type=int,
+        help=(
+            "minimum logical KV-injection rows for the optional stacked projection; "
+            "0 disables it (default: 16 for DFlash, 0 for DSpark)"
+        ),
+    )
 
     args = parser.parse_args()
+    if args.dflash_stacked_kv_min_rows is not None:
+        if args.dflash_stacked_kv_min_rows < 0 or args.dflash_stacked_kv_min_rows > 0xffffffff:
+            parser.error("--dflash-stacked-kv-min-rows must be between 0 and 4294967295")
+        if not args.dflash_stacked_kv:
+            parser.error("--dflash-stacked-kv-min-rows requires --dflash-stacked-kv")
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
     return args
@@ -298,6 +310,7 @@ def main() -> None:
                                       fuse_gate_up_exps=args.fuse_gate_up_exps,
                                       fp8_as_q8=args.fp8_as_q8,
                                       dflash_stacked_kv=args.dflash_stacked_kv,
+                                      dflash_stacked_kv_min_rows=args.dflash_stacked_kv_min_rows,
                                       )
 
         if args.vocab_only:
