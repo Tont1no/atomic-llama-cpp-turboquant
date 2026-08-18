@@ -51,7 +51,9 @@ the eight-node Q4_0/Q8_0 path.  For each matching dispatch it executes the
 direct fused writer first, then executes the exact normal fallback sequence
 (three-op fused, two-op RMS/MUL fused, or individual RMS/MUL/ROPE according to
 the same runtime fusion priority, standalone FWHT, ordinary `SET_ROWS`) and compares only
-the indexed raw quantized cache rows. Direct-first ordering is required because
+the indexed raw quantized cache rows. It also snapshots the complete cache and
+requires every unaddressed row to remain byte-identical after both direct
+passes and the fallback. Direct-first ordering is required because
 the graph allocator may reuse the dead RMS input allocation for a later FWHT
 intermediate; fallback-first would then corrupt the input before the diagnostic
 direct launch. The direct writer is repeated after poisoning its destination
@@ -78,6 +80,15 @@ Remove-Item Env:GGML_CUDA_DISABLE_GRAPHS
 
 A `DFlash-K raw cache validation PASS` line is the byte-identity signal.  The
 ordinary numerical backend result alone is not sufficient for this gate.
+
+The model-like fixture also makes its FP32 inputs, positions, and untouched
+cache rows deterministic. Its separate CPU-versus-CUDA semantic check uses a
+quantization-local oracle instead of the default `1e-7` NMSE: dequantized
+untouched rows must match exactly, and each written Q4_0/Q8_0 block may differ
+by at most one FP16 scale ULP and one quantization level, with written-row NMSE
+capped at `5e-6`. This admits only boundary amplification from the different
+CPU and CUDA FP32 pipelines; it does not replace the exact CUDA
+direct-versus-fallback byte comparison or the deterministic logits/KV harness.
 
 `CUDA0` is intentional: `-b CUDA` does not match the numbered backend name and
 can report success after running zero focused cases.
