@@ -932,7 +932,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool device_fastpath_reported = false;
     bool device_fallback_reported = false;
-    bool device_guard_reported    = false;
+    bool device_guard_reported[3] = {};
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -1098,6 +1098,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        const int device_shape_bucket = n_tokens == 1 ? 0 : n_tokens <= 16 ? 1 : 2;
+        const char * device_shape_name = device_shape_bucket == 0 ? "single" :
+                                         device_shape_bucket == 1 ? "verify" : "prompt";
 
         // Safe generation fast path: one logical ubatch and token input. The
         // context API uses the retained target ubatch order for both features
@@ -1120,11 +1123,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        if (has_tokens && !device_candidate && !device_guard_reported) {
-            LOG_INF("%s: device-resident DFlash reject=common_batch_guard n_tokens=%d draft_ubatch=%d target_ubatch=%d metadata=%d\n",
-                    __func__, n_tokens, n_ubatch, (int32_t) llama_n_ubatch(ctx_tgt),
+        if (has_tokens && !device_candidate && !device_guard_reported[device_shape_bucket]) {
+            LOG_INF("%s: device-resident DFlash reject=common_batch_guard bucket=%s n_tokens=%d draft_ubatch=%d target_ubatch=%d metadata=%d\n",
+                    __func__, device_shape_name, n_tokens, n_ubatch, (int32_t) llama_n_ubatch(ctx_tgt),
                     (int) (batch_in.pos && batch_in.n_seq_id && batch_in.seq_id));
-            device_guard_reported = true;
+            device_guard_reported[device_shape_bucket] = true;
         }
 
         if (device_candidate) {

@@ -1798,8 +1798,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    const int dflash_shape_bucket = n_tokens_all == 1 ? 0 : n_tokens_all <= 16 ? 1 : 2;
+    const char * dflash_shape_name = dflash_shape_bucket == 0 ? "single" :
+                                     dflash_shape_bucket == 1 ? "verify" : "prompt";
+    const bool dflash_target_diag = embeddings_layer_inp_device;
+    uint32_t dflash_target_ubatch_count = 0;
+    uint32_t dflash_target_ubatch_sizes[4] = {};
+    uint32_t dflash_target_ubatch_overflow = 0;
+    uint32_t dflash_target_split_at = 0;
+    uint32_t dflash_target_split_rows = 0;
+    bool dflash_target_defer_split = false;
+
     // The imported activations must all come from one retained graph.
     defer_layer_inp_host = embeddings_layer_inp_device && n_tokens_all <= cparams.n_ubatch;
+    const bool dflash_target_defer_initial = defer_layer_inp_host;
 
     if (output_all) {
         // require that all tokens are output
@@ -1925,9 +1937,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
     do {
         const auto & ubatch = mctx->get_ubatch();
 
+        if (dflash_target_diag) {
+            if (dflash_target_ubatch_count < 4) {
+                dflash_target_ubatch_sizes[dflash_target_ubatch_count] = ubatch.n_tokens;
+            } else {
+                ++dflash_target_ubatch_overflow;
+            }
+            ++dflash_target_ubatch_count;
+        }
+
         // Some memory implementations split even a small logical batch. Do
         // not defer in that case because only the final graph is retained.
         if (defer_layer_inp_host && (n_tokens_prev != 0 || ubatch.n_tokens != n_tokens_all)) {
+            dflash_target_defer_split = true;
+            dflash_target_split_at = dflash_target_ubatch_count;
+            dflash_target_split_rows = ubatch.n_tokens;
             defer_layer_inp_host = false;
         }
 
@@ -2125,6 +2149,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    if (dflash_target_diag && !(dflash_target_decode_reported[dflash_shape_bucket] & 1ull)) {
+        uint32_t retained_graph_rows = 0;
+        uint32_t retained_graph_n_pos = 0;
+        if (gf_res_prev) {
+            const llama_ubatch & retained = gf_res_prev->get_ubatch();
+            retained_graph_rows = retained.n_tokens;
+            retained_graph_n_pos = retained.n_pos;
+        }
+        LLAMA_LOG_INFO("%s: DFlash target-retention bucket=%s logical_rows=%u ubatches=%u sizes=[%u,%u,%u,%u] overflow=%u defer_initial=%d split=%d split_at=%u split_rows=%u defer_final=%d ready=%d retained_rows=%zu/%zu graph_rows=%u graph_n_pos=%u\n",
+                __func__, dflash_shape_name, n_tokens_all, dflash_target_ubatch_count,
+                dflash_target_ubatch_sizes[0], dflash_target_ubatch_sizes[1],
+                dflash_target_ubatch_sizes[2], dflash_target_ubatch_sizes[3],
+                dflash_target_ubatch_overflow, (int) dflash_target_defer_initial,
+                (int) dflash_target_defer_split, dflash_target_split_at, dflash_target_split_rows,
+                (int) defer_layer_inp_host, (int) embd_layer_inp_device_ready,
+                device_layer_inp_seq_ids.size(), device_layer_inp_pos.size(),
+                retained_graph_rows, retained_graph_n_pos);
+        dflash_target_decode_reported[dflash_shape_bucket] |= 1ull;
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -2196,11 +2240,17 @@ bool llama_context::decode_dflash_features(
         REJECT_DRAFT_UBATCH   = 1ull << 5,
     };
 
+    const int reject_bucket = batch_inp.n_tokens == 1 ? 0 : batch_inp.n_tokens <= 16 ? 1 : 2;
+    const char * reject_bucket_name = reject_bucket == 0 ? "single" :
+                                      reject_bucket == 1 ? "verify" : "prompt";
+    uint64_t & reject_reported = dflash_device_reject_reported[reject_bucket];
+
     auto reject = [&](reject_reason reason, const char * name) {
         ctx_tgt.materialize_layer_inputs_host();
-        if (!(dflash_device_reject_reported & reason)) {
-            LLAMA_LOG_INFO("%s: device-resident DFlash reject=%s\n", __func__, name);
-            dflash_device_reject_reported |= reason;
+        if (!(reject_reported & reason)) {
+            LLAMA_LOG_INFO("%s: device-resident DFlash reject=%s bucket=%s n_tokens=%d\n",
+                    __func__, name, reject_bucket_name, batch_inp.n_tokens);
+            reject_reported |= reason;
         }
         return false;
     };
@@ -2212,13 +2262,13 @@ bool llama_context::decode_dflash_features(
             !batch_inp.embd || batch_inp.token ||
             batch_inp.n_tokens <= 0 || (uint32_t) batch_inp.n_tokens > cparams.n_ubatch ||
             !batch_inp.pos || !batch_inp.n_seq_id || !batch_inp.seq_id) {
-        if (!(dflash_device_reject_reported & REJECT_GUARD)) {
-            LLAMA_LOG_INFO("%s: device-resident DFlash reject=guard arch=%d unified=%d dsv4=%d embd=%d token=%d n_tokens=%d ubatch=%u metadata=%d\n",
-                    __func__, (int) model.arch, (int) cparams.kv_unified,
+        if (!(reject_reported & REJECT_GUARD)) {
+            LLAMA_LOG_INFO("%s: device-resident DFlash reject=guard bucket=%s arch=%d unified=%d dsv4=%d embd=%d token=%d n_tokens=%d ubatch=%u metadata=%d\n",
+                    __func__, reject_bucket_name, (int) model.arch, (int) cparams.kv_unified,
                     (int) (model.hparams.dsv4_hc_mult > 0), (int) (batch_inp.embd != nullptr),
                     (int) (batch_inp.token != nullptr), batch_inp.n_tokens, cparams.n_ubatch,
                     (int) (batch_inp.pos && batch_inp.n_seq_id && batch_inp.seq_id));
-            dflash_device_reject_reported |= REJECT_GUARD;
+            reject_reported |= REJECT_GUARD;
         }
         ctx_tgt.materialize_layer_inputs_host();
         return false;
@@ -2227,11 +2277,11 @@ bool llama_context::decode_dflash_features(
     if (!ctx_tgt.embd_layer_inp_device_ready || !ctx_tgt.gf_res_prev ||
             ctx_tgt.device_layer_inp_seq_ids.size() != (size_t) batch_inp.n_tokens ||
             ctx_tgt.device_layer_inp_pos.size() != (size_t) batch_inp.n_tokens) {
-        if (!(dflash_device_reject_reported & REJECT_TARGET_READY)) {
-            LLAMA_LOG_INFO("%s: device-resident DFlash reject=target_ready ready=%d graph=%d rows=%zu/%zu expected=%d\n",
-                    __func__, (int) ctx_tgt.embd_layer_inp_device_ready, (int) (ctx_tgt.gf_res_prev != nullptr),
+        if (!(reject_reported & REJECT_TARGET_READY)) {
+            LLAMA_LOG_INFO("%s: device-resident DFlash reject=target_ready bucket=%s ready=%d graph=%d rows=%zu/%zu expected=%d\n",
+                    __func__, reject_bucket_name, (int) ctx_tgt.embd_layer_inp_device_ready, (int) (ctx_tgt.gf_res_prev != nullptr),
                     ctx_tgt.device_layer_inp_seq_ids.size(), ctx_tgt.device_layer_inp_pos.size(), batch_inp.n_tokens);
-            dflash_device_reject_reported |= REJECT_TARGET_READY;
+            reject_reported |= REJECT_TARGET_READY;
         }
         ctx_tgt.materialize_layer_inputs_host();
         return false;
@@ -2251,15 +2301,15 @@ bool llama_context::decode_dflash_features(
     std::sort(source_rows.begin(), source_rows.end());
     std::sort(input_rows.begin(), input_rows.end());
     if (source_rows != input_rows) {
-        if (!(dflash_device_reject_reported & REJECT_ROW_SET)) {
+        if (!(reject_reported & REJECT_ROW_SET)) {
             size_t mismatch = 0;
             while (mismatch < source_rows.size() && mismatch < input_rows.size() &&
                     source_rows[mismatch] == input_rows[mismatch]) {
                 ++mismatch;
             }
-            LLAMA_LOG_INFO("%s: device-resident DFlash reject=row_set rows=%zu/%zu mismatch=%zu\n",
-                    __func__, source_rows.size(), input_rows.size(), mismatch);
-            dflash_device_reject_reported |= REJECT_ROW_SET;
+            LLAMA_LOG_INFO("%s: device-resident DFlash reject=row_set bucket=%s rows=%zu/%zu mismatch=%zu\n",
+                    __func__, reject_bucket_name, source_rows.size(), input_rows.size(), mismatch);
+            reject_reported |= REJECT_ROW_SET;
         }
         ctx_tgt.materialize_layer_inputs_host();
         return false;
@@ -2303,14 +2353,14 @@ bool llama_context::decode_dflash_features(
         if (!tensor || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
                 tensor->ne[0] != n_embd_tgt || tensor->ne[1] != batch_inp.n_tokens ||
                 tensor->ne[2] != 1 || tensor->ne[3] != 1) {
-            if (!(dflash_device_reject_reported & REJECT_TENSOR_SHAPE)) {
-                LLAMA_LOG_INFO("%s: device-resident DFlash reject=tensor_shape layer=%d tensor=%d type=%s contiguous=%d shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] expected=[%" PRId64 ",%d,1,1]\n",
-                        __func__, il, (int) (tensor != nullptr), tensor ? ggml_type_name(tensor->type) : "none",
+            if (!(reject_reported & REJECT_TENSOR_SHAPE)) {
+                LLAMA_LOG_INFO("%s: device-resident DFlash reject=tensor_shape bucket=%s layer=%d tensor=%d type=%s contiguous=%d shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] expected=[%" PRId64 ",%d,1,1]\n",
+                        __func__, reject_bucket_name, il, (int) (tensor != nullptr), tensor ? ggml_type_name(tensor->type) : "none",
                         tensor ? (int) ggml_is_contiguous(tensor) : 0,
                         tensor ? tensor->ne[0] : 0, tensor ? tensor->ne[1] : 0,
                         tensor ? tensor->ne[2] : 0, tensor ? tensor->ne[3] : 0,
                         n_embd_tgt, batch_inp.n_tokens);
-                dflash_device_reject_reported |= REJECT_TENSOR_SHAPE;
+                reject_reported |= REJECT_TENSOR_SHAPE;
             }
             ctx_tgt.materialize_layer_inputs_host();
             return false;
@@ -2354,11 +2404,11 @@ bool llama_context::decode_dflash_features(
     external_layer_inputs.clear();
     if (rejected) {
         ret = 0;
-        if (!(dflash_device_reject_reported & REJECT_DRAFT_UBATCH)) {
-            LLAMA_LOG_INFO("%s: device-resident DFlash reject=draft_ubatch actual_tokens=%u expected_tokens=%d mismatch_row=%d\n",
-                    __func__, external_layer_inputs_actual_tokens, batch_inp.n_tokens,
+        if (!(reject_reported & REJECT_DRAFT_UBATCH)) {
+            LLAMA_LOG_INFO("%s: device-resident DFlash reject=draft_ubatch bucket=%s actual_tokens=%u expected_tokens=%d mismatch_row=%d\n",
+                    __func__, reject_bucket_name, external_layer_inputs_actual_tokens, batch_inp.n_tokens,
                     external_layer_inputs_mismatch_row);
-            dflash_device_reject_reported |= REJECT_DRAFT_UBATCH;
+            reject_reported |= REJECT_DRAFT_UBATCH;
         }
         ctx_tgt.materialize_layer_inputs_host();
         return false;

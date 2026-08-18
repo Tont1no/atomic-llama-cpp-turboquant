@@ -51,11 +51,16 @@ reachable nodes and ancestors. It rejects the graph if a raw target tensor is
 reachable or any detached source leaf is missing, and logs the graph node/leaf
 counts with `target_ancestors=0` on the first validated graph.
 
-Guard failures are reported once per low-cardinality reason to keep production
-logs useful without per-token noise: `common_batch_guard`, `guard`,
+Guard failures are reported once per low-cardinality reason and batch-shape
+bucket (`single`, `verify` up to 16 rows, or `prompt`) to keep production logs
+useful without per-token noise: `common_batch_guard`, `guard`,
 `target_ready`, `row_set`, `device_backend`, `tensor_shape`, or
 `draft_ubatch`. Shape and prepared-ubatch failures include bounded dimensions or
-row indices needed to identify the violated guard.
+row indices needed to identify the violated guard. The opted-in target also
+reports one retention summary per shape bucket, including the actual ubatch
+count and first four sizes, split point, deferred-extraction state, and retained
+row/graph metadata. This keeps a prompt-prefill rejection from hiding the first
+generation verification result.
 
 Changed source files:
 
