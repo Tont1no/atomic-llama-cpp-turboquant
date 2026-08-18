@@ -457,6 +457,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const auto kv_head  = mctx_cur->get_head();
     const auto mem_size = mctx_cur->get_size();
+    const uint32_t active_n_rs_seq = mctx_cur->get_active_n_rs_seq();
 
     const int64_t n_seqs = ubatch.n_seqs;
 
@@ -476,7 +477,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (active_n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -499,7 +500,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K = (int64_t) active_n_rs_seq + 1;
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -537,13 +538,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
+    const uint32_t active_n_rs_seq = mctx_cur->get_active_n_rs_seq();
 
     const int64_t S_v          = s->ne[0];
     const int64_t H_v          = s->ne[2];
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = active_n_rs_seq > 0;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
@@ -561,7 +563,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    const int64_t K = active_n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);

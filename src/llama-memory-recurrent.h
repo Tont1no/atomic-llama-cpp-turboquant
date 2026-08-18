@@ -24,6 +24,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                         bool   rs_seq_dynamic,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -73,10 +74,24 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // When enabled, each decode executes only the snapshot depth required by
+    // the rows present for a sequence in that batch. The cache allocation and
+    // rollback address space always retain the configured n_rs_seq maximum.
+    const bool rs_seq_dynamic = false;
+
+    // Resolve a safe execution depth for the sanitized batch. Invalid or
+    // ambiguous metadata fails closed to the configured maximum.
+    uint32_t active_rs_depth(const llama_batch & batch, bool embd_all, bool * used_fallback = nullptr);
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // Per-sequence snapshot depth known to have been written by the most
+    // recent dynamic graph. Prevents selecting stale max-allocation planes.
+    std::vector<uint32_t> rs_valid_depth;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+    void commit_rs_depth(const llama_ubatch & ubatch, uint32_t active_depth);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -118,6 +133,8 @@ private:
 
     const uint32_t n_seq_max = 1;
 
+    uint32_t last_reported_active_n_rs_seq = UINT32_MAX;
+
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
@@ -145,7 +162,8 @@ public:
     // used to create a batch processing context from a batch
     llama_memory_recurrent_context(
             llama_memory_recurrent * mem,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            uint32_t active_n_rs_seq);
 
     virtual ~llama_memory_recurrent_context();
 
@@ -164,6 +182,7 @@ public:
     //
 
     uint32_t get_n_rs() const;
+    uint32_t get_active_n_rs_seq() const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
@@ -182,6 +201,10 @@ private:
 
     std::vector<llama_ubatch> ubatches;
 
+    // Maximum active depth requested for this logical batch. Individual
+    // ragged ubatches may safely use a smaller depth based on their row count.
+    const uint32_t active_n_rs_seq = 0;
+
     //
     // data needed for building the compute graph for the current ubatch:
     // TODO: extract all the state like `head` and `n` here
@@ -189,3 +212,12 @@ private:
 
     const bool is_full = false;
 };
+
+// Pure batch-metadata helper used by the dynamic rollback implementation and
+// its unit tests. Returns configured_max and sets used_fallback on malformed
+// metadata; otherwise returns min(configured_max, max_rows_per_seq - 1).
+uint32_t llama_recurrent_batch_active_rs_depth(
+        const llama_batch & batch,
+        uint32_t configured_max,
+        uint32_t n_seq_max,
+        bool * used_fallback = nullptr);
