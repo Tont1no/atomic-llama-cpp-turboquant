@@ -239,6 +239,12 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool stage_layer_inputs_device(
+            const llm_graph_result * res,
+            size_t token_offset,
+            size_t n_tokens,
+            size_t n_tokens_all);
+    void extract_staged_layer_inputs(size_t n_tokens);
     void materialize_layer_inputs_host();
 
     //
@@ -317,11 +323,27 @@ private:
     bool defer_layer_inp_host         = false;
 
     std::vector<ggml_tensor *> external_layer_inputs;
+    std::vector<ggml_tensor *> device_layer_inp_tensors;
     std::vector<llama_seq_id> device_layer_inp_seq_ids;
     std::vector<llama_pos>    device_layer_inp_pos;
     uint32_t device_layer_inp_n_tokens = 0;
     uint32_t device_layer_inp_n_pos    = 0;
     bool device_layer_inp_text_tokens  = false;
+    bool device_layer_inp_staged       = false;
+    uint32_t device_layer_inp_staged_rows = 0;
+
+    struct dflash_layer_stage {
+        // Declare metadata before the allocation so the buffer is destroyed
+        // first (members are destroyed in reverse declaration order).
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_backend_t backend = nullptr; // non-owning scheduler backend
+        ggml_backend_buffer_type_t buft = nullptr;
+        uint32_t capacity = 0;
+        int64_t n_embd = 0;
+        std::vector<int32_t> lids;
+        std::vector<ggml_tensor *> tensors;
+    } device_layer_stage;
     bool external_layer_inputs_rejected = false;
     uint32_t external_layer_inputs_actual_tokens = 0;
     int32_t  external_layer_inputs_mismatch_row  = -1;

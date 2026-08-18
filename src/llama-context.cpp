@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -484,6 +485,12 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // The staging buffer was allocated from a scheduler backend. Release it
+    // explicitly while that backend is still alive; member destruction would
+    // otherwise destroy sched/backends before this earlier-declared member.
+    device_layer_stage.buf.reset();
+    device_layer_stage.ctx.reset();
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1405,9 +1412,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     if (tensor == source) {
                         source_reachable = true;
                     }
-                    if (detached_leaf && tensor != source &&
+                    const bool exact_prefix = tensor->type == source->type &&
+                            tensor->ne[0] == source->ne[0] &&
+                            tensor->ne[1] == gparams.ubatch.n_tokens &&
+                            source->ne[1] >= tensor->ne[1] &&
+                            tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+                            source->ne[2] == 1 && source->ne[3] == 1 &&
+                            tensor->nb[0] == source->nb[0] && tensor->nb[1] == source->nb[1];
+                    if (detached_leaf && tensor != source && exact_prefix &&
                             tensor->view_src == nullptr && tensor->buffer == source->buffer &&
-                            tensor->data == source->data && ggml_are_same_shape(tensor, source)) {
+                            tensor->data == source->data) {
                         imported[i] = true;
                     }
                 }
@@ -1726,8 +1740,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
-    // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
+    // so accept either present rather than requiring exactly one. DFlash can
+    // also decode metadata-only batches when feature rows are imported from a
+    // retained target graph.
+    GGML_ASSERT(batch_inp.token || batch_inp.embd ||
+            (model.arch == LLM_ARCH_DFLASH && !external_layer_inputs.empty()));
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1745,18 +1762,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
     external_layer_inputs_actual_tokens = 0;
     external_layer_inputs_mismatch_row  = -1;
     std::fill(embd_layer_inp_host_ready.begin(), embd_layer_inp_host_ready.end(), false);
+    device_layer_inp_tensors.assign(cparams.embeddings_layer_inp.size(), nullptr);
     device_layer_inp_seq_ids.clear();
     device_layer_inp_pos.clear();
     device_layer_inp_n_tokens = 0;
     device_layer_inp_n_pos = 0;
     device_layer_inp_text_tokens = false;
+    device_layer_inp_staged = false;
+    device_layer_inp_staged_rows = 0;
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const bool dflash_external = model.arch == LLM_ARCH_DFLASH && batch_inp.embd && !external_layer_inputs.empty();
+    const bool dflash_external = model.arch == LLM_ARCH_DFLASH && !external_layer_inputs.empty();
     const int64_t n_embd = dflash_external ? hparams.n_embd_inp_enc() :
                            mtp_embd         ? hparams.n_embd_out()     : hparams.n_embd_inp();
 
@@ -1902,7 +1922,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (!external_layer_inputs.empty()) {
         const llama_ubatch & actual = mctx->get_ubatch();
         external_layer_inputs_actual_tokens = actual.n_tokens;
-        bool exact_single_ubatch = actual.embd && actual.n_tokens == n_tokens_all &&
+        bool exact_single_ubatch = !actual.token && !actual.embd && actual.n_tokens == n_tokens_all &&
                 n_tokens_all == (uint32_t) batch_inp.n_tokens &&
                 actual.n_pos == hparams.n_pos_per_embd() && actual.pos && actual.n_seq_id && actual.seq_id &&
                 batch_inp.pos && batch_inp.n_seq_id && batch_inp.seq_id;
@@ -1957,18 +1977,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ++dflash_target_ubatch_count;
         }
 
-        // Some memory implementations split even a small logical batch. Do
-        // not defer in that case because only the final graph is retained.
+        // Hybrid/recurrent memory can split a small logical batch when active
+        // sequences contribute unequal row counts. Retain those activations
+        // in a context-owned device buffer before the compute graph is reused.
         if (defer_layer_inp_host && (n_tokens_prev != 0 || ubatch.n_tokens != n_tokens_all)) {
-            dflash_target_defer_split = true;
-            dflash_target_split_at = dflash_target_ubatch_count;
-            dflash_target_split_rows = ubatch.n_tokens;
-            defer_layer_inp_host = false;
-            device_layer_inp_seq_ids.clear();
-            device_layer_inp_pos.clear();
-            device_layer_inp_n_tokens = 0;
-            device_layer_inp_n_pos = 0;
-            device_layer_inp_text_tokens = false;
+            if (!dflash_target_defer_split) {
+                dflash_target_defer_split = true;
+                dflash_target_split_at = dflash_target_ubatch_count;
+                dflash_target_split_rows = ubatch.n_tokens;
+            }
+            device_layer_inp_staged = true;
         }
 
         // count the outputs in this ubatch
@@ -2110,7 +2128,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        if (device_layer_inp_staged) {
+            if (!stage_layer_inputs_device(res, n_tokens_prev, ubatch.n_tokens, n_tokens_all)) {
+                // Preserve already staged rows before falling back to the
+                // established per-UBatch host extraction path.
+                if (n_tokens_prev > 0) {
+                    extract_staged_layer_inputs(n_tokens_prev);
+                }
+                defer_layer_inp_host = false;
+                device_layer_inp_staged = false;
+                device_layer_inp_staged_rows = 0;
+                std::fill(device_layer_inp_tensors.begin(), device_layer_inp_tensors.end(), nullptr);
+                device_layer_inp_seq_ids.clear();
+                device_layer_inp_pos.clear();
+                device_layer_inp_n_tokens = 0;
+                device_layer_inp_n_pos = 0;
+                device_layer_inp_text_tokens = false;
+                extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+            }
+        } else {
+            extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2145,20 +2183,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // context is still positioned on this ubatch. llm_graph_result may be
         // reused, so its previously stored ubatch is not a safe metadata source.
         if (defer_layer_inp_host) {
-            device_layer_inp_n_tokens = ubatch.n_tokens;
-            device_layer_inp_n_pos = ubatch.n_pos;
-            device_layer_inp_text_tokens = ubatch.token != nullptr;
-            device_layer_inp_seq_ids.resize(ubatch.n_tokens);
-            device_layer_inp_pos.resize((size_t) ubatch.n_tokens * ubatch.n_pos);
+            if (device_layer_inp_n_pos == 0) {
+                device_layer_inp_n_pos = ubatch.n_pos;
+                device_layer_inp_text_tokens = ubatch.token != nullptr;
+                device_layer_inp_seq_ids.resize(n_tokens_all);
+                device_layer_inp_pos.resize((size_t) n_tokens_all * ubatch.n_pos);
+            }
 
-            bool metadata_valid = ubatch.n_pos == hparams.n_pos_per_embd() &&
+            bool metadata_valid = device_layer_inp_n_pos == ubatch.n_pos &&
+                    ubatch.n_pos == hparams.n_pos_per_embd() &&
                     ubatch.pos && ubatch.n_seq_id && ubatch.seq_id;
             for (uint32_t i = 0; metadata_valid && i < ubatch.n_tokens; ++i) {
                 metadata_valid = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i];
                 if (!metadata_valid) {
                     break;
                 }
-                device_layer_inp_seq_ids[i] = ubatch.seq_id[i][0];
+                device_layer_inp_seq_ids[n_tokens_prev + i] = ubatch.seq_id[i][0];
                 for (uint32_t p = 0; p < ubatch.n_pos; ++p) {
                     llama_pos value = ubatch.pos[(size_t) p * ubatch.n_tokens + i];
                     // Text-token M-RoPE is transformed to [p,p,p,0] by
@@ -2167,15 +2207,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (ubatch.token && ubatch.n_pos == 4 && p == 3) {
                         value = 0;
                     }
-                    device_layer_inp_pos[(size_t) p * ubatch.n_tokens + i] = value;
+                    device_layer_inp_pos[(size_t) p * n_tokens_all + n_tokens_prev + i] = value;
                 }
             }
             if (!metadata_valid) {
+                if (device_layer_inp_staged && device_layer_inp_staged_rows > 0) {
+                    extract_staged_layer_inputs(device_layer_inp_staged_rows);
+                } else {
+                    defer_layer_inp_host = false;
+                    extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+                }
                 device_layer_inp_seq_ids.clear();
                 device_layer_inp_pos.clear();
                 device_layer_inp_n_tokens = 0;
                 device_layer_inp_n_pos = 0;
                 device_layer_inp_text_tokens = false;
+                defer_layer_inp_host = false;
+                device_layer_inp_staged = false;
+                device_layer_inp_staged_rows = 0;
+                std::fill(device_layer_inp_tensors.begin(), device_layer_inp_tensors.end(), nullptr);
+            } else {
+                device_layer_inp_n_tokens = n_tokens_prev + ubatch.n_tokens;
+                device_layer_inp_text_tokens = device_layer_inp_text_tokens && ubatch.token != nullptr;
             }
         }
 
@@ -2184,7 +2237,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
     } while (mctx->next());
 
     if (defer_layer_inp_host && n_tokens_prev == n_tokens_all) {
-        embd_layer_inp_device_ready = device_layer_inp_n_tokens == n_tokens_all &&
+        bool sources_valid = device_layer_inp_staged ? device_layer_inp_staged_rows == n_tokens_all : gf_res_prev != nullptr;
+        for (uint32_t il = 0; sources_valid && il < cparams.embeddings_layer_inp.size(); ++il) {
+            if (!cparams.embeddings_layer_inp[il]) {
+                continue;
+            }
+            if (!device_layer_inp_staged) {
+                device_layer_inp_tensors[il] = gf_res_prev->get_layer_inp(il);
+            }
+            sources_valid = device_layer_inp_tensors[il] != nullptr;
+        }
+
+        embd_layer_inp_device_ready = sources_valid && device_layer_inp_n_tokens == n_tokens_all &&
                 device_layer_inp_n_pos == hparams.n_pos_per_embd() &&
                 device_layer_inp_seq_ids.size() == n_tokens_all &&
                 device_layer_inp_pos.size() == (size_t) n_tokens_all * device_layer_inp_n_pos;
@@ -2193,7 +2257,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (dflash_target_diag && !(dflash_target_decode_reported[dflash_shape_bucket] & 1ull)) {
+    const uint64_t dflash_target_diag_bit = dflash_target_defer_split ? 2ull : 1ull;
+    if (dflash_target_diag && !(dflash_target_decode_reported[dflash_shape_bucket] & dflash_target_diag_bit)) {
         uint32_t retained_graph_rows = 0;
         uint32_t retained_graph_n_pos = 0;
         if (gf_res_prev) {
@@ -2201,18 +2266,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             retained_graph_rows = retained.n_tokens;
             retained_graph_n_pos = retained.n_pos;
         }
-        LLAMA_LOG_INFO("%s: DFlash target-retention bucket=%s logical_rows=%u ubatches=%u sizes=[%u,%u,%u,%u] overflow=%u defer_initial=%d split=%d split_at=%u split_rows=%u defer_final=%d ready=%d retained_seq_rows=%zu retained_pos_values=%zu retained_n_pos=%u text_tokens=%d graph_rows=%u graph_n_pos=%u\n",
+        LLAMA_LOG_INFO("%s: DFlash target-retention bucket=%s logical_rows=%u ubatches=%u sizes=[%u,%u,%u,%u] overflow=%u defer_initial=%d split=%d split_at=%u split_rows=%u defer_final=%d ready=%d staged=%d staged_rows=%u retained_seq_rows=%zu retained_pos_values=%zu retained_n_pos=%u text_tokens=%d graph_rows=%u graph_n_pos=%u\n",
                 __func__, dflash_shape_name, n_tokens_all, dflash_target_ubatch_count,
                 dflash_target_ubatch_sizes[0], dflash_target_ubatch_sizes[1],
                 dflash_target_ubatch_sizes[2], dflash_target_ubatch_sizes[3],
                 dflash_target_ubatch_overflow, (int) dflash_target_defer_initial,
                 (int) dflash_target_defer_split, dflash_target_split_at, dflash_target_split_rows,
                 (int) defer_layer_inp_host, (int) embd_layer_inp_device_ready,
+                (int) device_layer_inp_staged, device_layer_inp_staged_rows,
                 device_layer_inp_seq_ids.size(), device_layer_inp_pos.size(),
                 device_layer_inp_n_pos,
                 (int) device_layer_inp_text_tokens,
                 retained_graph_rows, retained_graph_n_pos);
-        dflash_target_decode_reported[dflash_shape_bucket] |= 1ull;
+        dflash_target_decode_reported[dflash_shape_bucket] |= dflash_target_diag_bit;
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2305,7 +2371,7 @@ bool llama_context::decode_dflash_features(
     // before cache application because iSWA can fall back to an equal split
     // after its initial simple split fails under cache fragmentation.
     if (model.arch != LLM_ARCH_DFLASH || !cparams.kv_unified || model.hparams.dsv4_hc_mult > 0 ||
-            !batch_inp.embd || batch_inp.token ||
+            batch_inp.embd || batch_inp.token ||
             batch_inp.n_tokens <= 0 || (uint32_t) batch_inp.n_tokens > cparams.n_ubatch ||
             !batch_inp.pos || !batch_inp.n_seq_id || !batch_inp.seq_id) {
         if (!(reject_reported & REJECT_GUARD)) {
@@ -2320,14 +2386,15 @@ bool llama_context::decode_dflash_features(
         return false;
     }
 
-    if (!ctx_tgt.embd_layer_inp_device_ready || !ctx_tgt.gf_res_prev ||
+    if (!ctx_tgt.embd_layer_inp_device_ready ||
             ctx_tgt.device_layer_inp_n_tokens != (uint32_t) batch_inp.n_tokens ||
             ctx_tgt.device_layer_inp_seq_ids.size() != (size_t) batch_inp.n_tokens ||
             ctx_tgt.device_layer_inp_pos.size() !=
                     (size_t) batch_inp.n_tokens * ctx_tgt.device_layer_inp_n_pos) {
         if (!(reject_reported & REJECT_TARGET_READY)) {
-            LLAMA_LOG_INFO("%s: device-resident DFlash reject=target_ready bucket=%s ready=%d graph=%d rows=%zu pos=%zu n_pos=%u expected=%d\n",
+            LLAMA_LOG_INFO("%s: device-resident DFlash reject=target_ready bucket=%s ready=%d graph=%d staged=%d staged_rows=%u rows=%zu pos=%zu n_pos=%u expected=%d\n",
                     __func__, reject_bucket_name, (int) ctx_tgt.embd_layer_inp_device_ready, (int) (ctx_tgt.gf_res_prev != nullptr),
+                    (int) ctx_tgt.device_layer_inp_staged, ctx_tgt.device_layer_inp_staged_rows,
                     ctx_tgt.device_layer_inp_seq_ids.size(), ctx_tgt.device_layer_inp_pos.size(),
                     ctx_tgt.device_layer_inp_n_pos, batch_inp.n_tokens);
             reject_reported |= REJECT_TARGET_READY;
@@ -2441,12 +2508,13 @@ bool llama_context::decode_dflash_features(
             return reject(REJECT_TARGET_READY, "target_ready");
         }
 
-        ggml_tensor * tensor = ctx_tgt.gf_res_prev->get_layer_inp(il);
+        ggml_tensor * tensor = il < (int32_t) ctx_tgt.device_layer_inp_tensors.size() ?
+                ctx_tgt.device_layer_inp_tensors[il] : nullptr;
         if (!tensor || tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
-                tensor->ne[0] != n_embd_tgt || tensor->ne[1] != batch_inp.n_tokens ||
+                tensor->ne[0] != n_embd_tgt || tensor->ne[1] < batch_inp.n_tokens ||
                 tensor->ne[2] != 1 || tensor->ne[3] != 1) {
             if (!(reject_reported & REJECT_TENSOR_SHAPE)) {
-                LLAMA_LOG_INFO("%s: device-resident DFlash reject=tensor_shape bucket=%s layer=%d tensor=%d type=%s contiguous=%d shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] expected=[%" PRId64 ",%d,1,1]\n",
+                LLAMA_LOG_INFO("%s: device-resident DFlash reject=tensor_shape bucket=%s layer=%d tensor=%d type=%s contiguous=%d shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] expected_prefix=[%" PRId64 ",>=%d,1,1]\n",
                         __func__, reject_bucket_name, il, (int) (tensor != nullptr), tensor ? ggml_type_name(tensor->type) : "none",
                         tensor ? (int) ggml_is_contiguous(tensor) : 0,
                         tensor ? tensor->ne[0] : 0, tensor ? tensor->ne[1] : 0,
@@ -2487,6 +2555,8 @@ bool llama_context::decode_dflash_features(
     }
 
     llama_batch device_batch = batch_inp;
+    device_batch.token    = nullptr;
+    device_batch.embd     = nullptr;
     device_batch.pos      = positions.data();
     device_batch.n_seq_id = n_seq_id.data();
     device_batch.seq_id   = seq_id.data();
@@ -2717,19 +2787,200 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     }
 }
 
-void llama_context::materialize_layer_inputs_host() {
-    if ((!defer_layer_inp_host && !embd_layer_inp_device_ready) || !gf_res_prev) {
+bool llama_context::stage_layer_inputs_device(
+        const llm_graph_result * res,
+        size_t token_offset,
+        size_t n_tokens,
+        size_t n_tokens_all) {
+    if (!res || n_tokens == 0 || n_tokens_all > cparams.n_ubatch || token_offset + n_tokens > n_tokens_all) {
+        return false;
+    }
+
+    std::vector<int32_t> lids;
+    std::vector<ggml_tensor *> sources;
+    ggml_backend_t backend = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    int64_t n_embd = 0;
+
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+
+        ggml_tensor * src = res->get_layer_inp(il);
+        if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+                src->ne[1] != (int64_t) n_tokens || src->ne[2] != 1 || src->ne[3] != 1 ||
+                !src->buffer || !src->data) {
+            return false;
+        }
+
+        ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched.get(), src);
+        ggml_backend_buffer_type_t src_buft = ggml_backend_buffer_get_type(src->buffer);
+        ggml_backend_dev_t src_device = src_backend ? ggml_backend_get_device(src_backend) : nullptr;
+        ggml_backend_reg_t src_reg = src_device ? ggml_backend_dev_backend_reg(src_device) : nullptr;
+        if (!src_backend || !src_buft || !src_device ||
+                ggml_backend_dev_type(src_device) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                !src_reg || std::strcmp(ggml_backend_reg_name(src_reg), "CUDA") != 0) {
+            return false;
+        }
+        if (!backend) {
+            backend = src_backend;
+            buft = src_buft;
+            n_embd = src->ne[0];
+        }
+        if (src_backend != backend || src_buft != buft || src->ne[0] != n_embd) {
+            return false;
+        }
+
+        lids.push_back((int32_t) il);
+        sources.push_back(src);
+    }
+
+    if (lids.empty()) {
+        return false;
+    }
+
+    auto & stage = device_layer_stage;
+    const uint32_t capacity = cparams.n_ubatch;
+    const bool stage_matches = stage.ctx && stage.buf && stage.backend == backend && stage.buft == buft &&
+            stage.capacity == capacity && stage.n_embd == n_embd && stage.lids == lids;
+
+    if (stage.ctx || stage.buf) {
+        // Draft graph leaves retain raw pointers into this storage. Do not
+        // reconfigure or free it while the paired contexts are alive: a
+        // mismatched configuration falls back to host rather than risking an
+        // ABA graph-reuse match against recycled tensor metadata.
+        if (!stage_matches) {
+            return false;
+        }
+    } else {
+        // A prior external draft graph is synchronized before the next target
+        // decode enters here. Complete the current target graph before the
+        // first allocation-backed D2D copy.
+        synchronize();
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ (lids.size() + 1) * ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        stage.ctx.reset(ggml_init(params));
+        if (!stage.ctx) {
+            return false;
+        }
+
+        for (int32_t il : lids) {
+            ggml_tensor * tensor = ggml_new_tensor_2d(stage.ctx.get(), GGML_TYPE_F32, n_embd, capacity);
+            ggml_format_name(tensor, "dflash_layer_stage_l%d", il);
+            stage.tensors.push_back(tensor);
+        }
+
+        stage.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(stage.ctx.get(), buft));
+        if (!stage.buf) {
+            stage.ctx.reset();
+            stage.tensors.clear();
+            return false;
+        }
+
+        stage.backend = backend;
+        stage.buft = buft;
+        stage.capacity = capacity;
+        stage.n_embd = n_embd;
+        stage.lids = lids;
+
+        LLAMA_LOG_INFO("%s: allocated DFlash target staging buffer = %.2f MiB, rows=%u, layers=%zu\n",
+                __func__, ggml_backend_buffer_get_size(stage.buf.get()) / 1024.0 / 1024.0,
+                capacity, lids.size());
+    }
+
+    ggml_init_params view_params = {
+        /*.mem_size   =*/ (lids.size() + 1) * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr view_ctx { ggml_init(view_params) };
+    if (!view_ctx) {
+        return false;
+    }
+
+    std::vector<ggml_tensor *> destinations;
+    destinations.reserve(lids.size());
+    for (size_t i = 0; i < lids.size(); ++i) {
+        ggml_tensor * dst = ggml_view_2d(
+                view_ctx.get(), stage.tensors[i], n_embd, n_tokens,
+                stage.tensors[i]->nb[1], token_offset * stage.tensors[i]->nb[1]);
+        if (ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (dst->ne[d] != sources[i]->ne[d] || dst->nb[d] != sources[i]->nb[d]) {
+                return false;
+            }
+        }
+        if (dst->type != sources[i]->type) {
+            return false;
+        }
+        destinations.push_back(dst);
+    }
+
+    for (size_t i = 0; i < lids.size(); ++i) {
+        ggml_backend_tensor_copy_async(backend, stage.backend, sources[i], destinations[i]);
+        device_layer_inp_tensors[lids[i]] = stage.tensors[i];
+    }
+    device_layer_inp_staged_rows = (uint32_t) (token_offset + n_tokens);
+
+    return true;
+}
+
+void llama_context::extract_staged_layer_inputs(size_t n_tokens) {
+    auto & stage = device_layer_stage;
+    if (!stage.backend || n_tokens == 0 || n_tokens > stage.capacity) {
         return;
     }
 
-    const llama_ubatch & ubatch = gf_res_prev->get_ubatch();
+    for (size_t i = 0; i < stage.lids.size(); ++i) {
+        const uint32_t il = stage.lids[i];
+        ggml_tensor * src = stage.tensors[i];
+        if (il >= embd_layer_inp.size() || !src || !embd_layer_inp[il].has_data()) {
+            continue;
+        }
+        const size_t nbytes = n_tokens * src->ne[0] * ggml_type_size(src->type);
+        GGML_ASSERT(nbytes <= embd_layer_inp[il].size * sizeof(float));
+        ggml_backend_tensor_get_async(stage.backend, src, embd_layer_inp[il].data, 0, nbytes);
+        embd_layer_inp_host_ready[il] = true;
+    }
+}
+
+void llama_context::materialize_layer_inputs_host() {
+    if ((!defer_layer_inp_host && !embd_layer_inp_device_ready) || device_layer_inp_n_tokens == 0) {
+        return;
+    }
+
     defer_layer_inp_host = false;
     embd_layer_inp_device_ready = false;
-    extract_layer_inputs(gf_res_prev.get(), 0, ubatch.n_tokens);
 
-    // extract_layer_inputs() schedules asynchronous D2H copies. This helper
-    // is also reached from a getter after that getter's initial synchronize(),
-    // so complete the newly scheduled copies before exposing host pointers.
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il] || il >= device_layer_inp_tensors.size()) {
+            continue;
+        }
+        ggml_tensor * src = device_layer_inp_tensors[il];
+        if (!src || !embd_layer_inp[il].has_data()) {
+            continue;
+        }
+
+        ggml_backend_t backend = device_layer_inp_staged ? device_layer_stage.backend :
+                ggml_backend_sched_get_tensor_backend(sched.get(), src);
+        if (!backend) {
+            continue;
+        }
+        const size_t nbytes = (size_t) device_layer_inp_n_tokens * src->ne[0] * ggml_type_size(src->type);
+        GGML_ASSERT(nbytes <= embd_layer_inp[il].size * sizeof(float));
+        ggml_backend_tensor_get_async(backend, src, embd_layer_inp[il].data, 0, nbytes);
+        embd_layer_inp_host_ready[il] = true;
+    }
+
+    // The getter may have synchronized before entering this helper. Complete
+    // the newly scheduled prefix copies before exposing host pointers.
     synchronize();
 }
 
