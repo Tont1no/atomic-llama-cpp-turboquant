@@ -29,6 +29,11 @@ public:
 
     ~llama_memory_recurrent() = default;
 
+    bool prepare_batch(
+            llama_context * lctx,
+            const llama_batch & batch,
+            bool embd_all) override;
+
     //
     // llama_memory_i
     //
@@ -74,9 +79,14 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // Physical rollback planes currently resident. This can be smaller than
+    // n_rs_seq for the dynamic Qwen/DFlash path; plane zero is always present.
+    uint32_t n_rs_seq_alloc = 0;
+
     // When enabled, each decode executes only the snapshot depth required by
-    // the rows present for a sequence in that batch. The cache allocation and
-    // rollback address space always retain the configured n_rs_seq maximum.
+    // the rows present for a sequence in that batch. Supported compact Qwen
+    // contexts also resize the resident rollback planes between decode ticks;
+    // the logical rollback limit remains the configured n_rs_seq maximum.
     const bool rs_seq_dynamic = false;
 
     // Resolve a safe execution depth for the sanitized batch. Invalid or
@@ -133,10 +143,22 @@ private:
 
     const uint32_t n_seq_max = 1;
 
+    // Qwen hybrid recurrent states are large enough that retaining every
+    // configured rollback plane penalizes cap-zero multi-slot throughput.
+    // This bounded path changes only the resident plane count between ticks.
+    const bool rs_seq_compact = false;
+
+    ggml_type type_r;
+    ggml_type type_s;
+    std::vector<ggml_backend_buffer_type_t> buft_l;
+
     uint32_t last_reported_active_n_rs_seq = UINT32_MAX;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    bool resize_rs_storage(uint32_t depth);
+    bool materialize_pending_rollbacks(uint32_t retained_depth);
 
     size_t total_size() const;
 

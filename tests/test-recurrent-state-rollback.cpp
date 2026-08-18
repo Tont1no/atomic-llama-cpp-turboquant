@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
+#include "llama-ext.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,14 @@ static llama_context * make_ctx(
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count);
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos);
 
+static size_t context_memory_bytes(const llama_context * ctx) {
+    size_t total = 0;
+    for (const auto & [_, mb] : llama_get_memory_breakdown(ctx)) {
+        total += mb.context;
+    }
+    return total;
+}
+
 static bool decode_ragged_and_compare(
         const common_params & params,
         llama_model * model,
@@ -40,6 +49,7 @@ static bool decode_ragged_and_compare(
         fprintf(stderr, "%s : failed to create ragged contexts\n", __func__);
         return false;
     }
+    const size_t bytes_depth_zero = context_memory_bytes(ctx_batched);
 
     std::vector<std::vector<llama_token>> rows = {
         { 1 },
@@ -69,6 +79,7 @@ static bool decode_ragged_and_compare(
         return false;
     }
     llama_batch_free(batch);
+    const size_t bytes_depth_three = context_memory_bytes(ctx_batched);
 
     constexpr float eps = 1e-5f;
     const auto compare_outputs = [&](
@@ -116,6 +127,18 @@ static bool decode_ragged_and_compare(
     }
     llama_batch_free(one_each);
 
+    const size_t bytes_depth_zero_again = context_memory_bytes(ctx_batched);
+    const bool uses_compact_storage = bytes_depth_three > bytes_depth_zero;
+    if (uses_compact_storage && bytes_depth_zero_again != bytes_depth_zero) {
+        fprintf(stderr, "%s : compact recurrent storage did not return to depth-zero size (%zu != %zu)\n",
+                __func__, bytes_depth_zero_again, bytes_depth_zero);
+        return false;
+    }
+    if (uses_compact_storage) {
+        fprintf(stderr, "%s : compact recurrent context bytes depth0=%zu depth3=%zu depth0=%zu\n",
+                __func__, bytes_depth_zero, bytes_depth_three, bytes_depth_zero_again);
+    }
+
     bool ok = compare_outputs("depth-zero", { 0, 1, 2 }, { 0, 0, 0 });
     if (ok && llama_memory_seq_rm(llama_get_memory(ctx_batched), 2, 4, -1)) {
         fprintf(stderr, "%s : depth-zero graph incorrectly allowed rollback into a stale snapshot plane\n", __func__);
@@ -125,6 +148,196 @@ static bool decode_ragged_and_compare(
     for (auto * ctx : ctx_ref) {
         llama_free(ctx);
     }
+    return ok;
+}
+
+static bool compare_last_logits(
+        const char * phase,
+        llama_context * batched,
+        int32_t batched_idx,
+        llama_context * reference,
+        int n_vocab) {
+    const float * actual   = llama_get_logits_ith(batched, batched_idx);
+    const float * expected = llama_get_logits_ith(reference, 0);
+    if (actual == nullptr || expected == nullptr) {
+        fprintf(stderr, "%s : missing logits\n", phase);
+        return false;
+    }
+    constexpr float eps = 1e-5f;
+    for (int token = 0; token < n_vocab; ++token) {
+        if (std::fabs(actual[token] - expected[token]) > eps) {
+            fprintf(stderr, "%s : mismatch at token %d (%g != %g)\n",
+                    phase, token, (double) actual[token], (double) expected[token]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_multi_rollback_shrink(
+        const common_params & params,
+        llama_model * model,
+        int n_vocab) {
+    llama_context * ctx = make_ctx(params, model, 2, true);
+    llama_context * refs[2] = {
+        make_ctx(params, model, 1, true),
+        make_ctx(params, model, 1, true),
+    };
+    if (ctx == nullptr || refs[0] == nullptr || refs[1] == nullptr) {
+        fprintf(stderr, "%s : failed to create contexts\n", __func__);
+        return false;
+    }
+    const size_t bytes_depth_zero = context_memory_bytes(ctx);
+
+    const uint32_t count = llama_n_rs_seq(ctx) + 1;
+    constexpr uint32_t rollback = 3;
+    if (count <= rollback) {
+        return true;
+    }
+    std::vector<std::vector<llama_token>> tokens(2, std::vector<llama_token>(count));
+    llama_batch prompt = llama_batch_init(2*count, 0, 2);
+    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+        for (uint32_t pos = 0; pos < count; ++pos) {
+            tokens[seq][pos] = (llama_token) ((1 + seq*count + pos) % n_vocab);
+            common_batch_add(prompt, tokens[seq][pos], pos, { seq }, pos + 1 == count);
+        }
+        if (!decode_tokens(refs[seq], tokens[seq], count)) {
+            fprintf(stderr, "%s : reference prompt failed for seq %d\n", __func__, seq);
+            llama_batch_free(prompt);
+            return false;
+        }
+    }
+    if (llama_decode(ctx, prompt) != 0) {
+        fprintf(stderr, "%s : batched prompt failed\n", __func__);
+        llama_batch_free(prompt);
+        return false;
+    }
+    llama_batch_free(prompt);
+
+    const llama_pos rollback_pos = (llama_pos) count - rollback;
+    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), seq, rollback_pos, -1) ||
+                !llama_memory_seq_rm(llama_get_memory(refs[seq]), 0, rollback_pos, -1)) {
+            fprintf(stderr, "%s : rollback failed for seq %d\n", __func__, seq);
+            return false;
+        }
+    }
+
+    // Both sequences have pending rollback planes when prepare_batch shrinks
+    // the resident allocation. This catches temporary-view accumulation.
+    llama_batch replay = llama_batch_init(2, 0, 2);
+    for (llama_seq_id seq = 0; seq < 2; ++seq) {
+        common_batch_add(replay, tokens[seq][rollback_pos], rollback_pos, { seq }, true);
+        if (!decode_one(refs[seq], tokens[seq][rollback_pos], rollback_pos)) {
+            fprintf(stderr, "%s : reference replay failed for seq %d\n", __func__, seq);
+            llama_batch_free(replay);
+            return false;
+        }
+    }
+    if (llama_decode(ctx, replay) != 0) {
+        fprintf(stderr, "%s : batched replay failed\n", __func__);
+        llama_batch_free(replay);
+        return false;
+    }
+    llama_batch_free(replay);
+
+    const size_t bytes_depth_zero_again = context_memory_bytes(ctx);
+    const bool ok = compare_last_logits("multi rollback seq0", ctx, 0, refs[0], n_vocab) &&
+                    compare_last_logits("multi rollback seq1", ctx, 1, refs[1], n_vocab) &&
+                    bytes_depth_zero_again == bytes_depth_zero;
+    if (!ok && bytes_depth_zero_again != bytes_depth_zero) {
+        fprintf(stderr, "%s : storage did not return to depth0 (%zu != %zu)\n",
+                __func__, bytes_depth_zero_again, bytes_depth_zero);
+    }
+    llama_free(ctx);
+    llama_free(refs[0]);
+    llama_free(refs[1]);
+    return ok;
+}
+
+static bool decode_shared_rollback_shrink(
+        const common_params & params,
+        llama_model * model,
+        int n_vocab) {
+    llama_context * ctx = make_ctx(params, model, 2, true);
+    llama_context * ref_rollback = make_ctx(params, model, 1, true);
+    llama_context * ref_sibling  = make_ctx(params, model, 1, true);
+    if (ctx == nullptr || ref_rollback == nullptr || ref_sibling == nullptr) {
+        fprintf(stderr, "%s : failed to create contexts\n", __func__);
+        return false;
+    }
+    const size_t bytes_depth_zero = context_memory_bytes(ctx);
+    const uint32_t count = llama_n_rs_seq(ctx) + 1;
+    constexpr uint32_t rollback = 3;
+    std::vector<llama_token> tokens(count);
+    for (uint32_t pos = 0; pos < count; ++pos) {
+        tokens[pos] = (llama_token) ((17 + pos) % n_vocab);
+    }
+    if (!decode_tokens(ctx, tokens, count) ||
+            !decode_tokens(ref_rollback, tokens, count) ||
+            !decode_tokens(ref_sibling, tokens, count)) {
+        fprintf(stderr, "%s : prompt failed\n", __func__);
+        return false;
+    }
+    llama_memory_seq_cp(llama_get_memory(ctx), 0, 1, 0, -1);
+
+    const llama_pos rollback_pos = (llama_pos) count - rollback;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, rollback_pos, -1) ||
+            !llama_memory_seq_rm(llama_get_memory(ref_rollback), 0, rollback_pos, -1)) {
+        fprintf(stderr, "%s : rollback failed\n", __func__);
+        return false;
+    }
+
+    // The first cap0 tick must retain the pending plane until find_slot has
+    // detached seq0 from the tail shared with seq1.
+    llama_batch first = llama_batch_init(2, 0, 2);
+    const llama_token sibling_token = (llama_token) ((tokens.back() + 1) % n_vocab);
+    common_batch_add(first, tokens[rollback_pos], rollback_pos, { 0 }, true);
+    common_batch_add(first, sibling_token, count, { 1 }, true);
+    if (!decode_one(ref_rollback, tokens[rollback_pos], rollback_pos) ||
+            !decode_one(ref_sibling, sibling_token, count) ||
+            llama_decode(ctx, first) != 0) {
+        fprintf(stderr, "%s : first cap0 decode failed\n", __func__);
+        llama_batch_free(first);
+        return false;
+    }
+    llama_batch_free(first);
+    const size_t bytes_pending_shared = context_memory_bytes(ctx);
+    if (bytes_pending_shared <= bytes_depth_zero) {
+        fprintf(stderr, "%s : shared rollback plane was not retained until tail detachment\n", __func__);
+        return false;
+    }
+    if (!compare_last_logits("shared rollback seq0", ctx, 0, ref_rollback, n_vocab) ||
+            !compare_last_logits("shared sibling seq1", ctx, 1, ref_sibling, n_vocab)) {
+        return false;
+    }
+
+    // A second cap0 tick has no pending index and can return to the one-plane
+    // allocation without changing either independently split state.
+    llama_batch second = llama_batch_init(2, 0, 2);
+    const llama_token rollback_next = (llama_token) ((tokens[rollback_pos] + 3) % n_vocab);
+    const llama_token sibling_next  = (llama_token) ((sibling_token + 3) % n_vocab);
+    common_batch_add(second, rollback_next, rollback_pos + 1, { 0 }, true);
+    common_batch_add(second, sibling_next, count + 1, { 1 }, true);
+    if (!decode_one(ref_rollback, rollback_next, rollback_pos + 1) ||
+            !decode_one(ref_sibling, sibling_next, count + 1) ||
+            llama_decode(ctx, second) != 0) {
+        fprintf(stderr, "%s : second cap0 decode failed\n", __func__);
+        llama_batch_free(second);
+        return false;
+    }
+    llama_batch_free(second);
+    const size_t bytes_depth_zero_again = context_memory_bytes(ctx);
+    const bool ok = compare_last_logits("shared shrink seq0", ctx, 0, ref_rollback, n_vocab) &&
+                    compare_last_logits("shared shrink seq1", ctx, 1, ref_sibling, n_vocab) &&
+                    bytes_depth_zero_again == bytes_depth_zero;
+    if (!ok && bytes_depth_zero_again != bytes_depth_zero) {
+        fprintf(stderr, "%s : storage did not return to depth0 (%zu != %zu)\n",
+                __func__, bytes_depth_zero_again, bytes_depth_zero);
+    }
+    llama_free(ctx);
+    llama_free(ref_rollback);
+    llama_free(ref_sibling);
     return ok;
 }
 
@@ -177,6 +390,12 @@ int main(int argc, char ** argv) {
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
     if (!decode_ragged_and_compare(params, model, n_vocab)) {
+        return 1;
+    }
+    if (!decode_multi_rollback_shrink(params, model, n_vocab)) {
+        return 1;
+    }
+    if (!decode_shared_rollback_shrink(params, model, n_vocab)) {
         return 1;
     }
 

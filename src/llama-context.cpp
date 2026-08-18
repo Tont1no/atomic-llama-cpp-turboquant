@@ -752,6 +752,13 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
+void llama_context::invalidate_memory_graphs() {
+    gf_res_prev.reset();
+    gf_res_reserve.reset();
+    sched.reset();
+    sched_need_reserve = true;
+}
+
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -1858,6 +1865,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+
+    // Dynamic recurrent snapshot storage is reshaped only at this synchronized
+    // between-tick boundary. Run it before scheduler reservation so any changed
+    // tensor pointers and graph shapes are reserved from the new layout.
+    if (!memory->prepare_batch(this, balloc->get_batch(), output_all)) {
+        LLAMA_LOG_ERROR("%s: failed to prepare batch-dependent memory storage\n", __func__);
+        return -2;
+    }
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed

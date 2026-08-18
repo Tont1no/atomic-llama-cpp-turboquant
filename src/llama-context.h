@@ -57,6 +57,11 @@ struct llama_context {
 
     void synchronize();
 
+    // Drop scheduler/graph objects that retain direct memory tensor pointers.
+    // The caller must synchronize first and sets up replacement storage before
+    // the next sched_reserve().
+    void invalidate_memory_graphs();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 

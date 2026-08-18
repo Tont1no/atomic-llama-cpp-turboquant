@@ -44,6 +44,11 @@ public:
 
     ~llama_memory_hybrid() = default;
 
+    bool prepare_batch(
+            llama_context * lctx,
+            const llama_batch & batch,
+            bool embd_all) override;
+
     //
     // llama_memory_i
     //

@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
+#include "llama-context.h"
 #include "llama-model.h"
 
 #include <algorithm>
@@ -83,7 +84,14 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   rs_seq_dynamic,
-    const layer_filter_cb & filter) : rs_seq_dynamic(rs_seq_dynamic && n_rs_seq > 0), hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter) :
+    rs_seq_dynamic(rs_seq_dynamic && n_rs_seq > 0),
+    hparams(model.hparams),
+    n_seq_max(n_seq_max),
+    rs_seq_compact(rs_seq_dynamic && n_rs_seq > 0 &&
+            (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE)),
+    type_r(type_r),
+    type_s(type_s) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -91,45 +99,16 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
+    this->n_rs_seq_alloc = rs_seq_compact ? 0 : n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
     rs_valid_depth.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
-        }
-    };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
-
-    // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                return nullptr;
-            }
-
-            ctx_map.emplace(buft, ctx);
-
-            return ctx;
-        }
-
-        return it->second.get();
-    };
-
     r_l.resize(n_layer);
     s_l.resize(n_layer);
+    buft_l.resize(n_layer, nullptr);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -150,29 +129,11 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
-        if (!ctx) {
-            throw std::runtime_error("failed to create ggml context for rs cache");
-        }
-
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
-        ggml_format_name(r, "cache_r_l%d", i);
-        ggml_format_name(s, "cache_s_l%d", i);
-        r_l[i] = r;
-        s_l[i] = s;
+        buft_l[i] = buft;
     }
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for rs cache");
-        }
-        ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
+    if (!resize_rs_storage(n_rs_seq_alloc)) {
+        throw std::runtime_error("failed to allocate buffer for rs cache");
     }
 
     {
@@ -180,10 +141,275 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_s = size_s_bytes();
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq_alloc,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
+}
+
+bool llama_memory_recurrent::resize_rs_storage(uint32_t depth) {
+    depth = std::min(depth, n_rs_seq);
+    if (!ctxs_bufs.empty() && depth == n_rs_seq_alloc) {
+        return true;
+    }
+    const bool initial_allocation = ctxs_bufs.empty();
+
+    const int32_t n_layer = hparams.n_layer();
+
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+            it = ctx_map.emplace(buft, ctx).first;
+        }
+        return it->second.get();
+    };
+
+    std::vector<ggml_tensor *> r_new(n_layer, nullptr);
+    std::vector<ggml_tensor *> s_new(n_layer, nullptr);
+    const uint32_t n_rows = size * (1 + depth);
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (buft_l[il] == nullptr) {
+            continue;
+        }
+        ggml_context * ctx = ctx_for_buft(buft_l[il]);
+        if (!ctx) {
+            return false;
+        }
+        r_new[il] = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+        s_new[il] = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_format_name(r_new[il], "cache_r_l%d", il);
+        ggml_format_name(s_new[il], "cache_s_l%d", il);
+    }
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs_new;
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        bufs_new.emplace_back(std::move(ctx), buf);
+    }
+
+    if (!ctxs_bufs.empty()) {
+        const uint32_t copy_rows = size * (1 + std::min(depth, n_rs_seq_alloc));
+        ggml_init_params copy_params = {
+            /*.mem_size   =*/ size_t(4u*n_layer*ggml_tensor_overhead()),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr copy_ctx(ggml_init(copy_params));
+        if (!copy_ctx) {
+            return false;
+        }
+
+        auto copy_rows_between = [&](ggml_tensor * src, ggml_tensor * dst) {
+            ggml_tensor * src_view = ggml_view_2d(copy_ctx.get(), src, src->ne[0], copy_rows, src->nb[1], 0);
+            ggml_tensor * dst_view = ggml_view_2d(copy_ctx.get(), dst, dst->ne[0], copy_rows, dst->nb[1], 0);
+            if (ggml_backend_view_init(src_view) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_view_init(dst_view) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            ggml_backend_tensor_copy(src_view, dst_view);
+            return true;
+        };
+
+        for (int32_t il = 0; il < n_layer; ++il) {
+            if (r_l[il] == nullptr) {
+                continue;
+            }
+            if (!copy_rows_between(r_l[il], r_new[il]) || !copy_rows_between(s_l[il], s_new[il])) {
+                return false;
+            }
+        }
+    }
+
+    r_l = std::move(r_new);
+    s_l = std::move(s_new);
+    ctxs_bufs = std::move(bufs_new);
+    n_rs_seq_alloc = depth;
+
+    for (const auto & [_, buf] : ctxs_bufs) {
+        if (initial_allocation) {
+            LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB (resident depth %u/%u)\n",
+                    __func__, ggml_backend_buffer_name(buf.get()),
+                    ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0,
+                    n_rs_seq_alloc, n_rs_seq);
+        } else {
+            LLAMA_LOG_DEBUG("%s: %10s RS buffer size = %8.2f MiB (resident depth %u/%u)\n",
+                    __func__, ggml_backend_buffer_name(buf.get()),
+                    ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0,
+                    n_rs_seq_alloc, n_rs_seq);
+        }
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::materialize_pending_rollbacks(uint32_t retained_depth) {
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(4u*hparams.n_layer()*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return false;
+    }
+
+    for (size_t seq = 0; seq < rs_idx.size(); ++seq) {
+        const uint32_t rollback = rs_idx[seq];
+        if (rollback == 0 || rollback <= retained_depth) {
+            continue;
+        }
+        if (rollback > n_rs_seq_alloc || seq >= cells.size()) {
+            LLAMA_LOG_ERROR("%s: rollback plane %u is not resident for seq %zu (resident %u)\n",
+                    __func__, rollback, seq, n_rs_seq_alloc);
+            return false;
+        }
+
+        const int32_t tail = cells[seq].tail;
+        if (tail < 0 || (uint32_t) tail >= size) {
+            LLAMA_LOG_ERROR("%s: no recurrent tail for pending rollback seq %zu\n", __func__, seq);
+            return false;
+        }
+
+        auto copy_row = [&](ggml_tensor * tensor) {
+            ggml_tensor * src = ggml_view_2d(ctx.get(), tensor, tensor->ne[0], 1, tensor->nb[1],
+                    ((size_t) rollback*size + tail)*tensor->nb[1]);
+            ggml_tensor * dst = ggml_view_2d(ctx.get(), tensor, tensor->ne[0], 1, tensor->nb[1],
+                    (size_t) tail*tensor->nb[1]);
+            if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS ||
+                    ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            ggml_backend_tensor_copy(src, dst);
+            return true;
+        };
+
+        for (int32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (r_l[il] == nullptr) {
+                continue;
+            }
+            if (!copy_row(r_l[il]) || !copy_row(s_l[il])) {
+                return false;
+            }
+        }
+        rs_idx[seq] = 0;
+
+        // The view objects above are no longer needed once the blocking
+        // backend copies have completed. Reuse the bounded temporary context
+        // for the next pending sequence instead of accumulating 4*n_layer
+        // objects per sequence.
+        ggml_reset(ctx.get());
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::prepare_batch(
+        llama_context * lctx,
+        const llama_batch & batch,
+        bool embd_all) {
+    if (!rs_seq_compact) {
+        return true;
+    }
+
+    bool fallback = false;
+    uint32_t desired = active_rs_depth(batch, embd_all, &fallback);
+    std::vector<bool> participating(n_seq_max, false);
+
+    if (!fallback && batch.n_seq_id != nullptr && batch.seq_id != nullptr) {
+        for (int32_t i = 0; i < batch.n_tokens && !fallback; ++i) {
+            if (batch.n_seq_id[i] <= 0 || batch.seq_id[i] == nullptr) {
+                fallback = true;
+                break;
+            }
+            for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+                const llama_seq_id seq_id = batch.seq_id[i][j];
+                if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+                    fallback = true;
+                    break;
+                }
+                participating[seq_id] = true;
+            }
+        }
+    } else if (!fallback) {
+        fallback = true;
+    }
+
+    if (fallback) {
+        desired = n_rs_seq;
+    } else {
+        // Snapshots of sequences absent from this logical batch remain valid
+        // and must stay addressable. Participating sequences are bounded by
+        // the requested depth below if physical planes are removed.
+        for (size_t seq = 0; seq < rs_valid_depth.size(); ++seq) {
+            if (!participating[seq]) {
+                desired = std::max(desired, rs_valid_depth[seq]);
+            }
+        }
+
+        // A shared tail must be split by find_slot() before one sequence can
+        // consume a pending rollback without changing the other sequence's
+        // base state. Keep that rollback plane resident for this tick so the
+        // normal graph-side s_copy path performs the copy after the split.
+        for (size_t seq = 0; seq < rs_idx.size() && seq < cells.size(); ++seq) {
+            const uint32_t rollback = rs_idx[seq];
+            const int32_t tail = cells[seq].tail;
+            if (rollback > desired && tail >= 0 && (uint32_t) tail < size &&
+                    cells[tail].seq_id.size() > 1) {
+                desired = std::max(desired, rollback);
+            }
+        }
+    }
+    desired = std::min(desired, n_rs_seq);
+
+    if (desired == n_rs_seq_alloc) {
+        return true;
+    }
+
+    lctx->synchronize();
+    if (!materialize_pending_rollbacks(desired)) {
+        return false;
+    }
+
+    // Graphs and scheduler allocations retain direct tensor/buffer pointers.
+    // Destroy them before the old resident planes are released.
+    lctx->invalidate_memory_graphs();
+
+    const uint32_t old_depth = n_rs_seq_alloc;
+    if (!resize_rs_storage(desired)) {
+        LLAMA_LOG_ERROR("%s: failed to resize recurrent rollback storage from %u to %u\n",
+                __func__, old_depth, desired);
+        return false;
+    }
+    // Plane removal happens before init_batch()/find_slot(). If later decode
+    // preparation fails, a participating sequence must not retain a logical
+    // rollback depth that is no longer physically resident.
+    for (size_t seq = 0; seq < rs_valid_depth.size(); ++seq) {
+        if (participating[seq]) {
+            rs_valid_depth[seq] = std::min(rs_valid_depth[seq], desired);
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: resident recurrent rollback depth = %u/%u\n",
+            __func__, n_rs_seq_alloc, n_rs_seq);
+    return true;
 }
 
 uint32_t llama_memory_recurrent::active_rs_depth(const llama_batch & batch, bool embd_all, bool * used_fallback) {
@@ -343,6 +569,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         if ((size_t) seq_id_dst < rs_valid_depth.size() && (size_t) seq_id_src < rs_valid_depth.size()) {
             rs_valid_depth[seq_id_dst] = rs_valid_depth[seq_id_src];
         }
+        if ((size_t) seq_id_dst < rs_idx.size() && (size_t) seq_id_src < rs_idx.size()) {
+            rs_idx[seq_id_dst] = rs_idx[seq_id_src];
+        }
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
         if (tail_dst.tail >= 0) {
@@ -395,6 +624,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     for (size_t i = 0; i < rs_valid_depth.size(); ++i) {
         if ((llama_seq_id) i != seq_id) {
             rs_valid_depth[i] = 0;
+            rs_idx[i] = 0;
         }
     }
 
@@ -1369,18 +1599,18 @@ uint32_t llama_memory_recurrent_context::get_n_rs() const {
 
 uint32_t llama_memory_recurrent_context::get_active_n_rs_seq() const {
     if (is_full || ubatches.empty()) {
-        return mem->n_rs_seq;
+        return mem->n_rs_seq_alloc;
     }
 
     const llama_ubatch & ubatch = ubatches[i_next];
     if (!ubatch.equal_seqs() || ubatch.n_seq_tokens == 0 || ubatch.n_seqs == 0 ||
             (uint64_t) ubatch.n_tokens != (uint64_t) ubatch.n_seq_tokens * ubatch.n_seqs) {
-        return mem->n_rs_seq;
+        return mem->n_rs_seq_alloc;
     }
 
     // Ragged logical batches are split into equal-row ubatches. A shorter
     // group needs fewer snapshots than the maximum selected for splitting.
-    return std::min(active_n_rs_seq, ubatch.n_seq_tokens - 1);
+    return std::min({ active_n_rs_seq, mem->n_rs_seq_alloc, ubatch.n_seq_tokens - 1 });
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
@@ -1407,7 +1637,7 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
-    if (mem->n_rs_seq == 0) {
+    if (mem->n_rs_seq_alloc == 0) {
         return src0;
     }
 
@@ -1419,6 +1649,9 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
             // reset rollback idx
             mem->rs_idx[seq] = 0;
         }
+    }
+    if (idx > mem->n_rs_seq_alloc) {
+        return src0;
     }
     return (int32_t)(idx * mem->size) + src0;
 }

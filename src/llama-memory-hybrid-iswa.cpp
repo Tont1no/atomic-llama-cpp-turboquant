@@ -65,6 +65,13 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             : filter_recr
     )) {}
 
+bool llama_memory_hybrid_iswa::prepare_batch(
+        llama_context * lctx,
+        const llama_batch & batch,
+        bool embd_all) {
+    return mem_recr->prepare_batch(lctx, batch, embd_all);
+}
+
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         const uint32_t active_n_rs_seq = mem_recr->active_rs_depth(balloc.get_batch(), embd_all);
