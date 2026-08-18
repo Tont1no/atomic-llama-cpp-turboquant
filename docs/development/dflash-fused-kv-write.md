@@ -6,6 +6,20 @@ kernel:
 
 `RMS_NORM -> MUL -> NEOX ROPE -> FWHT128 -> SET_ROWS(Q4_0/Q8_0)`
 
+## Integration boundary
+
+This opt-in branch is based on the stable Qwen performance integration at
+`15f4cf24f`. It replays only the Fused-K CUDA runtime, dispatch marker,
+raw-cache validator, deterministic harness, scheduler-reservation fix, and
+their documentation. It does **not** include the earlier stacked K/V
+projection commit (`31c9843a9`), its GGUF metadata, or its converter changes.
+The Native-FP8/DSpark converter and runtime from the stable integration remain
+unchanged.
+
+The Fused-K source series was GPU-correctness qualified before this replay.
+This integration replay itself is CPU-tested and CUDA-compiled only; it does
+not start a server, load a model, or execute a CUDA test.
+
 The fused kernel still consumes the allocator-owned I64 row-index tensor.  It
 does not derive or retain host-side cache positions, so unified multi-sequence
 and iSWA cache placement keep the existing semantics.  The cache Hadamard
@@ -137,11 +151,14 @@ follow-up should first remove that redundant split/concat only when
 Build-only qualification used for this branch:
 
 ```powershell
+$Cuda132Root = 'C:\Users\pasca\Documents\GitHub\Ai-Loader\.codex-deploy\cuda-13.2\toolkit'
 cmake -S . -B build-fused-sm120 -G "Visual Studio 17 2022" -A x64 `
+  -T "cuda=$Cuda132Root" -DCUDAToolkit_ROOT="$Cuda132Root" `
   -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 `
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON
 cmake --build build-fused-sm120 --config Release --target test-backend-ops -j 8
-cmake --build build-fused-sm120 --config Release --target llama-server -j 8
+cmake --build build-fused-sm120 --config Release `
+  --target test-dflash-fusion-determinism -j 8
 ```
 
 Before promotion, run the focused `RMS_NORM_MUL_ROPE` backend cases and the
