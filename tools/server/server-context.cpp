@@ -13,6 +13,7 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "speculative-sps.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -22,6 +23,7 @@
 #include <cinttypes>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <filesystem>
 #include <utility>
 #include <fstream>
@@ -38,6 +40,20 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_speculative_is_only_dspark(const std::vector<common_speculative_type> & types) {
+    int n_enabled = 0;
+    for (const auto type : types) {
+        if (type == COMMON_SPECULATIVE_TYPE_NONE) {
+            continue;
+        }
+        if (type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            return false;
+        }
+        ++n_enabled;
+    }
+    return n_enabled == 1;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -214,6 +230,12 @@ struct server_slot {
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
 
+    // DSpark SPS phase-1 state. survival is produced by the latest batched
+    // draft pass; offered is the actual target-verify denominator after caps.
+    std::vector<float>    spec_draft_survival;
+    std::vector<uint64_t> spec_offered_per_pos;
+    std::vector<uint64_t> spec_sps_prefix_choices;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -327,6 +349,8 @@ struct server_slot {
 
         spec_is_replay = false;
 
+        spec_draft_survival.clear();
+
         last_nl_pos    = 0;
         generated_text = "";
         has_new_line   = false;
@@ -350,6 +374,8 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_offered_per_pos.clear();
+        spec_sps_prefix_choices.clear();
 
         n_predict_max = -1;
 
@@ -620,12 +646,15 @@ struct server_slot {
             const double mean_acc_len = n_draft_verif_steps > 0 ? 1.0 + (double) n_draft_accepted / (double) n_draft_verif_steps : 1.0;
 
             std::string acceptance_rates_per_pos;
-            if (n_draft_verif_steps > 0) {
-                for (size_t i = 0; i < n_accepted_per_pos.size(); ++i) {
+            if (!spec_offered_per_pos.empty()) {
+                for (size_t i = 0; i < spec_offered_per_pos.size(); ++i) {
                     if (i > 0) {
                         acceptance_rates_per_pos += ", ";
                     }
-                    acceptance_rates_per_pos += string_format("%.3f", (double) n_accepted_per_pos[i] / (double) n_draft_verif_steps);
+                    const uint64_t accepted = i < n_accepted_per_pos.size() ? n_accepted_per_pos[i] : 0;
+                    acceptance_rates_per_pos += string_format("%.3f",
+                            spec_offered_per_pos[i] > 0 ?
+                                (double) accepted / (double) spec_offered_per_pos[i] : 0.0);
                 }
             }
 
@@ -634,6 +663,20 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (!spec_sps_prefix_choices.empty()) {
+                std::string choices;
+                for (size_t i = 0; i < spec_sps_prefix_choices.size(); ++i) {
+                    if (spec_sps_prefix_choices[i] == 0) {
+                        continue;
+                    }
+                    if (!choices.empty()) {
+                        choices += ", ";
+                    }
+                    choices += string_format("%zu:%" PRIu64, i, spec_sps_prefix_choices[i]);
+                }
+                SLT_INF(*this, "SPS prefix choices = {%s}\n", choices.c_str());
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -841,6 +884,8 @@ private:
 
     common_speculative_ptr spec;
 
+    std::optional<common_speculative_sps_profile> spec_sps_profile;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -882,6 +927,7 @@ private:
     void destroy() {
         spec.reset();
         spec_init.reset();
+        spec_sps_profile.reset();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
@@ -951,6 +997,31 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        spec_sps_profile.reset();
+        const auto & sps_path = params_base.speculative.draft.sps_profile;
+        if (params_base.speculative.draft.sps_shadow && sps_path.empty()) {
+            SRV_ERR("%s\n", "--spec-draft-sps-shadow requires --spec-draft-sps-profile");
+            return false;
+        }
+        if (!sps_path.empty()) {
+            if (!server_speculative_is_only_dspark(params_base.speculative.types)) {
+                SRV_ERR("%s\n", "SPS prefix planning requires exactly one speculative type: draft-dspark");
+                return false;
+            }
+            try {
+                spec_sps_profile = common_speculative_sps_profile_load(sps_path);
+            } catch (const std::exception & e) {
+                // A requested but malformed cost surface is a startup failure.
+                // Never silently execute against an unvalidated profile.
+                SRV_ERR("failed to load SPS profile: %s\n", e.what());
+                return false;
+            }
+            SRV_INF("DSpark SPS planner enabled: profile='%s', entries=%zu, mode=%s\n",
+                    sps_path.c_str(), spec_sps_profile->entries.size(),
+                    params_base.speculative.draft.sps_shadow ? "shadow" : "execution-caps");
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1242,6 +1313,11 @@ private:
             spec_init.reset();
             ctx_dft   = nullptr;
             model_dft = nullptr;
+        }
+
+        if (spec_sps_profile && !spec) {
+            SRV_ERR("%s\n", "DSpark SPS profile was requested but the speculative context did not initialize");
+            return false;
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2920,6 +2996,8 @@ private:
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
+                        slot.spec_draft_survival.clear();
+
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
@@ -2938,6 +3016,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .survival = */ spec_sps_profile ? &slot.spec_draft_survival : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -2953,12 +3032,124 @@ private:
             });
         }
 
+        // Phase 1 keeps the existing full DSpark draft pass, then applies a
+        // global target-verification cap. This is not packed-ragged draft
+        // execution: it saves target verify rows, not DSpark noise rows.
+        if (spec_sps_profile && !drafting.empty()) {
+            int32_t context_tokens   = 1;
+            int32_t base_verify_rows = (int32_t) generating.size(); // one anchor per active slot
+            double  base_useful      = (double) generating.size();
+
+            for (const auto * slot : generating) {
+                context_tokens = std::max(context_tokens, slot->prompt.n_tokens());
+                if (std::find(drafting.begin(), drafting.end(), slot) == drafting.end() && !slot->spec_draft.empty()) {
+                    // A checkpoint replay already has a fixed prefix and
+                    // cannot be resized by this tick's allocator.
+                    base_verify_rows += (int32_t) slot->spec_draft.size();
+                    base_useful      += (double) slot->spec_draft.size();
+                }
+            }
+
+            std::vector<common_speculative_sps_slot> planner_slots;
+            std::vector<server_slot *> planner_server_slots;
+            int32_t static_verify_rows = base_verify_rows;
+
+            for (auto * slot : drafting) {
+                static_verify_rows += (int32_t) slot->spec_draft.size();
+                if (slot->spec_draft.empty()) {
+                    continue;
+                }
+
+                planner_slots.push_back({
+                    /* .seq_id     = */ slot->id,
+                    /* .survival   = */ slot->spec_draft_survival,
+                    /* .min_prefix = */ std::min<int32_t>(
+                                                params_base.speculative.draft.n_min,
+                                                (int32_t) slot->spec_draft.size()),
+                    /* .max_prefix = */ (int32_t) slot->spec_draft.size(),
+                });
+                planner_server_slots.push_back(slot);
+            }
+
+            bool has_compatible_prompt_work = false;
+            if (params_base.cont_batching) {
+                for (auto & slot : slots) {
+                    if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) &&
+                            (!slot_batched || slot_batched->can_batch_with(slot))) {
+                        has_compatible_prompt_work = true;
+                        break;
+                    }
+                }
+            }
+
+            common_speculative_sps_plan plan;
+            if (has_compatible_prompt_work) {
+                // Phase-1 profiles only describe decode/verify rows. Pending
+                // prompt rows are appended later, so executing a plan here
+                // would query a cost point for the wrong target batch shape.
+                plan.reason = "compatible prompt work may join the target batch";
+            } else {
+                plan = common_speculative_sps_plan_prefixes(
+                        *spec_sps_profile,
+                        context_tokens,
+                        (int32_t) generating.size(),
+                        base_verify_rows,
+                        base_useful,
+                        planner_slots);
+            }
+
+            metrics.n_sps_plan_ticks++;
+            metrics.n_sps_static_verify_rows += static_verify_rows;
+            if (params_base.speculative.draft.sps_shadow) {
+                metrics.n_sps_shadow_ticks++;
+            }
+
+            if (!plan.valid) {
+                metrics.n_sps_fallback_ticks++;
+                metrics.n_sps_planned_verify_rows  += static_verify_rows;
+                metrics.n_sps_executed_verify_rows += static_verify_rows;
+                SRV_WRN("DSpark SPS planner static fallback: %s (ctx=%d, active=%zu, rows=%d)\n",
+                        plan.reason.c_str(), context_tokens, generating.size(), static_verify_rows);
+            } else {
+                metrics.n_sps_planned_verify_rows += plan.total_verify_rows;
+                metrics.n_sps_executed_verify_rows += params_base.speculative.draft.sps_shadow ?
+                        static_verify_rows : plan.total_verify_rows;
+
+                for (size_t i = 0; i < planner_server_slots.size(); ++i) {
+                    auto & slot = *planner_server_slots[i];
+                    const int32_t selected = plan.prefixes[i];
+
+                    if (slot.spec_sps_prefix_choices.size() <= (size_t) selected) {
+                        slot.spec_sps_prefix_choices.resize((size_t) selected + 1, 0);
+                    }
+                    slot.spec_sps_prefix_choices[selected]++;
+
+                    SLT_DBG(slot,
+                            "SPS prefix: selected=%d static=%zu expected=%.3f cost_us=%.3f score=%.6f mode=%s\n",
+                            selected, slot.spec_draft.size(), plan.expected_useful_tokens,
+                            plan.predicted_cost_us, plan.expected_tokens_per_us,
+                            params_base.speculative.draft.sps_shadow ? "shadow" : "execute");
+
+                    if (!params_base.speculative.draft.sps_shadow) {
+                        slot.spec_draft.resize((size_t) selected);
+                        slot.spec_draft_survival.resize((size_t) selected);
+                    }
+                }
+            }
+        }
+
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            if (slot.spec_offered_per_pos.size() < draft.size()) {
+                slot.spec_offered_per_pos.resize(draft.size(), 0);
+            }
+            for (size_t i = 0; i < draft.size(); ++i) {
+                slot.spec_offered_per_pos[i]++;
+            }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -4030,6 +4221,15 @@ private:
         metrics.n_draft_tokens      += slot.stats.n_draft_tokens;
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
         metrics.n_draft_verif_steps += slot.stats.n_draft_verif_steps;
+
+        auto & offered_dst = metrics.n_offered_per_pos;
+        const auto & offered_src = slot.spec_offered_per_pos;
+        if (offered_dst.size() < offered_src.size()) {
+            offered_dst.resize(offered_src.size(), 0);
+        }
+        for (size_t i = 0; i < offered_src.size(); ++i) {
+            offered_dst[i] += offered_src[i];
+        }
 
         auto & dst = metrics.n_accepted_per_pos;
         const auto & src = slot.n_accepted_per_pos;

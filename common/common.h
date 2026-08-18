@@ -325,6 +325,11 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
+    // Optional measured server-step cost table for the DSpark global prefix
+    // planner. An empty path preserves the fixed-depth scheduler exactly.
+    std::string sps_profile;
+    bool sps_shadow = false; // plan and report, but do not cap verification
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

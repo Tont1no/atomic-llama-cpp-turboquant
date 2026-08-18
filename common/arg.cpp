@@ -4087,9 +4087,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+
+    add_opt(common_arg(
+        {"--spec-draft-sps-profile"}, "FILE",
+        "measured DSpark server-step cost table used by the global prefix planner; "
+        "unset preserves static speculative depth",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("SPS profile path must not be empty");
+            }
+            params.speculative.draft.sps_profile = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_PROFILE"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-shadow"},
+        {"--no-spec-draft-sps-shadow"},
+        string_format("compute DSpark SPS plans without applying verification caps (default: %s)",
+                      params.speculative.draft.sps_shadow ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.sps_shadow = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_SHADOW"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
