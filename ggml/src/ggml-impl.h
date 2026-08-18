@@ -552,6 +552,52 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// Signed finite E4M3 (torch.float8_e4m3fn / CUDA_R_8F_E4M3).  Do not use
+// the UE4M3 helpers above: those encode NVFP4 block scales and intentionally
+// apply the E2M1 convention's 0.5 factor.
+static inline float ggml_f8_e4m3_to_fp32(uint8_t x) {
+    const uint8_t mag = x & 0x7F;
+    if (mag == 0) {
+        return (x & 0x80) ? -0.0f : 0.0f;
+    }
+    if (mag == 0x7F) {
+        return NAN;
+    }
+    const int exp = (mag >> 3) & 0xF;
+    const int man = mag & 0x7;
+    const float value = exp == 0
+        ? ldexpf((float) man, -9)
+        : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    return (x & 0x80) ? -value : value;
+}
+
+static inline uint8_t ggml_fp32_to_f8_e4m3(float x) {
+    if (isnan(x)) {
+        return 0x7F;
+    }
+    const uint8_t sign = signbit(x) ? 0x80 : 0;
+    float ax = fabsf(x);
+    if (ax >= 448.0f) {
+        return sign | 0x7E;
+    }
+
+    // Exhaustive nearest finite code is compact, deterministic and only used
+    // by reference/conversion paths (the native CUDA path uses __nv_fp8_e4m3).
+    uint8_t best = 0;
+    float best_err = ax;
+    for (uint8_t code = 1; code <= 0x7E; ++code) {
+        const float value = ggml_f8_e4m3_to_fp32(code);
+        const float err = fabsf(ax - value);
+        // CUDA FP8 conversion is round-to-nearest-even.  On an exact
+        // midpoint prefer the code whose significand LSB is even.
+        if (err < best_err || (err == best_err && (code & 1u) == 0)) {
+            best = code;
+            best_err = err;
+        }
+    }
+    return sign | best;
+}
+
 /**
  * Converts brain16 to float32.
  *

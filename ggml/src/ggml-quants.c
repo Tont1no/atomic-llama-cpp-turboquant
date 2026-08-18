@@ -25,6 +25,18 @@
 
 #define UNUSED GGML_UNUSED
 
+void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_fp32_to_f8_e4m3(x[i]);
+    }
+}
+
+void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_f8_e4m3_to_fp32(x[i]);
+    }
+}
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;

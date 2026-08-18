@@ -705,6 +705,54 @@ class MXFP4(__Quant, qtype=GGMLQuantizationType.MXFP4):
         return (d * qs.astype(np.float32))
 
 
+class F8E4M3(__Quant, qtype=GGMLQuantizationType.F8_E4M3):
+    """Signed finite E4M3 as used by torch.float8_e4m3fn / CUDA_R_8F_E4M3.
+
+    Unlike the UE4M3 helper below, bit 7 is a sign and exponent 15 is part of
+    the finite range (only mantissa 7 is NaN).  This class is mainly useful for
+    inspection and tests; ModelOpt conversion writes original code bytes
+    losslessly instead of requantizing them.
+    """
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        x = blocks.reshape(-1).astype(np.uint8, copy=False)
+        sign = np.where((x & 0x80) != 0, -1.0, 1.0).astype(np.float32)
+        mag = x & np.uint8(0x7F)
+        exp = (mag >> np.uint8(3)).astype(np.int32)
+        man = (mag & np.uint8(7)).astype(np.float32)
+        val = np.where(
+            exp == 0,
+            man * np.float32(2.0 ** -9),
+            (np.float32(1.0) + man / np.float32(8.0)) * np.exp2(exp - 7).astype(np.float32),
+        )
+        val = np.where(mag == np.uint8(0x7F), np.nan, val)
+        return (sign * val).reshape(blocks.shape).astype(np.float32)
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        values = blocks.reshape(-1).astype(np.float32, copy=False)
+        # A small exhaustive reference quantizer is preferable here: the
+        # converter's native-preservation path never calls it for checkpoint
+        # weights, while tests get exact nearest-code semantics.
+        codes = np.arange(256, dtype=np.uint8)
+        grid = cls.dequantize_blocks(codes.reshape(-1, 1)).reshape(-1)
+        finite = ~np.isnan(grid)
+        grid = grid[finite]
+        codes = codes[finite]
+        # CUDA FP8 conversion uses round-to-nearest-even. Stable-partition
+        # even codes first so np.argmin resolves exact midpoint ties to the
+        # code with an even significand LSB.
+        even_first = np.argsort(codes & np.uint8(1), kind="stable")
+        grid = grid[even_first]
+        codes = codes[even_first]
+        distances = np.abs(values.reshape(-1, 1) - grid.reshape(1, -1))
+        out = codes[np.argmin(distances, axis=1)]
+        out = np.where((values == 0) & np.signbit(values), np.uint8(0x80), out)
+        out = np.where(np.isnan(values), np.uint8(0x7F), out)
+        return out.reshape(blocks.shape).astype(np.uint8)
+
+
 class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
     # E2M1 values doubled (kvalues_mxfp4 convention)
     kvalues = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)

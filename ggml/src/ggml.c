@@ -673,6 +673,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
+    },
     [GGML_TYPE_Q1_0] = {
         .type_name                = "q1_0",
         .blck_size                = QK1_0,
@@ -3289,6 +3297,23 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_f8_e4m3(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * activation,
+        struct ggml_tensor  * weight_scale,
+        struct ggml_tensor  * input_scale) {
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(activation->type == GGML_TYPE_F32);
+    GGML_ASSERT(weight_scale->type == GGML_TYPE_F32 && ggml_is_scalar(weight_scale));
+    GGML_ASSERT(input_scale->type == GGML_TYPE_F32 && ggml_is_scalar(input_scale));
+
+    struct ggml_tensor * result = ggml_mul_mat(ctx, weight, activation);
+    result->src[2] = weight_scale;
+    result->src[3] = input_scale;
     return result;
 }
 
