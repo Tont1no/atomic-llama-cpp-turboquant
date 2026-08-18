@@ -36,7 +36,8 @@ from being mistaken for DSpark survival.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "max_draft_tokens_per_slot": 7,
   "entries": [
     {
       "context_tokens": 8192,
@@ -56,12 +57,16 @@ Definitions:
   per active slot and fixed checkpoint-replay rows.
 - `cost_us`: measured target server-step time for this point.
 
-All fields are required and unknown fields are rejected. Coordinates and costs
+All fields are required and unknown fields are rejected. Schema v2 uses exact
+`active_slots` lookup and permits each active count to have its own physically
+reachable row axis; every active count must still contain a complete
+context-by-row grid. The loader continues to accept legacy schema v1 profiles,
+which use a shared row axis and ceiling lookup for active slots.
+
+Coordinates and costs
 must be positive, coordinates must be unique, `total_verify_rows` must be at
 least `active_slots`, and costs must be monotonic over comparable load points.
-The valid portions of the context/slot/row axes must form a complete measured
-grid; sparse crossing dimensions are rejected. Runtime lookup uses an
-unambiguous component-wise ceiling and never extrapolates.
+Runtime lookup uses an unambiguous context/row ceiling and never extrapolates.
 
 ## Objective and fallback
 

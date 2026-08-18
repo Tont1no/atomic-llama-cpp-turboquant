@@ -1433,6 +1433,12 @@ struct ggml_backend_cuda_context {
     std::atomic<uint64_t> dflash_k_fused_dispatches   {0};
     std::atomic<uint64_t> dflash_k_fallback_dispatches{0};
 
+    // Monotonic counters used by the SPS recorder to reject CUDA graph
+    // capture/instantiation steps without relying on timing heuristics.
+    std::atomic<uint64_t> graph_direct_executions {0};
+    std::atomic<uint64_t> graph_capture_executions{0};
+    std::atomic<uint64_t> graph_replay_executions {0};
+
     // Captured when the backend context is created so a deterministic test can
     // construct independent fallback and fused contexts in one process.  This
     // also avoids a getenv() in graph traversal.

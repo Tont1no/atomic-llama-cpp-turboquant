@@ -1591,6 +1591,38 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_sps_executed_verify_rows_total",
             "DSpark SPS: Verify rows executed after fallback and shadow handling on planning ticks",
             (double) metrics.n_sps_executed_verify_rows
+        }, {
+            "spec_decode_sps_record_retained_samples_total",
+            "DSpark SPS recorder: Eligible synchronized target-decode samples retained",
+            (double) metrics.n_sps_record_retained_samples
+        }, {
+            "spec_decode_sps_record_skipped_warmup_total",
+            "DSpark SPS recorder: Per-coordinate warmup executions excluded",
+            (double) metrics.n_sps_record_skipped_warmup
+        }, {
+            "spec_decode_sps_record_skipped_capture_total",
+            "DSpark SPS recorder: CUDA graph capture or instantiation executions excluded",
+            (double) metrics.n_sps_record_skipped_capture
+        }, {
+            "spec_decode_sps_record_skipped_mixed_total",
+            "DSpark SPS recorder: Mixed prompt/decode batches excluded",
+            (double) metrics.n_sps_record_skipped_mixed
+        }, {
+            "spec_decode_sps_record_skipped_partial_total",
+            "DSpark SPS recorder: Partial or sub-batched target decodes excluded",
+            (double) metrics.n_sps_record_skipped_partial
+        }, {
+            "spec_decode_sps_record_skipped_retry_total",
+            "DSpark SPS recorder: Failed target decodes requiring retry excluded",
+            (double) metrics.n_sps_record_skipped_retry
+        }, {
+            "spec_decode_sps_record_skipped_other_total",
+            "DSpark SPS recorder: Other ineligible executions excluded",
+            (double) metrics.n_sps_record_skipped_other
+        }, {
+            "spec_decode_sps_record_write_errors_total",
+            "DSpark SPS recorder: Atomic sidecar or profile write failures",
+            (double) metrics.n_sps_record_write_errors
         },
     };
 
@@ -1631,6 +1663,14 @@ std::string server_task_result_metrics::to_metrics() {
             "recurrent_snapshot_shrink_stable_ticks",
             "Distinct stable scheduling epochs observed for the pending shrink",
             (double) metrics.recurrent_shrink_stable_ticks
+        }, {
+            "spec_decode_sps_record_coordinates_ready",
+            "DSpark SPS recorder: Coordinates with the requested retained-sample quota",
+            (double) metrics.n_sps_record_coordinates_ready
+        }, {
+            "spec_decode_sps_record_coordinates_total",
+            "DSpark SPS recorder: Total requested coordinates",
+            (double) metrics.n_sps_record_coordinates_total
         },
     };
 

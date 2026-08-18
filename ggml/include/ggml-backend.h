@@ -204,6 +204,16 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
+    // Monotonic execution counters for backends that distinguish direct graph
+    // launches, graph capture/instantiation, and graph replay. Backends that do
+    // not expose this optional proc simply do not contribute to the totals.
+    struct ggml_backend_graph_execution_stats {
+        uint64_t direct;
+        uint64_t capture;
+        uint64_t replay;
+    };
+    typedef struct ggml_backend_graph_execution_stats (*ggml_backend_get_graph_execution_stats_t)(ggml_backend_t backend);
+
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);

@@ -21,6 +21,21 @@ static const char * VALID_PROFILE = R"JSON({
   ]
 })JSON";
 
+static const char * VALID_PROFILE_V2 = R"JSON({
+  "schema_version": 2,
+  "max_draft_tokens_per_slot": 1,
+  "entries": [
+    {"context_tokens": 1024, "active_slots": 1, "total_verify_rows": 1, "cost_us": 1.0},
+    {"context_tokens": 1024, "active_slots": 1, "total_verify_rows": 2, "cost_us": 2.0},
+    {"context_tokens": 2048, "active_slots": 1, "total_verify_rows": 1, "cost_us": 2.0},
+    {"context_tokens": 2048, "active_slots": 1, "total_verify_rows": 2, "cost_us": 3.0},
+    {"context_tokens": 1024, "active_slots": 2, "total_verify_rows": 2, "cost_us": 2.5},
+    {"context_tokens": 1024, "active_slots": 2, "total_verify_rows": 3, "cost_us": 3.5},
+    {"context_tokens": 2048, "active_slots": 2, "total_verify_rows": 2, "cost_us": 3.5},
+    {"context_tokens": 2048, "active_slots": 2, "total_verify_rows": 3, "cost_us": 4.5}
+  ]
+})JSON";
+
 template<typename Fn>
 static void assert_throws(Fn && fn) {
     bool threw = false;
@@ -110,6 +125,57 @@ static void test_sparse_many_axis_profile_is_rejected() {
 
     assert_throws([&] {
         common_speculative_sps_profile_parse(profile.str(), "many-axis-regression");
+    });
+}
+
+static void test_v2_exact_active_and_independent_row_axes() {
+    const auto profile = common_speculative_sps_profile_parse(VALID_PROFILE_V2);
+    assert(profile.schema_version == 2);
+    assert(profile.max_draft_tokens_per_slot == 1);
+    assert(profile.entries.size() == 8);
+
+    assert(profile.lookup_cost_us(1000, 1, 2).value() == 2.0);
+    assert(profile.lookup_cost_us(1500, 1, 2).value() == 3.0);
+    assert(profile.lookup_cost_us(1000, 2, 3).value() == 3.5);
+    assert(!profile.lookup_cost_us(1000, 3, 3));
+    assert(!profile.lookup_cost_us(1000, 1, 3));
+
+    const std::vector<common_speculative_sps_slot> one_slot = {
+        { 0, { 0.9f, 0.8f, 0.7f }, 1, 3 },
+    };
+    const auto capped = common_speculative_sps_plan_prefixes(
+            profile, 1000, 1, 1, 1.0, one_slot);
+    assert(capped.valid);
+    assert(capped.total_verify_rows <= 2);
+
+    assert_throws([] {
+        common_speculative_sps_profile_parse(R"({
+          "schema_version": 2,
+          "max_draft_tokens_per_slot": 1,
+          "entries": [
+            {"context_tokens":1024,"active_slots":1,"total_verify_rows":1,"cost_us":1.0},
+            {"context_tokens":1024,"active_slots":1,"total_verify_rows":2,"cost_us":2.0},
+            {"context_tokens":2048,"active_slots":1,"total_verify_rows":1,"cost_us":2.0}
+          ]
+        })");
+    });
+    assert_throws([] {
+        common_speculative_sps_profile_parse(R"({
+          "schema_version": 2,
+          "max_draft_tokens_per_slot": 1,
+          "entries": [
+            {"context_tokens":1024,"active_slots":1,"total_verify_rows":3,"cost_us":1.0}
+          ]
+        })");
+    });
+    assert_throws([] {
+        common_speculative_sps_profile_parse(R"({
+          "schema_version": 2,
+          "max_draft_tokens_per_slot": -1,
+          "entries": [
+            {"context_tokens":1024,"active_slots":1,"total_verify_rows":1,"cost_us":1.0}
+          ]
+        })");
     });
 }
 
@@ -235,6 +301,7 @@ static void test_score_order_and_profile_row_cap() {
 int main() {
     test_parse_and_lookup();
     test_sparse_many_axis_profile_is_rejected();
+    test_v2_exact_active_and_independent_row_axes();
     test_file_loader();
     test_global_prefix_plan();
     test_score_order_and_profile_row_cap();
