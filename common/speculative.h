@@ -67,20 +67,27 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
-// process the batch and update the internal state of the speculative context
+// Process a target batch and update the speculative context. DFlash/DSpark may
+// stage target features here instead of immediately mutating the draft KV.
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
-// commit target-side state deferred until after speculative acceptance
+// Finish a staged DFlash/DSpark batch after every participating sequence has
+// been resolved with common_speculative_accept() or common_speculative_clear().
+// Callers must complete this process -> accept/clear -> commit lifecycle before
+// beginning the next draft round, decoding another target batch, or releasing a
+// participating sequence. Other speculative implementations commit eagerly.
 bool common_speculative_commit(common_speculative * spec);
 bool common_speculative_needs_commit(const common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
-// informs the speculative context that n_accepted tokens were accepted by the target model
+// Informs the speculative context that n_accepted draft tokens were accepted by
+// the target. For a staged DFlash/DSpark batch this selects anchor + accepted
+// prefix for the subsequent common_speculative_commit() call.
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
-// discard per-sequence speculative state when a slot is reset
+// Discard per-sequence staged state when a slot is reset, released, or aborted.
 void common_speculative_clear(common_speculative * spec, llama_seq_id seq_id);
 
 // (optional) get/set internal state
