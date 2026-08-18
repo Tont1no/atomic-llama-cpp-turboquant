@@ -91,6 +91,9 @@ The kill switch controls only the new tagged eight-node FWHT writer; the older
 five-node fusion remains identical in both arms. The harness also rejects a
 false pass unless OFF observes the tagged fallback and ON observes both the
 exact FWHT-fusion marker and raw-cache validation with no tagged fallback.
+The OFF arm intentionally performs the first DFlash feature injection without
+a warm-up decode, covering scheduler reservation before metadata-only external
+target-feature aliases are attached.
 
 Run it with the real target and DFlash GGUFs on SM120. The draft K cache must be
 Q4_0 or Q8_0; run both commands when qualifying both formats:

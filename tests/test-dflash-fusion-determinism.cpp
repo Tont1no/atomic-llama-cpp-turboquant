@@ -398,6 +398,9 @@ int main(int argc, char ** argv) {
 
     LOG_INF("DFlash deterministic regression: fallback run\n");
     g_arm.store(test_arm::fallback, std::memory_order_relaxed);
+    // This is intentionally the first DFlash decode after spec construction.
+    // It regresses first-use scheduler reservation before external feature
+    // aliases are installed, as well as the OFF cache-writer path itself.
     const run_result fallback = run_once(params, false);
     LOG_INF("DFlash deterministic regression: fused+raw-validation run\n");
     g_arm.store(test_arm::fused, std::memory_order_relaxed);

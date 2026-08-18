@@ -2583,6 +2583,14 @@ bool llama_context::decode_dflash_features(
     device_batch.seq_id   = seq_id.data();
     device_batch.logits   = logits.data();
 
+    // Speculator construction changes the draft context to non-causal mode,
+    // which invalidates its constructor-time scheduler reservation. Reserve
+    // the final ordinary DFlash graph before installing external aliases:
+    // graph_reserve() deliberately uses a token-backed synthetic ubatch,
+    // whereas an external-import graph must remain metadata-only.
+    GGML_ASSERT(external_layer_inputs.empty());
+    sched_reserve();
+
     external_layer_inputs = std::move(layer_inputs);
     ret = decode(device_batch);
     const bool rejected = external_layer_inputs_rejected;
