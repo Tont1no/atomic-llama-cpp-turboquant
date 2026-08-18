@@ -4202,22 +4202,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
-    static const bool dflash_k_fusion_enabled = [] {
-        const char * env = getenv("GGML_CUDA_DFLASH_K_FUSION");
-        return env == nullptr || atoi(env) != 0;
-    }();
-    static const bool dflash_k_validate = [] {
-        const char * env = getenv("GGML_CUDA_DFLASH_K_VALIDATE");
-        return env != nullptr && atoi(env) != 0;
-    }();
-
-    if (dflash_k_fusion_enabled && ggml_cuda_can_fuse(cgraph, i,
+    if (cuda_ctx->dflash_k_fusion_enabled && ggml_cuda_can_fuse(cgraph, i,
             { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE,
               GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         // The FWHT + quantized cache specialization is intentionally SM120
         // only.  Other devices execute the original eight-node graph.
         if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL) {
-            if (dflash_k_validate) {
+            if (cuda_ctx->dflash_k_validate) {
                 ggml_cuda_validate_dflash_k_fwht_fusion(cuda_ctx, node, cgraph->nodes[i + 1],
                         cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4],
                         cgraph->nodes[i + 7]);
@@ -4238,8 +4229,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // Keep the new quantized/BF16 side-effect path SM120-only while it is
         // being qualified.  Returning to the normal dispatcher preserves the
         // established graph on every other device.
-        if (!extended_dst || (dflash_k_fusion_enabled &&
-                              ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL)) {
+        // GGML_CUDA_DFLASH_K_FUSION isolates only the new tagged eight-node
+        // FWHT cache writer above.  Keep this established five-node path
+        // identical in the OFF and ON arms of the deterministic regression.
+        if (!extended_dst || ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL) {
             ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
                     cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
             return 4;

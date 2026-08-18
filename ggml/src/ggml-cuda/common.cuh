@@ -1430,6 +1430,12 @@ struct ggml_backend_cuda_context {
     std::atomic<uint64_t> dflash_k_fused_dispatches   {0};
     std::atomic<uint64_t> dflash_k_fallback_dispatches{0};
 
+    // Captured when the backend context is created so a deterministic test can
+    // construct independent fallback and fused contexts in one process.  This
+    // also avoids a getenv() in graph traversal.
+    bool dflash_k_fusion_enabled = true;
+    bool dflash_k_validate       = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1485,6 +1491,11 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        const char * fusion_env = getenv("GGML_CUDA_DFLASH_K_FUSION");
+        dflash_k_fusion_enabled = fusion_env == nullptr || atoi(fusion_env) != 0;
+
+        const char * validate_env = getenv("GGML_CUDA_DFLASH_K_VALIDATE");
+        dflash_k_validate = validate_env != nullptr && atoi(validate_env) != 0;
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
