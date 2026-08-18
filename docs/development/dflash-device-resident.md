@@ -51,6 +51,12 @@ reachable nodes and ancestors. It rejects the graph if a raw target tensor is
 reachable or any detached source leaf is missing, and logs the graph node/leaf
 counts with `target_ancestors=0` on the first validated graph.
 
+Guard failures are reported once per low-cardinality reason to keep production
+logs useful without per-token noise: `common_batch_guard`, `guard`,
+`target_ready`, `row_set`, `device_backend`, `tensor_shape`, or
+`draft_ubatch`. Shape and prepared-ubatch failures include bounded dimensions or
+row indices needed to identify the violated guard.
+
 Changed source files:
 
 - `common/speculative.cpp`
