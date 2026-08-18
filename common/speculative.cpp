@@ -14,8 +14,8 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstring>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1425,12 +1425,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // build one batch holding every drafting sequence's noise block into a single decode)
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
-        std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<int32_t> n_sample   (n_seq,  0);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
+            }
+
+            if (dp.survival) {
+                dp.survival->clear();
             }
 
             common_sampler_reset(smpls[seq_id].get());
@@ -1445,9 +1449,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
-            const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
+            const bool require_full_dspark_block = is_dspark && dp.survival != nullptr;
+            if (require_full_dspark_block && n_draft < params.n_max) {
+                // A shorter block would violate DSpark's equal-size Markov
+                // layout, while widening it could exceed this sequence's
+                // server context allowance. Use target-only for this tick.
+                continue;
+            }
+
+            // The DSpark Markov graph requires equal-size blocks in one
+            // ubatch. Keep the rectangular trained execution block and apply
+            // the per-sequence limit only while sampling the SPS result. Plain
+            // DFlash and adaptive DSpark retain their supported ragged blocks.
+            const int32_t n_block_tokens = require_full_dspark_block ?
+                    params.n_max : n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_block_tokens;
+            n_sample   [seq_id] = n_draft;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
             }
@@ -1464,6 +1481,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        bool need_dspark_conf = is_dspark && params.p_min > 0.0f;
+        if (is_dspark && !need_dspark_conf) {
+            need_dspark_conf = std::any_of(dparams.begin(), dparams.end(), [](const auto & dp) {
+                return dp.drafting && dp.survival != nullptr;
+            });
+        }
+        // llama_get_embeddings_nextn synchronizes the async decode and applies
+        // the output-row reorder before exposing the host buffer.
+        const float * dspark_conf = need_dspark_conf ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+        const int32_t n_embd_out  = llama_model_n_embd_out(llama_get_model(ctx_dft));
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1471,7 +1499,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & dp = dparams[seq_id];
 
             const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
+            const int32_t n_draft_sample = n_sample[seq_id];
 
             auto * smpl = smpls[seq_id].get();
 
@@ -1480,12 +1508,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dspark) {
                 // DSpark predicts the next token from position 0 and optionally truncates
                 // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                bool survival_valid = dp.survival != nullptr && dspark_conf != nullptr;
+                float survival_prev = 1.0f;
 
-                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                for (int32_t i = 0; i < n_draft_sample; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    const float confidence = dspark_conf ? dspark_conf[(size_t) idx * n_embd_out] : 0.0f;
+
+                    if (survival_valid &&
+                            (!std::isfinite(confidence) || confidence < 0.0f || confidence > 1.0f)) {
+                        survival_valid = false;
+                        dp.survival->clear();
+                    }
+
+                    if (dspark_conf && confidence < params.p_min) {
                         break;
                     }
 
@@ -1504,10 +1541,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    if (survival_valid) {
+                        // The head estimates per-position acceptance. Prefix
+                        // survival requires every preceding token to be
+                        // accepted, so use the DeepSpec cumprod.
+                        survival_prev *= confidence;
+                        dp.survival->push_back(survival_prev);
+                    }
+                }
+
+                if (!survival_valid && dp.survival) {
+                    dp.survival->clear();
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                for (int32_t i = 1; i <= n_draft_sample; ++i) {
                     common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1532,6 +1581,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+                if (dp.survival) {
+                    dp.survival->clear();
+                }
             }
         }
     }

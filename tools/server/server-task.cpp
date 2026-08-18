@@ -1549,7 +1549,7 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_tokens_max
         }, {
             "spec_decode_num_draft_tokens_total",
-            "Speculative: Total draft tokens generated",
+            "Speculative: Total draft tokens offered to target verification",
             (double) metrics.n_draft_tokens
         }, {
             "spec_decode_num_accepted_tokens_total",
@@ -1567,6 +1567,30 @@ std::string server_task_result_metrics::to_metrics() {
             "recurrent_snapshot_resize_seconds_total",
             "Time spent synchronizing and reallocating recurrent snapshot storage",
             metrics.t_recurrent_resize_us / 1.e6
+        }, {
+            "spec_decode_sps_plan_ticks_total",
+            "DSpark SPS: Total global prefix planning ticks",
+            (double) metrics.n_sps_plan_ticks
+        }, {
+            "spec_decode_sps_fallback_ticks_total",
+            "DSpark SPS: Planning ticks that used the static fallback",
+            (double) metrics.n_sps_fallback_ticks
+        }, {
+            "spec_decode_sps_shadow_ticks_total",
+            "DSpark SPS: Planning ticks observed in shadow mode",
+            (double) metrics.n_sps_shadow_ticks
+        }, {
+            "spec_decode_sps_static_verify_rows_total",
+            "DSpark SPS: Verify rows requested by static prefixes on planning ticks",
+            (double) metrics.n_sps_static_verify_rows
+        }, {
+            "spec_decode_sps_planned_verify_rows_total",
+            "DSpark SPS: Verify rows selected by the planner, or static rows on fallback, on planning ticks",
+            (double) metrics.n_sps_planned_verify_rows
+        }, {
+            "spec_decode_sps_executed_verify_rows_total",
+            "DSpark SPS: Verify rows executed after fallback and shadow handling on planning ticks",
+            (double) metrics.n_sps_executed_verify_rows
         },
     };
 
@@ -1623,7 +1647,7 @@ std::string server_task_result_metrics::to_metrics() {
     add_items("counter", counters);
     add_items("gauge",   gauges);
 
-    // labeled counter: one time series per draft position
+    // labeled counters: one time series per draft position
     if (!metrics.n_accepted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
                       " Accepted tokens per draft position\n"
@@ -1636,7 +1660,7 @@ std::string server_task_result_metrics::to_metrics() {
 
     if (!metrics.n_drafted_per_pos.empty()) {
         prometheus << "# HELP llamacpp:spec_decode_num_draft_tokens_per_pos_total"
-                      " Offered tokens per draft position\n"
+                      " Tokens offered to the target per draft position\n"
                    << "# TYPE llamacpp:spec_decode_num_draft_tokens_per_pos_total counter\n";
         for (size_t i = 0; i < metrics.n_drafted_per_pos.size(); i++) {
             prometheus << "llamacpp:spec_decode_num_draft_tokens_per_pos_total{position=\""

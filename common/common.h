@@ -336,6 +336,12 @@ struct common_params_speculative_draft {
     float adaptive_ema_threshold = 0.55f;
     uint32_t adaptive_ema_warmup = 8;
 
+    // Optional measured server-step cost table for the DSpark global prefix
+    // planner. An empty path disables SPS and leaves the existing fixed or
+    // adaptive scheduler unchanged.
+    std::string sps_profile;
+    bool sps_shadow = false; // plan and report, but do not cap verification
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

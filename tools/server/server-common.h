@@ -464,7 +464,7 @@ struct server_metrics {
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
-    uint64_t n_draft_tokens      = 0; // Total draft tokens generated
+    uint64_t n_draft_tokens      = 0; // Total draft tokens offered to target verification
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_drafted_per_pos;  // Offered tokens per draft position
@@ -477,6 +477,13 @@ struct server_metrics {
     uint32_t recurrent_required_depth      = 0;
     uint32_t recurrent_pending_depth       = UINT32_MAX;
     uint32_t recurrent_shrink_stable_ticks = 0;
+
+    uint64_t n_sps_plan_ticks            = 0;
+    uint64_t n_sps_fallback_ticks        = 0;
+    uint64_t n_sps_shadow_ticks          = 0;
+    uint64_t n_sps_static_verify_rows    = 0;
+    uint64_t n_sps_planned_verify_rows   = 0;
+    uint64_t n_sps_executed_verify_rows  = 0;
 
     void init() {
         t_start = ggml_time_us();

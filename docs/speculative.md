@@ -103,6 +103,12 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 `--spec-draft-p-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
+`llama-server` can optionally select DSpark target-verification prefixes globally from a measured
+server-step cost table with `--spec-draft-sps-profile FILE`. This phase-1 path still evaluates the
+full DSpark noise block; it caps only the target verify rows. See
+[`development/dspark-sps-phase1.md`](development/dspark-sps-phase1.md) for the strict JSON schema,
+shadow mode, telemetry, and the remaining packed-ragged phase-2 work.
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 
