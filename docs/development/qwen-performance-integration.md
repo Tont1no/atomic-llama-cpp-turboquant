@@ -14,10 +14,12 @@ model files, or the measured-regression experiments.
 | Active recurrent execution depth | `24b8479a9` | Used only by the adaptive DFlash-family path |
 | Compact recurrent snapshot storage and per-row depth | `9af282e74` | Used only by the adaptive DFlash-family path; requires all callers to be rebuilt |
 | Native ModelOpt E4M3 matmul | `620079c4e` | Experimental, model-conversion opt-in, SM120 and CUDA 13.2 build required |
+| Official Qwen DSpark draft schema | `a593261bc` | Adds the `DSparkDraftModel` alias and forwards `output_in_s` correctly |
 
 The complete ancestry, including intermediate correctness and diagnostics
 commits, was replayed in order. Native FP8 was then applied as its separate
-two-commit series (`780506a50`, `620079c4e`) after the recurrent-state series.
+series (`780506a50`, `620079c4e`, `a593261bc`, `469d857f7`) after the
+recurrent-state series.
 
 The following work is intentionally not part of this branch:
 
@@ -91,8 +93,17 @@ CPU parser and state tests can be built without a GPU backend:
 cmake -S . -B build-integration-cpu-vs17 -G "Visual Studio 17 2022" -A x64 `
   -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON
 cmake --build build-integration-cpu-vs17 --config Release `
-  --target llama-cli test-arg-parser test-speculative-adaptive `
-  test-recurrent-active-depth test-server-queue-load test-fp8-e4m3 -j 12
+  --target llama-cli test-arg-parser test-speculative-adaptive test-fp8-e4m3 -j 12
+```
+
+The internal recurrent/server tests are not exported by the default shared
+Windows build. Build those two in a separate static tree:
+
+```powershell
+cmake -S . -B build-integration-cpu-static-vs17 -G "Visual Studio 17 2022" -A x64 `
+  -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DBUILD_SHARED_LIBS=OFF
+cmake --build build-integration-cpu-static-vs17 --config Release `
+  --target test-recurrent-active-depth test-server-queue-load -j 8
 ```
 
 The local side-by-side CUDA 13.2 toolkit must be selected explicitly; otherwise
@@ -111,3 +122,20 @@ cmake --build build-integration-cuda132-vs17 --config Release `
 These commands compile CUDA code but do not start `llama-server`, load a model,
 or execute a CUDA test. GPU correctness and throughput qualification remain a
 separate, exclusive-run step.
+
+## Integration validation
+
+The integration worktree passed the following CPU-only checks after the final
+DSpark schema update:
+
+- `test-arg-parser`;
+- `test-speculative-adaptive`;
+- `test-recurrent-active-depth` (static Windows tree);
+- `test-server-queue-load` (static Windows tree);
+- `test-fp8-e4m3` against the CPU backend;
+- `llama-cli --version` and help/parser smoke.
+
+The CUDA tree was configured with nvcc 13.2.86, CUDA Toolkit 13.2.86, and
+`compute_120a,sm_120a`, then `test-fp8-e4m3` was compiled successfully. The
+CUDA test executable was intentionally not run. The exclusive GPU wrapper's
+mocked CPU suite also passed; see `exclusive-gpu-task.md`.
