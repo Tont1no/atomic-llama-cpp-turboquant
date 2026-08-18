@@ -107,6 +107,21 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
+    // The packed projection is an optional duplicate of the ordinary per-layer
+    // weights. Keeping both makes the optimization fully backwards compatible
+    // and lets the graph fall back when quantization types, scales, or LoRA make
+    // one combined matmul unsafe.
+    const int64_t n_embd_kv_stacked = hparams.dsv4_hc_mult > 0
+            ? (int64_t) n_layer * hparams.n_embd_head_k()
+            : (int64_t) n_layer * (n_embd_k_gqa + n_embd_v_gqa);
+    dflash_attn_kv_stacked = create_tensor(
+            tn(LLM_TENSOR_DFLASH_ATTN_KV_STACKED, "weight"),
+            { n_embd, n_embd_kv_stacked }, TENSOR_NOT_REQUIRED);
+    if (dflash_attn_kv_stacked) {
+        LLAMA_LOG_INFO("%s: using optional stacked DFlash KV projection, shape = [%lld, %lld]\n",
+                __func__, (long long) n_embd, (long long) n_embd_kv_stacked);
+    }
+
     if (hparams.dsv4_hc_mult > 0) {
         const int64_t q_lora_rank     = hparams.n_lora_q;
         const int64_t n_ff_exp        = hparams.n_ff_exp;
@@ -245,6 +260,64 @@ static ggml_tensor * dflash_import_external_leaf(
     }
 
     return leaf;
+}
+
+static bool dflash_can_use_stacked_qwen(
+        const llama_model & model,
+        const llama_adapter_loras * loras,
+        int64_t n_embd,
+        int64_t n_embd_k,
+        int64_t n_embd_v,
+        int64_t n_layer) {
+    const ggml_tensor * packed = model.dflash_attn_kv_stacked;
+    if (!packed || !ggml_is_contiguous(packed) || (loras && !loras->empty()) ||
+            !packed->buffer ||
+            packed->ne[0] != n_embd || packed->ne[1] != n_layer * (n_embd_k + n_embd_v) ||
+            packed->ne[2] != 1 || packed->ne[3] != 1) {
+        return false;
+    }
+
+    // A stacked Q8_0 tensor is bit-identical to quantizing the same rows as
+    // separate tensors. Mixed types and extra per-tensor scales are deliberately
+    // kept on the established per-layer path.
+    for (int64_t il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+        if (!layer.wk || !layer.wv || !layer.wk->buffer || !layer.wv->buffer || layer.wk_s || layer.wv_s ||
+                !ggml_is_contiguous(layer.wk) || !ggml_is_contiguous(layer.wv) ||
+                layer.wk->type != packed->type || layer.wv->type != packed->type ||
+                ggml_backend_buffer_get_type(layer.wk->buffer) != ggml_backend_buffer_get_type(packed->buffer) ||
+                ggml_backend_buffer_get_type(layer.wv->buffer) != ggml_backend_buffer_get_type(packed->buffer) ||
+                layer.wk->ne[0] != n_embd || layer.wk->ne[1] != n_embd_k ||
+                layer.wv->ne[0] != n_embd || layer.wv->ne[1] != n_embd_v) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool dflash_can_use_stacked_dsv4(
+        const llama_model & model,
+        const llama_adapter_loras * loras,
+        int64_t n_embd,
+        int64_t n_embd_kv,
+        int64_t n_layer) {
+    const ggml_tensor * packed = model.dflash_attn_kv_stacked;
+    if (!packed || !ggml_is_contiguous(packed) || (loras && !loras->empty()) ||
+            !packed->buffer ||
+            packed->ne[0] != n_embd || packed->ne[1] != n_layer * n_embd_kv ||
+            packed->ne[2] != 1 || packed->ne[3] != 1) {
+        return false;
+    }
+
+    for (int64_t il = 0; il < n_layer; ++il) {
+        const ggml_tensor * wkv = model.layers[il].wkv;
+        if (!wkv || !wkv->buffer || !ggml_is_contiguous(wkv) || wkv->type != packed->type ||
+                ggml_backend_buffer_get_type(wkv->buffer) != ggml_backend_buffer_get_type(packed->buffer) ||
+                wkv->ne[0] != n_embd || wkv->ne[1] != n_embd_kv) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // DSpark (DFlash + Markov & Confidence head): Markov bias on the draft logits, chained per block position
@@ -389,14 +462,36 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             res->add_input(std::move(inp));
         }
 
+        ggml_tensor * kv_stacked = nullptr;
+        const bool use_stacked_kv = dflash_can_use_stacked_qwen(
+                model, loras, n_embd, n_embd_k_gqa, n_embd_v_gqa, n_layer);
+        if (use_stacked_kv) {
+            kv_stacked = ggml_mul_mat(ctx0, model.dflash_attn_kv_stacked, inp_g);
+            cb(kv_stacked, "kv_stacked", -1);
+        }
+
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g);
-
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            ggml_tensor * Kcur = nullptr;
+            ggml_tensor * Vcur = nullptr;
+            if (kv_stacked) {
+                const int64_t row_base = (int64_t) il * (n_embd_k_gqa + n_embd_v_gqa);
+                // A 2D slice would have a token stride wider than its logical
+                // row and therefore cannot be reshaped. View the heads and token
+                // stride directly so multi-token injection remains valid.
+                Kcur = ggml_view_3d(ctx0, kv_stacked, n_embd_head, n_head_kv, n_tokens,
+                        n_embd_head * kv_stacked->nb[0], kv_stacked->nb[1],
+                        row_base * kv_stacked->nb[0]);
+                Vcur = ggml_view_3d(ctx0, kv_stacked, n_embd_head, n_head_kv, n_tokens,
+                        n_embd_head * kv_stacked->nb[0], kv_stacked->nb[1],
+                        (row_base + n_embd_k_gqa) * kv_stacked->nb[0]);
+            } else {
+                Kcur = build_lora_mm(layer.wk, inp_g);
+                Vcur = build_lora_mm(layer.wv, inp_g);
+                Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+                Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            }
 
             Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
             Kcur = ggml_rope_ext(
@@ -592,14 +687,29 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
             res->add_input(std::move(inp));
         }
 
+        ggml_tensor * kv_stacked = nullptr;
+        const bool use_stacked_kv = dflash_can_use_stacked_dsv4(
+                model, loras, n_embd, n_embd_head, n_layer);
+        if (use_stacked_kv) {
+            kv_stacked = ggml_mul_mat(ctx0, model.dflash_attn_kv_stacked, inp_g);
+            cb(kv_stacked, "kv_stacked", -1);
+        }
+
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
             // main-track KV: kv_norm(wkv(main_x)) with rope on the trailing dims, same
             // rope parameters as the uncompressed layers in build_attention_impl
-            ggml_tensor * kv = build_lora_mm(layer.wkv, inp_g);
+            ggml_tensor * kv = nullptr;
+            if (kv_stacked) {
+                kv = ggml_view_3d(ctx0, kv_stacked, n_embd_head, 1, n_tokens,
+                        n_embd_head * kv_stacked->nb[0], kv_stacked->nb[1],
+                        (int64_t) il * n_embd_head * kv_stacked->nb[0]);
+            } else {
+                kv = build_lora_mm(layer.wkv, inp_g);
+                kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_tokens);
+            }
             kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
-            kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_tokens);
 
             ggml_tensor * kv_nope = ggml_view_3d(ctx0, kv, n_embd_head_nope, 1, n_tokens,
                     ggml_row_size(kv->type, n_embd_head),

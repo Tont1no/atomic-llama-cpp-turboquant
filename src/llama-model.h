@@ -640,6 +640,11 @@ struct llama_model {
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // Optional converter-generated projection used only by the DFlash KV-injection
+    // graph. The ordinary per-layer tensors remain authoritative and provide an
+    // exact fallback for legacy GGUFs, mixed tensor types, scales, and LoRA.
+    struct ggml_tensor * dflash_attn_kv_stacked = nullptr;
+
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;

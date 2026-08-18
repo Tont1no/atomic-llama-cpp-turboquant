@@ -631,6 +631,7 @@ class MODEL_TENSOR(IntEnum):
     ATTN_Q               = auto()
     ATTN_K               = auto()
     ATTN_V               = auto()
+    DFLASH_ATTN_KV_STACKED = auto()
     ATTN_QKV             = auto()
     ATTN_OUT             = auto()
     ATTN_NORM            = auto()
@@ -1348,6 +1349,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_Q:                    "blk.{bid}.attn_q",
     MODEL_TENSOR.ATTN_K:                    "blk.{bid}.attn_k",
     MODEL_TENSOR.ATTN_V:                    "blk.{bid}.attn_v",
+    MODEL_TENSOR.DFLASH_ATTN_KV_STACKED:     "dflash.attn_kv_stacked",
     MODEL_TENSOR.ATTN_OUT:                  "blk.{bid}.attn_output",
     MODEL_TENSOR.ATTN_ROT_EMBD:             "blk.{bid}.attn_rot_embd",
     MODEL_TENSOR.ATTN_SINKS:                "blk.{bid}.attn_sinks",
@@ -4777,6 +4779,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.DFLASH_ATTN_KV_STACKED,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K_NORM,

@@ -992,6 +992,48 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             return self._DSPARK_ROOT_MAP[name]
         return super()._map_dsv4_tensor_name(name, bid)
 
+    @property
+    def _stacked_kv_name(self) -> str:
+        return self.format_tensor_name(gguf.MODEL_TENSOR.DFLASH_ATTN_KV_STACKED)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        if not self.dflash_stacked_kv:
+            return
+
+        names = [f"layers.{bid}.attn.wkv.weight" for bid in range(self.block_count)]
+        missing = [name for name in names if name not in self.model_tensors]
+        if missing:
+            logger.warning(
+                "DSpark: requested stacked KV projection but source tensors are incomplete (%s); skipping",
+                ", ".join(missing),
+            )
+            return
+
+        rows = [self.model_tensors[name]() for name in names]
+        logger.info("DSpark: emitting stacked KV projection for %d draft stages", self.block_count)
+        yield self._stacked_kv_name, torch.cat(rows, dim=0).contiguous()
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == self._stacked_kv_name:
+            return [(name, data_torch)]
+        return super().modify_tensors(data_torch, name, bid)
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if new_name == self._stacked_kv_name and n_dims >= 2:
+            # Match the source WKV tensors exactly. The runtime deliberately
+            # rejects the packed path when even one source tensor has a
+            # different type, so preserve the converter's DSV4 dtype rules.
+            names = [f"layers.{il}.attn.wkv.weight" for il in range(self.block_count)]
+            if all(source in self._dsv4_bf16_tensors for source in names):
+                return gguf.GGMLQuantizationType.BF16
+            if all(source in self._dsv4_f32_tensors for source in names):
+                return gguf.GGMLQuantizationType.F32
+            if all(source in self._dsv4_fp8_dequantized for source in names):
+                return gguf.GGMLQuantizationType.Q8_0
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
     def set_vocab(self):
         if self.target_model_dir is None:
             raise ValueError("DeepSeek-V4 DSpark requires --target-model-dir with the target tokenizer")

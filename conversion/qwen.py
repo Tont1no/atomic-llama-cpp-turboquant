@@ -633,6 +633,10 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
+    @property
+    def _stacked_kv_name(self) -> str:
+        return self.format_tensor_name(gguf.MODEL_TENSOR.DFLASH_ATTN_KV_STACKED)
+
     def set_vocab(self):
         if self.target_model_dir is None:
             raise ValueError(
@@ -692,10 +696,54 @@ class DFlashModel(Qwen3Model):
         return super().filter_tensors((name, gen))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name == self._stacked_kv_name:
+            yield name, data_torch
+            return
+
         if name == "model.embed_tokens.weight" and not self.hparams.get("has_embed_tokens", True):
             return
 
         yield from super().modify_tensors(data_torch, name, bid)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        if not self.dflash_stacked_kv:
+            return
+
+        projections: dict[tuple[int, str], Tensor] = {}
+        for name, gen in self.model_tensors.items():
+            bid = next((int(part) for part in name.split(".") if part.isdecimal()), None)
+            if bid is None or bid < 0 or bid >= self.block_count:
+                continue
+            try:
+                mapped = self.map_tensor_name(name)
+            except ValueError:
+                continue
+
+            if mapped == self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid):
+                projections[(bid, "k")] = gen()
+            elif mapped == self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid):
+                projections[(bid, "v")] = gen()
+
+        missing = [
+            f"{kind}{bid}" for bid in range(self.block_count) for kind in ("k", "v")
+            if (bid, kind) not in projections
+        ]
+        if missing:
+            logger.warning(
+                "DFlash: requested stacked KV projection but source tensors are incomplete (%s); skipping",
+                ", ".join(missing),
+            )
+            return
+
+        rows = [
+            projections[(bid, kind)]
+            for bid in range(self.block_count)
+            for kind in ("k", "v")
+        ]
+        logger.info("DFlash: emitting stacked KV projection for %d draft layers", self.block_count)
+        yield self._stacked_kv_name, torch.cat(rows, dim=0).contiguous()
 
 
 @ModelBase.register("Qwen3DSparkModel")

@@ -165,6 +165,13 @@ def parse_args() -> argparse.Namespace:
             "layer count to populate its GGUF."
         ),
     )
+    parser.add_argument(
+        "--dflash-stacked-kv", action="store_true",
+        help=(
+            "emit an optional duplicate DFlash/DSpark KV projection stacked across draft layers; "
+            "compatible runtimes use one matmul during KV injection while GGUFs without it keep the legacy path"
+        ),
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -288,9 +295,10 @@ def main() -> None:
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
-                                     fuse_gate_up_exps=args.fuse_gate_up_exps,
-                                     fp8_as_q8=args.fp8_as_q8,
-                                     )
+                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
+                                      fp8_as_q8=args.fp8_as_q8,
+                                      dflash_stacked_kv=args.dflash_stacked_kv,
+                                      )
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")

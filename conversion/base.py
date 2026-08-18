@@ -130,7 +130,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 dflash_stacked_kv: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -151,6 +152,7 @@ class ModelBase:
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
         self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps
+        self.dflash_stacked_kv = dflash_stacked_kv
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
