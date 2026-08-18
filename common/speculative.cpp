@@ -932,6 +932,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool device_fastpath_reported = false;
     bool device_fallback_reported = false;
+    bool device_guard_reported    = false;
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -1117,6 +1118,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 batch_device.seq_id[i][0] = batch_in.seq_id[i][0];
                 batch_device.logits[i]    = false;
             }
+        }
+
+        if (has_tokens && !device_candidate && !device_guard_reported) {
+            LOG_INF("%s: device-resident DFlash reject=common_batch_guard n_tokens=%d draft_ubatch=%d target_ubatch=%d metadata=%d\n",
+                    __func__, n_tokens, n_ubatch, (int32_t) llama_n_ubatch(ctx_tgt),
+                    (int) (batch_in.pos && batch_in.n_seq_id && batch_in.seq_id));
+            device_guard_reported = true;
         }
 
         if (device_candidate) {
