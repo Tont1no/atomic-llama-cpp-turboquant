@@ -1090,6 +1090,12 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+| `llamacpp:recurrent_snapshot_resizes_total` | Counter | Dynamic recurrent snapshot storage reallocations. |
+| `llamacpp:recurrent_snapshot_resize_seconds_total` | Counter | Time spent synchronizing and reallocating recurrent snapshot storage. |
+| `llamacpp:recurrent_snapshot_resident_depth` | Gauge | Currently resident recurrent rollback depth. |
+| `llamacpp:recurrent_snapshot_required_depth` | Gauge | Latest correctness-required recurrent rollback depth. |
+| `llamacpp:recurrent_snapshot_pending_depth` | Gauge | Pending shrink depth, or -1 when no shrink is pending. |
+| `llamacpp:recurrent_snapshot_shrink_stable_ticks` | Gauge | Distinct stable scheduling epochs observed for the pending shrink. |
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 

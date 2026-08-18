@@ -108,6 +108,11 @@ public:
         return queue_tasks_deferred.size();
     }
 
+    // Number of inference slots requested by tasks that have not yet been
+    // assigned. Used as an advisory load estimate by adaptive speculative
+    // scheduling; control/metrics/slot-management tasks do not count.
+    size_t queue_inference_slot_demand();
+
     //
     // Functions below are not thread-safe, must only be used before start_loop() is called
     //

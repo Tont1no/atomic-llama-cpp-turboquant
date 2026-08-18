@@ -1559,6 +1559,14 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "recurrent_snapshot_resizes_total",
+            "Dynamic recurrent snapshot storage reallocations",
+            (double) metrics.n_recurrent_resizes
+        }, {
+            "recurrent_snapshot_resize_seconds_total",
+            "Time spent synchronizing and reallocating recurrent snapshot storage",
+            metrics.t_recurrent_resize_us / 1.e6
         },
     };
 
@@ -1583,6 +1591,22 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "recurrent_snapshot_resident_depth",
+            "Currently resident recurrent rollback depth",
+            (double) metrics.recurrent_resident_depth
+        }, {
+            "recurrent_snapshot_required_depth",
+            "Latest correctness-required recurrent rollback depth",
+            (double) metrics.recurrent_required_depth
+        }, {
+            "recurrent_snapshot_pending_depth",
+            "Pending recurrent shrink target, or -1 when none",
+            metrics.recurrent_pending_depth == UINT32_MAX ? -1.0 : (double) metrics.recurrent_pending_depth
+        }, {
+            "recurrent_snapshot_shrink_stable_ticks",
+            "Distinct stable scheduling epochs observed for the pending shrink",
+            (double) metrics.recurrent_shrink_stable_ticks
         },
     };
 

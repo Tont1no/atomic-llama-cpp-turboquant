@@ -75,6 +75,21 @@ int server_queue::get_new_id() {
     return new_id;
 }
 
+size_t server_queue::queue_inference_slot_demand() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+
+    size_t result = 0;
+    auto add_queue = [&](const std::deque<server_task> & queue) {
+        for (const server_task & task : queue) {
+            result += server_inference_slot_demand(task.type, task.child_tasks.size());
+        }
+    };
+    add_queue(queue_tasks);
+    add_queue(queue_tasks_deferred);
+    add_queue(queue_tasks_unhandled);
+    return result;
+}
+
 void server_queue::pop_deferred_task(int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {

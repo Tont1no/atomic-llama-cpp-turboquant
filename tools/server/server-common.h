@@ -471,6 +471,13 @@ struct server_metrics {
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
     std::vector<uint64_t> n_adaptive_draft_choices; // Adaptive selections, indexed by proposal length
 
+    uint64_t n_recurrent_resizes           = 0;
+    uint64_t t_recurrent_resize_us         = 0;
+    uint32_t recurrent_resident_depth      = 0;
+    uint32_t recurrent_required_depth      = 0;
+    uint32_t recurrent_pending_depth       = UINT32_MAX;
+    uint32_t recurrent_shrink_stable_ticks = 0;
+
     void init() {
         t_start = ggml_time_us();
     }

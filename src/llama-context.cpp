@@ -4092,6 +4092,39 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+llama_recurrent_resize_stats llama_context::recurrent_resize_stats() const {
+    llama_recurrent_resize_stats result = {};
+    if (!memory) {
+        return result;
+    }
+
+    const llama_memory_recurrent_resize_stats stats = memory->recurrent_resize_stats();
+    result.count            = stats.count;
+    result.time_us          = stats.time_us;
+    result.resident_depth   = stats.resident_depth;
+    result.configured_depth = stats.configured_depth;
+    result.pending_depth    = stats.pending_depth;
+    result.stable_ticks     = stats.stable_ticks;
+    result.required_depth   = stats.required_depth;
+    return result;
+}
+
+void llama_context::set_recurrent_load_hint(uint32_t load) {
+    recurrent_load_hint = load;
+    recurrent_load_epoch++;
+    if (recurrent_load_epoch == 0) {
+        recurrent_load_epoch = 1;
+    }
+}
+
+uint32_t llama_context::get_recurrent_load_hint() const {
+    return recurrent_load_hint;
+}
+
+uint64_t llama_context::get_recurrent_load_epoch() const {
+    return recurrent_load_epoch;
+}
+
 //
 // training
 //
@@ -5041,6 +5074,14 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+llama_recurrent_resize_stats llama_get_recurrent_resize_stats(const struct llama_context * ctx) {
+    return ctx->recurrent_resize_stats();
+}
+
+void llama_set_recurrent_load_hint(struct llama_context * ctx, uint32_t load) {
+    ctx->set_recurrent_load_hint(load);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

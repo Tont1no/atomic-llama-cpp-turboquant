@@ -60,6 +60,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    llama_memory_recurrent_resize_stats recurrent_resize_stats() const override;
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
@@ -153,6 +155,20 @@ private:
     std::vector<ggml_backend_buffer_type_t> buft_l;
 
     uint32_t last_reported_active_n_rs_seq = UINT32_MAX;
+
+    // Exact-target shrink hysteresis. Growth is always immediate when the
+    // incoming graph needs more resident planes; shrink happens only after
+    // two consecutive logical batches request the same lower safe depth.
+    static constexpr uint32_t rs_shrink_dwell_ticks = 2;
+    uint32_t rs_shrink_pending_depth = UINT32_MAX;
+    uint32_t rs_shrink_pending_load  = UINT32_MAX;
+    uint32_t rs_shrink_stable_ticks  = 0;
+    uint32_t rs_last_required_depth  = 0;
+    uint64_t rs_shrink_last_epoch    = UINT64_MAX;
+    uint64_t rs_standalone_epoch     = 0;
+
+    uint64_t rs_resize_count   = 0;
+    uint64_t rs_resize_time_us = 0;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

@@ -200,6 +200,12 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    llama_recurrent_resize_stats recurrent_resize_stats() const;
+
+    void set_recurrent_load_hint(uint32_t load);
+    uint32_t get_recurrent_load_hint() const;
+    uint64_t get_recurrent_load_epoch() const;
+
     //
     // training
     //
@@ -431,6 +437,9 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
     bool dflash_external_graph_reported = false;
+
+    uint32_t recurrent_load_hint  = 0;
+    uint64_t recurrent_load_epoch = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;
