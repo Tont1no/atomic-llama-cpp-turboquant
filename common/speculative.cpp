@@ -165,9 +165,15 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    virtual bool commit() { return true; }
+
+    virtual bool needs_commit() const { return false; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    virtual void clear(llama_seq_id /*seq_id*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -932,6 +938,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
+    struct deferred_verify {
+        llama_pos pos_first = -1;
+        int32_t n_rows = 0;
+        int32_t n_captured = 0;
+        int32_t n_commit = 0;
+        bool accepted = false;
+        std::vector<float> features;
+        std::vector<uint8_t> present;
+    };
+
+    std::vector<deferred_verify> deferred;
+
+    std::vector<float> commit_features;
+    std::vector<llama_pos> commit_pos;
+    std::vector<llama_seq_id> commit_seq;
+    std::vector<int32_t> immediate_rows;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -979,6 +1002,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        deferred.resize(n_seq);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1041,12 +1065,73 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        deferred[seq_id] = {};
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
         if (pos_max < N - 1) {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    bool inject_features(
+            const std::vector<float> & features,
+            const std::vector<llama_pos> & positions,
+            const std::vector<llama_seq_id> & seq_ids) {
+        const int32_t n_rows = (int32_t) positions.size();
+        if (n_rows == 0) {
+            return true;
+        }
+
+        GGML_ASSERT(features.size() == (size_t) n_rows * n_embd_enc);
+        GGML_ASSERT(seq_ids.size() == positions.size());
+
+        auto * ctx_dft = this->params.ctx_dft;
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+            llama_batch enc_batch = {
+                /*.n_tokens =*/ n_chunk,
+                /*.token    =*/ nullptr,
+                /*.embd     =*/ const_cast<float *>(features.data() + (size_t) offset * n_embd_enc),
+                /*.pos      =*/ nullptr,
+                /*.n_seq_id =*/ nullptr,
+                /*.seq_id   =*/ nullptr,
+                /*.logits   =*/ nullptr,
+            };
+
+            int32_t rc = llama_encode(ctx_dft, enc_batch);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+
+            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+            batch_inject.n_tokens = n_chunk;
+            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                batch_inject.pos[i]       = positions[offset + i];
+                batch_inject.n_seq_id[i]  = 1;
+                batch_inject.seq_id[i][0] = seq_ids[offset + i];
+                batch_inject.logits[i]    = false;
+            }
+
+            rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+        }
+
+        return true;
     }
 
     bool process(const llama_batch & batch_in) override {
@@ -1067,90 +1152,82 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
-        // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
-        std::vector<int32_t> i_batch_beg(n_seq, -1);
-        std::vector<int32_t> i_batch_end(n_seq, -1);
-        for (int32_t k = 0; k < n_tokens; ++k) {
-            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
-            const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-                continue;
-            }
-            i_batch_end[seq_id] = k;
-            if (i_batch_beg[seq_id] < 0) {
-                i_batch_beg[seq_id] = k;
-            }
-        }
-
         auto * ctx_tgt = this->params.ctx_tgt;
-        auto * ctx_dft = this->params.ctx_dft;
 
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
-                continue;
+        // Copy every target feature before running the draft encoder. Target embedding
+        // buffers belong to this decode/subbatch and are not valid after the next decode.
+        features_buf.resize((size_t) n_tokens * n_embd_enc);
+        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+            if (!layer) {
+                GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
-
-            for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
-                const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
-
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                    }
-                }
-
-                // fuse extracted features through DFlash encoder
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                const float * src = layer + (size_t) i * n_embd_tgt;
+                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
             }
         }
 
-        return true;
+        commit_features.clear();
+        commit_pos.clear();
+        commit_seq.clear();
+        immediate_rows.clear();
+        immediate_rows.reserve(n_tokens);
+
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            GGML_ASSERT(batch_in.n_seq_id[i] == 1);
+            const llama_seq_id seq_id = batch_in.seq_id[i][0];
+            GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+
+            auto & pending = deferred[seq_id];
+            const llama_pos pos = batch_in.pos[i];
+            const int32_t i_pending = pending.pos_first >= 0 ? (int32_t) (pos - pending.pos_first) : -1;
+
+            if (i_pending >= 0 && i_pending < pending.n_rows) {
+                if (i_pending == 0) {
+                    std::fill(pending.present.begin(), pending.present.end(), 0);
+                    pending.n_captured = 0;
+                    pending.n_commit = 0;
+                    pending.accepted = false;
+                }
+
+                std::memcpy(
+                        pending.features.data() + (size_t) i_pending * n_embd_enc,
+                        features_buf.data() + (size_t) i * n_embd_enc,
+                        (size_t) n_embd_enc * sizeof(float));
+                pending.present[i_pending] = 1;
+                pending.n_captured = std::max(pending.n_captured, i_pending + 1);
+                continue;
+            }
+
+            immediate_rows.push_back(i);
+        }
+
+        // Prompt rows, multimodal rows, and non-speculative generation rows are
+        // never deferred. Only an active verification block waits for acceptance.
+        commit_pos.resize(immediate_rows.size());
+        commit_seq.resize(immediate_rows.size());
+
+        for (size_t i = 0; i < immediate_rows.size(); ++i) {
+            const int32_t i_batch = immediate_rows[i];
+            commit_pos[i] = batch_in.pos[i_batch];
+            commit_seq[i] = batch_in.seq_id[i_batch][0];
+        }
+
+        if (immediate_rows.size() == (size_t) n_tokens) {
+            return inject_features(features_buf, commit_pos, commit_seq);
+        }
+
+        commit_features.resize(immediate_rows.size() * n_embd_enc);
+        for (size_t i = 0; i < immediate_rows.size(); ++i) {
+            std::memcpy(
+                    commit_features.data() + i * n_embd_enc,
+                    features_buf.data() + (size_t) immediate_rows[i] * n_embd_enc,
+                    (size_t) n_embd_enc * sizeof(float));
+        }
+
+        return inject_features(commit_features, commit_pos, commit_seq);
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1168,6 +1245,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
+
+            deferred[seq_id] = {};
 
             common_sampler_reset(smpls[seq_id].get());
 
@@ -1263,11 +1342,107 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+
+            if (!result.empty()) {
+                auto & pending = deferred[seq_id];
+                pending.pos_first = dp.n_past;
+                pending.n_rows = (int32_t) result.size() + 1;
+                pending.features.resize((size_t) pending.n_rows * n_embd_enc);
+                pending.present.assign(pending.n_rows, 0);
+            }
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    bool commit() override {
+        commit_features.clear();
+        commit_pos.clear();
+        commit_seq.clear();
+
+        size_t n_rows_commit = 0;
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & pending = deferred[seq_id];
+            if (!pending.accepted) {
+                continue;
+            }
+
+            if (pending.n_commit <= 0 || pending.n_commit > pending.n_captured) {
+                LOG_ERR("%s: incomplete deferred verification prefix for seq_id=%d (commit=%d, captured=%d)\n",
+                        __func__, (int) seq_id, pending.n_commit, pending.n_captured);
+                return false;
+            }
+
+            for (int32_t i = 0; i < pending.n_commit; ++i) {
+                if (!pending.present[i]) {
+                    LOG_ERR("%s: missing deferred verification row for seq_id=%d at offset=%d\n",
+                            __func__, (int) seq_id, (int) i);
+                    return false;
+                }
+            }
+
+            n_rows_commit += pending.n_commit;
+        }
+
+        commit_features.resize(n_rows_commit * n_embd_enc);
+        commit_pos.resize(n_rows_commit);
+        commit_seq.resize(n_rows_commit);
+
+        size_t i_commit = 0;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const auto & pending = deferred[seq_id];
+            if (!pending.accepted) {
+                continue;
+            }
+
+            std::memcpy(
+                    commit_features.data() + i_commit * n_embd_enc,
+                    pending.features.data(),
+                    (size_t) pending.n_commit * n_embd_enc * sizeof(float));
+
+            for (int32_t i = 0; i < pending.n_commit; ++i) {
+                commit_pos[i_commit] = pending.pos_first + i;
+                commit_seq[i_commit] = seq_id;
+                ++i_commit;
+            }
+        }
+
+        if (!inject_features(commit_features, commit_pos, commit_seq)) {
+            return false;
+        }
+
+        for (auto & pending : deferred) {
+            if (pending.accepted) {
+                pending = {};
+            }
+        }
+
+        return true;
+    }
+
+    bool needs_commit() const override {
+        return std::any_of(deferred.begin(), deferred.end(), [](const deferred_verify & pending) {
+            return pending.accepted;
+        });
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (is_other || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        auto & pending = deferred[seq_id];
+        if (pending.pos_first < 0) {
+            return;
+        }
+
+        pending.n_commit = std::min<int32_t>((int32_t) n_accepted + 1, pending.n_rows);
+        pending.accepted = true;
+    }
+
+    void clear(llama_seq_id seq_id) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            deferred[seq_id] = {};
+        }
     }
 };
 
@@ -2607,6 +2782,29 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     return result;
 }
 
+bool common_speculative_commit(common_speculative * spec) {
+    if (spec == nullptr) {
+        return true;
+    }
+
+    bool result = true;
+    for (auto & impl : spec->impls) {
+        result = result && impl->commit();
+    }
+
+    return result;
+}
+
+bool common_speculative_needs_commit(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    return std::any_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
+        return impl->needs_commit();
+    });
+}
+
 void common_speculative_draft(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -2722,6 +2920,21 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+void common_speculative_clear(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) spec->dparams.size());
+
+    for (auto & impl : spec->impls) {
+        impl->clear(seq_id);
+    }
+
+    spec->dparams[seq_id] = {};
+    spec->impl_last[seq_id] = nullptr;
 }
 
 // TODO: support the case of more than one speculative implementations having a state

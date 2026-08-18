@@ -336,6 +336,7 @@ struct server_slot {
         n_sent_text    = 0;
 
         if (can_speculate()) {
+            common_speculative_clear(spec, id);
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
@@ -851,6 +852,7 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    std::vector<size_t> spec_n_draft_verified;
 
     int trace = 0;
     int slots_debug = 0;
@@ -1222,6 +1224,7 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
+        spec_n_draft_verified.resize(slots.size());
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -3799,7 +3802,13 @@ private:
             slot.print_timings_tg();
         });
 
+        if (!spec) {
+            return;
+        }
+
         // speculative decoding - main model sample and accept
+        std::fill(spec_n_draft_verified.begin(), spec_n_draft_verified.end(), 0);
+        auto & n_draft_verified = spec_n_draft_verified;
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
@@ -3864,7 +3873,30 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                n_draft_verified[slot.id] = n_draft;
             }
+
+        });
+
+        // Acceptance is now known for every active slot. DFlash commits only the
+        // accepted verification prefixes in one encoder/KV-injection batch.
+        if (common_speculative_needs_commit(spec.get())) {
+            bool ok = true;
+            queue_tasks.yield_to_queue([&]() {
+                ok = common_speculative_commit(spec.get());
+            });
+
+            if (!ok) {
+                throw std::runtime_error("failed to commit speculative state");
+            }
+        }
+
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.id < 0 || slot.id >= (int) n_draft_verified.size() || n_draft_verified[slot.id] == 0) {
+                return;
+            }
+
+            const size_t n_draft = n_draft_verified[slot.id];
 
             const auto ids = std::move(slot.spec_draft);
 

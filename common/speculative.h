@@ -70,11 +70,18 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
+// commit target-side state deferred until after speculative acceptance
+bool common_speculative_commit(common_speculative * spec);
+bool common_speculative_needs_commit(const common_speculative * spec);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+
+// discard per-sequence speculative state when a slot is reset
+void common_speculative_clear(common_speculative * spec, llama_seq_id seq_id);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

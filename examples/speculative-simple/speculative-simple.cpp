@@ -290,6 +290,10 @@ int main(int argc, char ** argv) {
         }
 
         common_speculative_accept(spec, seq_id, ids.size() - 1);
+        if (!common_speculative_commit(spec)) {
+            LOG_ERR("failed to commit speculative state\n");
+            break;
+        }
 
         // full acceptance: consume the draft and commit accepted tokens
         n_past    += ids.size() - 1;
