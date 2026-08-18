@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "llama-dspark-packed.h"
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -261,78 +262,115 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     const int64_t n_tok   = base->ne[1];
 
     const auto it = model.gguf_kv.find("dflash.block_size");
-    GGML_ASSERT(it != model.gguf_kv.end() && "DSpark draft requires 'dflash.block_size' in GGUF metadata");
-    const int64_t block_size = std::stoi(it->second);
-    GGML_ASSERT(block_size > 0);
-
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
-    GGML_ASSERT(n_blocks > 0 && n_tok % n_blocks == 0 && "DSpark markov head requires equal-size blocks");
-    // runtime tokens per block in this ubatch (anchor + drafted positions), bounded by training block_size
-    const int64_t block_drafts = n_tok / n_blocks;
-    if (block_drafts > block_size) {
+    uint32_t block_size_u32 = 0;
+    if (it == model.gguf_kv.end() || !llama_dspark_parse_gamma(it->second, block_size_u32)) {
+        // Context decode rejects real DSpark batches with missing/malformed
+        // gamma before memory mutation. Reserve/probe graph construction must
+        // remain non-throwing so model initialization itself stays recoverable.
         return;
     }
+    const int64_t block_size = block_size_u32;
 
-    // anchor (committed last) token of every block: token 0 of each block, i.e. a strided view
-    const size_t token_stride = (size_t) block_drafts * tokens->nb[0];
-    const size_t base_stride = (size_t) block_drafts * base->nb[1];
+    const auto layout = llama_dspark_packed_layout_from_ubatch(g.ubatch, (uint32_t) block_size);
+    if (!layout.valid) {
+        // graph_reserve() uses a synthetic rectangular ubatch that can be much
+        // wider than the trained DSpark gamma. Preserve the pre-packed-path
+        // reserve behavior: the backbone graph is still a valid capacity
+        // probe, while real token batches are rejected in llama_context before
+        // memory mutation and can never reach this fallback.
+        const int64_t n_blocks = g.ubatch.n_seqs_unq;
+        if (n_blocks > 0 && n_tok % n_blocks == 0 && n_tok / n_blocks > block_size) {
+            return;
+        }
+        GGML_ASSERT(false && "DSpark markov head requires valid contiguous packed rows");
+    }
+    GGML_ASSERT(layout.indptr.back() == (uint32_t) n_tok);
 
-    ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
-    prev = ggml_cont_1d(ctx0, prev, n_blocks);
-
-    // confidence head input: predicts per-position acceptance
+    // Confidence head input predicts per-position acceptance. Consecutive
+    // source-order sequences with the same width retain the original
+    // vectorized Markov path; only width transitions split the graph.
     ggml_tensor * conf_inp = res->t_embd; // [n_embd, n_tok]
+    ggml_tensor * out_all  = nullptr;
+    ggml_tensor * conf_all = nullptr;
 
-    ggml_tensor * cat      = nullptr;
-    ggml_tensor * cat_conf = nullptr;
+    for (const auto & group : layout.groups) {
+        const int64_t n_blocks    = group.n_seqs;
+        const int64_t block_width = group.width;
+        const int64_t group_rows  = n_blocks * block_width;
+        GGML_ASSERT(group_rows > 0 && group.row_begin + group_rows <= (uint32_t) n_tok);
 
-    // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
-    //       token pick, not the Markov conditioning path
-    for (int64_t i = 0; i < block_drafts; ++i) {
-        ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
-        ggml_tensor * bias    = ggml_mul_mat(ctx0, w2, w1_prev); // [n_vocab, n_blocks]
+        ggml_tensor * tokens_group = ggml_view_1d(
+                ctx0, tokens, group_rows, (size_t) group.row_begin * tokens->nb[0]);
+        ggml_tensor * base_group = ggml_view_2d(
+                ctx0, base, n_vocab, group_rows, base->nb[1],
+                (size_t) group.row_begin * base->nb[1]);
+        ggml_tensor * conf_group = ggml_view_2d(
+                ctx0, conf_inp, conf_inp->ne[0], group_rows, conf_inp->nb[1],
+                (size_t) group.row_begin * conf_inp->nb[1]);
 
-        // position i of every block: strided view [n_vocab, n_blocks]
-        ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
-        ggml_tensor * col    = ggml_add(ctx0, base_i, bias);
+        const size_t token_stride = (size_t) block_width * tokens_group->nb[0];
+        const size_t base_stride  = (size_t) block_width * base_group->nb[1];
+        const size_t conf_stride  = (size_t) block_width * conf_group->nb[1];
 
-        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
+        // Anchor (the committed last token) is row zero of every packed run.
+        ggml_tensor * prev = ggml_view_2d(ctx0, tokens_group, 1, n_blocks, token_stride, 0);
+        prev = ggml_cont_1d(ctx0, prev, n_blocks);
 
-        // conf(i) = sigmoid(conf_proj . [conf_inp(i); markov_w1[prev(i)]] + b)  -- [1, n_blocks]
-        ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
-                                                (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
-        ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
-        ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
-        if (model.dspark_conf_proj_b) {
-            conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
+        ggml_tensor * group_pos_major      = nullptr;
+        ggml_tensor * group_conf_pos_major = nullptr;
+
+        // TODO: the in-graph chain is greedy (argmax); sampling params affect
+        // only the final token pick, not the Markov conditioning path.
+        for (int64_t i = 0; i < block_width; ++i) {
+            ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
+            ggml_tensor * bias    = ggml_mul_mat(ctx0, w2, w1_prev); // [n_vocab, n_blocks]
+
+            ggml_tensor * base_i = ggml_view_2d(
+                    ctx0, base_group, n_vocab, n_blocks, base_stride, i * base_group->nb[1]);
+            ggml_tensor * col = ggml_add(ctx0, base_i, bias);
+            group_pos_major = group_pos_major ? ggml_concat(ctx0, group_pos_major, col, 1) : col;
+
+            ggml_tensor * conf_inp_i = ggml_view_2d(
+                    ctx0, conf_group, conf_group->ne[0], n_blocks, conf_stride, i * conf_group->nb[1]);
+            ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
+            ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+            if (model.dspark_conf_proj_b) {
+                conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
+            }
+            conf = ggml_sigmoid(ctx0, conf);
+            group_conf_pos_major = group_conf_pos_major ?
+                    ggml_concat(ctx0, group_conf_pos_major, conf, 1) : conf;
+
+            if (i + 1 < block_width) {
+                prev = ggml_argmax(ctx0, col);
+            }
         }
-        conf = ggml_sigmoid(ctx0, conf);
 
-        cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
+        // The Markov loop is position-major. Restore block-major order inside
+        // this group, then append groups in their original source order.
+        ggml_tensor * out_group = ggml_reshape_3d(
+                ctx0, group_pos_major, n_vocab, n_blocks, block_width);
+        out_group = ggml_cont(ctx0, ggml_permute(ctx0, out_group, 0, 2, 1, 3));
+        out_group = ggml_reshape_2d(ctx0, out_group, n_vocab, group_rows);
+        out_all = out_all ? ggml_concat(ctx0, out_all, out_group, 1) : out_group;
 
-        if (i + 1 < block_drafts) {
-            prev = ggml_argmax(ctx0, col);
-        }
+        ggml_tensor * conf_out_group = ggml_reshape_3d(
+                ctx0, group_conf_pos_major, 1, n_blocks, block_width);
+        conf_out_group = ggml_cont(ctx0, ggml_permute(ctx0, conf_out_group, 0, 2, 1, 3));
+        conf_out_group = ggml_reshape_2d(ctx0, conf_out_group, 1, group_rows);
+        conf_all = conf_all ? ggml_concat(ctx0, conf_all, conf_out_group, 1) : conf_out_group;
     }
 
-    // cat is position-major; restore ubatch block-major order
-    ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
-    out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]
-    out = ggml_reshape_2d(ctx0, out, n_vocab, n_tok);
+    GGML_ASSERT(out_all && conf_all && out_all->ne[1] == n_tok && conf_all->ne[1] == n_tok);
 
-    {
-        ggml_tensor * conf = ggml_reshape_3d(ctx0, cat_conf, 1, n_blocks, block_drafts);
-        conf = ggml_cont(ctx0, ggml_permute(ctx0, conf, 0, 2, 1, 3));
-        conf = ggml_reshape_2d(ctx0, conf, 1, n_tok);
+    // Broadcast [1, n_tok] confidences to n_embd-wide rows to reuse the
+    // existing llama_get_embeddings_nextn host/device plumbing.
+    conf_all = ggml_repeat(ctx0, conf_all, res->t_embd);
+    res->t_h_nextn = conf_all;
+    ggml_build_forward_expand(g.gf, conf_all);
 
-        // note: broadcast the [1, n_tok] confidences to n_embd-wide rows to be able to reuse `llama_get_embeddings_nextn`
-        conf = ggml_repeat(ctx0, conf, res->t_embd);
-        res->t_h_nextn = conf;
-        ggml_build_forward_expand(g.gf, conf);
-    }
-
-    res->t_logits = out;
-    ggml_build_forward_expand(g.gf, out);
+    res->t_logits = out_all;
+    ggml_build_forward_expand(g.gf, out_all);
 }
 
 // DFlash decoder, dual-mode by batch type:

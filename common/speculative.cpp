@@ -11,12 +11,14 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-dspark-packed.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <cinttypes>
 
@@ -34,6 +36,54 @@ static constexpr int32_t SPEC_ADAPTIVE_ARMS[] = { 0, 1, 2, 3, 7 };
 
 int32_t common_speculative_draft_n_max_for_seq(int32_t configured_n_max, int32_t seq_n_max) {
     return seq_n_max < 0 ? configured_n_max : std::min(configured_n_max, seq_n_max);
+}
+
+common_speculative_dspark_pack_plan common_speculative_dspark_pack_rows(
+        int32_t configured_n_max,
+        int32_t configured_n_min,
+        int32_t trained_gamma,
+        int32_t max_total_rows,
+        const std::vector<int32_t> & seq_n_max) {
+    common_speculative_dspark_pack_plan result;
+    result.widths.assign(seq_n_max.size(), 0);
+    result.indptr.reserve(seq_n_max.size() + 1);
+    result.indptr.push_back(0);
+
+    if (configured_n_max < 0 || configured_n_min < 0 || configured_n_min > configured_n_max ||
+            trained_gamma <= 0 || configured_n_max > trained_gamma || max_total_rows <= 0) {
+        result.reason = "invalid DSpark gamma, draft bounds, or ubatch width";
+        return result;
+    }
+
+    int64_t total = 0;
+    for (size_t i = 0; i < seq_n_max.size(); ++i) {
+        if (seq_n_max[i] < -1) {
+            result.reason = "invalid per-sequence DSpark cap";
+            return result;
+        }
+
+        int32_t width = common_speculative_draft_n_max_for_seq(configured_n_max, seq_n_max[i]);
+        if (width < configured_n_min) {
+            width = 0;
+        }
+        if (width < 0 || width > trained_gamma) {
+            result.reason = "per-sequence DSpark width exceeds trained gamma";
+            return result;
+        }
+
+        total += width;
+        if (total > max_total_rows || total > std::numeric_limits<int32_t>::max()) {
+            result.reason = "packed DSpark rows exceed the single-ubatch target width";
+            return result;
+        }
+
+        result.widths[i] = width;
+        result.indptr.push_back((int32_t) total);
+    }
+
+    result.valid      = true;
+    result.total_rows = (int32_t) total;
+    return result;
 }
 
 int32_t common_speculative_adaptive_n_max(
@@ -1080,11 +1130,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_pos_dft = model_n_pos(model_dft);
 
         // read the trained block size from the dflash.block_size metadata key
-        block_size = 16;
+        block_size = is_dspark ? 0 : 16;
         {
             char buf[32] = {};
             if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
-                block_size = std::atoi(buf);
+                uint32_t parsed = 0;
+                block_size = llama_dspark_parse_gamma(buf, parsed) ? (int32_t) parsed : 0;
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
@@ -1095,8 +1146,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, DSpark yield a full block_size draft tokens
-        const int32_t n_draft_max = is_dspark ? block_size : block_size - 1;
-        if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
+        const int32_t n_draft_max = block_size > 0 ? (is_dspark ? block_size : block_size - 1) : 0;
+        if (block_size <= 0) {
+            LOG_ERR("%s: invalid dflash.block_size metadata; disabling draft proposals\n", __func__);
+            this->params.n_max = 0;
+            this->params.n_min = 0;
+        } else if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
             LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained block size %d -- clamping to %d\n",
                     __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
             this->params.n_max = std::min(this->params.n_max, n_draft_max);
@@ -1423,51 +1478,84 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         common_batch_clear(batch);
 
-        // build one batch holding every drafting sequence's noise block into a single decode)
-        // record where each block starts and its size
+        // Build one source-order batch holding every drafting sequence's noise
+        // rows. DSpark is compact/ragged; DFlash retains its anchor + masks
+        // layout unchanged.
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_sample   (n_seq,  0);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
+        if (is_dspark) {
+            std::vector<llama_seq_id> source_seqs;
+            std::vector<int32_t>      source_caps;
+            source_seqs.reserve(n_seq);
+            source_caps.reserve(n_seq);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+                if (dp.survival) {
+                    dp.survival->clear();
+                }
+                source_seqs.push_back(seq_id);
+                source_caps.push_back(dp.n_max);
             }
 
-            if (dp.survival) {
-                dp.survival->clear();
+            const auto packed = common_speculative_dspark_pack_rows(
+                    params.n_max,
+                    params.n_min,
+                    block_size,
+                    (int32_t) llama_n_ubatch(ctx_dft),
+                    source_caps);
+            if (!packed.valid) {
+                SPC_WRN("packed DSpark proposal rejected: %s; using target-only for this tick\n",
+                        packed.reason.c_str());
+                return;
             }
 
-            common_sampler_reset(smpls[seq_id].get());
+            for (size_t source = 0; source < source_seqs.size(); ++source) {
+                const llama_seq_id seq_id  = source_seqs[source];
+                const int32_t      n_draft = packed.widths[source];
+                if (n_draft == 0) {
+                    continue;
+                }
 
-            const int32_t n = (int32_t) dp.n_past;
+                auto & dp = dparams[seq_id];
+                common_sampler_reset(smpls[seq_id].get());
 
-            // DFlash and DSpark produce the complete proposal block in one decode,
-            // so respecting the per-sequence bound here avoids computing tokens
-            // that common_speculative_draft() would only truncate afterwards.
-            const int32_t n_draft = common_speculative_draft_n_max_for_seq(params.n_max, dp.n_max);
-            if (n_draft <= 0 || n_draft < params.n_min) {
-                continue;
+                const int32_t n = (int32_t) dp.n_past;
+                i_block_beg[seq_id] = batch.n_tokens;
+                n_sample   [seq_id] = n_draft;
+                for (int32_t i = 0; i < n_draft; ++i) {
+                    common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                }
             }
+        } else {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
 
-            const bool require_full_dspark_block = is_dspark && dp.survival != nullptr;
-            if (require_full_dspark_block && n_draft < params.n_max) {
-                // A shorter block would violate DSpark's equal-size Markov
-                // layout, while widening it could exceed this sequence's
-                // server context allowance. Use target-only for this tick.
-                continue;
-            }
+                if (dp.survival) {
+                    dp.survival->clear();
+                }
 
-            // The DSpark Markov graph requires equal-size blocks in one
-            // ubatch. Keep the rectangular trained execution block and apply
-            // the per-sequence limit only while sampling the SPS result. Plain
-            // DFlash and adaptive DSpark retain their supported ragged blocks.
-            const int32_t n_block_tokens = require_full_dspark_block ?
-                    params.n_max : n_draft + (is_dspark ? 0 : 1);
-            i_block_beg[seq_id] = batch.n_tokens;
-            n_sample   [seq_id] = n_draft;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                common_sampler_reset(smpls[seq_id].get());
+
+                const int32_t n = (int32_t) dp.n_past;
+                const int32_t n_draft = common_speculative_draft_n_max_for_seq(params.n_max, dp.n_max);
+                if (n_draft <= 0 || n_draft < params.n_min) {
+                    continue;
+                }
+
+                const int32_t n_block_tokens = n_draft + 1;
+                i_block_beg[seq_id] = batch.n_tokens;
+                n_sample   [seq_id] = n_draft;
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
+                }
             }
         }
 

@@ -107,6 +107,12 @@ public:
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
     llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
 
+    // Keep every participating sequence-set complete and only group adjacent
+    // source-order runs of identical length. This is used by packed DSpark on
+    // iSWA fallback memory: splitting a run would reinterpret a MASK row
+    // as a new Markov anchor.
+    llama_ubatch split_equal_complete(uint32_t n_ubatch, bool sequential, bool group_equal);
+
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 

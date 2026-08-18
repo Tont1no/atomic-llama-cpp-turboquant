@@ -47,7 +47,9 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) : unified(unified) {
+    const  layer_share_cb & share) :
+    unified(unified),
+    packed_dspark(model.dspark_markov_w1 != nullptr) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -158,6 +160,72 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
 
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    // DSpark Markov rows are anchor + MASK chains. A normal equal split cuts
+    // every active sequence at the shortest remaining width and can therefore
+    // turn a continuation MASK into the next graph's anchor. Keep each source
+    // run complete. Adjacent equal-width runs can still share one rectangular
+    // graph; a placement retry falls back to one complete source run at a time.
+    if (packed_dspark && balloc.get_batch().token) {
+        const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
+            auto sinfos_base = kv_base->prepare(ubatches);
+            if (sinfos_base.empty()) {
+                return nullptr;
+            }
+
+            auto sinfos_swa = kv_swa->prepare(ubatches);
+            if (sinfos_swa.empty()) {
+                return nullptr;
+            }
+
+            assert(sinfos_base.size() == sinfos_swa.size());
+            return std::make_unique<llama_kv_cache_iswa_context>(
+                    this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+        };
+
+        // Unified iSWA can keep the entire compact ragged batch in one
+        // source-order ubatch. This is the throughput path: the Markov graph
+        // consumes the packed indptr and executes all width groups together.
+        if (unified) {
+            balloc.split_reset();
+            std::vector<llama_ubatch> ubatches;
+            auto ubatch = balloc.split_simple(n_ubatch);
+            if (ubatch.n_tokens == balloc.get_n_tokens() &&
+                    balloc.get_n_used() == balloc.get_n_tokens()) {
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+                if (auto ctx = make_context(std::move(ubatches))) {
+                    return ctx;
+                }
+            }
+        }
+
+        const auto make_packed_context = [&](bool group_equal) -> llama_memory_context_ptr {
+            balloc.split_reset();
+
+            std::vector<llama_ubatch> ubatches;
+            while (true) {
+                auto ubatch = balloc.split_equal_complete(
+                        n_ubatch, /* sequential = */ true, group_equal);
+                if (ubatch.n_tokens == 0) {
+                    break;
+                }
+                ubatches.push_back(std::move(ubatch)); // NOLINT
+            }
+
+            if (balloc.get_n_used() < balloc.get_n_tokens()) {
+                return nullptr;
+            }
+            return make_context(std::move(ubatches));
+        };
+
+        if (auto ctx = make_packed_context(/* group_equal = */ true)) {
+            return ctx;
+        }
+        if (auto ctx = make_packed_context(/* group_equal = */ false)) {
+            return ctx;
+        }
+        return std::make_unique<llama_kv_cache_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
 
     // first try simple split
     do {

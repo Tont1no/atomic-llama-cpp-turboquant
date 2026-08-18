@@ -773,6 +773,11 @@ struct llm_graph_params {
     };
     std::vector<external_tensor_signature> external_layer_input_signatures;
 
+    // DSpark's Markov topology depends on source-order ragged run boundaries,
+    // not only on total rows. An empty signature means this is not a packed
+    // DSpark token graph.
+    std::vector<uint32_t> dspark_packed_indptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -861,6 +866,9 @@ struct llm_graph_params {
             return false;
         }
         if (external_layer_input_signatures != other.external_layer_input_signatures) {
+            return false;
+        }
+        if (dspark_packed_indptr != other.dspark_packed_indptr) {
             return false;
         }
 
