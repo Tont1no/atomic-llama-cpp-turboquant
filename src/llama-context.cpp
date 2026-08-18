@@ -4117,6 +4117,31 @@ llama_recurrent_resize_stats llama_context::recurrent_resize_stats() const {
     return result;
 }
 
+llama_graph_execution_stats llama_context::graph_execution_stats() const {
+    llama_graph_execution_stats result = {};
+
+    for (ggml_backend_t backend : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (!reg) {
+            continue;
+        }
+
+        auto fn = (ggml_backend_get_graph_execution_stats_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_graph_execution_stats");
+        if (!fn) {
+            continue;
+        }
+
+        const ggml_backend_graph_execution_stats stats = fn(backend);
+        result.direct  += stats.direct;
+        result.capture += stats.capture;
+        result.replay  += stats.replay;
+    }
+
+    return result;
+}
+
 void llama_context::set_recurrent_load_hint(uint32_t load) {
     recurrent_load_hint = load;
     recurrent_load_epoch++;
@@ -5086,6 +5111,10 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_recurrent_resize_stats llama_get_recurrent_resize_stats(const struct llama_context * ctx) {
     return ctx->recurrent_resize_stats();
+}
+
+llama_graph_execution_stats llama_get_graph_execution_stats(const struct llama_context * ctx) {
+    return ctx->graph_execution_stats();
 }
 
 void llama_set_recurrent_load_hint(struct llama_context * ctx, uint32_t load) {

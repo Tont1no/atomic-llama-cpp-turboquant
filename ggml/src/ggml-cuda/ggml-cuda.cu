@@ -4671,6 +4671,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (!use_cuda_graph) {
+        cuda_ctx->graph_direct_executions.fetch_add(1, std::memory_order_relaxed);
+    } else if (cuda_graph_update_required) {
+        cuda_ctx->graph_capture_executions.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        cuda_ctx->graph_replay_executions.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5889,6 +5897,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_get_graph_execution_stats") == 0) {
+        return (void *)+[](ggml_backend_t backend) -> ggml_backend_graph_execution_stats {
+            const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+            return {
+                ctx->graph_direct_executions .load(std::memory_order_relaxed),
+                ctx->graph_capture_executions.load(std::memory_order_relaxed),
+                ctx->graph_replay_executions .load(std::memory_order_relaxed),
+            };
+        };
     }
     return nullptr;
 }

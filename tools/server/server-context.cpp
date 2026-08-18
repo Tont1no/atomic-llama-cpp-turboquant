@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <limits>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -936,6 +937,16 @@ private:
     common_speculative_ptr spec;
 
     std::optional<common_speculative_sps_profile> spec_sps_profile;
+    std::unique_ptr<common_speculative_sps_profile_recorder> spec_sps_recorder;
+    std::string spec_sps_record_sidecar_path;
+
+    struct sps_record_tick_descriptor {
+        bool valid = false;
+        int32_t context_tokens = 0;
+        int32_t active_slots = 0;
+        int32_t total_verify_rows = 0;
+        std::vector<int32_t> prefixes;
+    } spec_sps_record_tick;
 
     bool add_bos_token = true;
 
@@ -979,6 +990,8 @@ private:
         spec.reset();
         spec_init.reset();
         spec_sps_profile.reset();
+        spec_sps_recorder.reset();
+        spec_sps_record_sidecar_path.clear();
 
         ctx_dft   = nullptr;
         model_dft = nullptr;
@@ -1050,7 +1063,10 @@ private:
         params_base = params;
 
         spec_sps_profile.reset();
+        spec_sps_recorder.reset();
+        spec_sps_record_sidecar_path.clear();
         const auto & sps_path = params_base.speculative.draft.sps_profile;
+        const auto & sps_record_path = params_base.speculative.draft.sps_record;
         if (params_base.speculative.draft.sps_shadow && sps_path.empty()) {
             SRV_ERR("%s\n", "--spec-draft-sps-shadow requires --spec-draft-sps-profile");
             return false;
@@ -1075,6 +1091,103 @@ private:
             SRV_INF("DSpark SPS planner enabled: profile='%s', entries=%zu, mode=%s\n",
                     sps_path.c_str(), spec_sps_profile->entries.size(),
                     params_base.speculative.draft.sps_shadow ? "shadow" : "execution-caps");
+        }
+        if (!sps_record_path.empty()) {
+            if (!sps_path.empty() || params_base.speculative.draft.sps_shadow || params_base.speculative.draft.adaptive) {
+                SRV_ERR("%s\n", "--spec-draft-sps-record cannot be combined with SPS planning, shadow mode, or adaptive drafting");
+                return false;
+            }
+            if (!server_speculative_is_only_dspark(params_base.speculative.types)) {
+                SRV_ERR("%s\n", "SPS recording requires exactly one speculative type: draft-dspark");
+                return false;
+            }
+            if (params_base.speculative.draft.sps_record_context_buckets.empty() ||
+                    params_base.speculative.draft.sps_record_active_slots.empty() ||
+                    params_base.speculative.draft.sps_record_caps.empty()) {
+                SRV_ERR("%s\n", "SPS recording requires context buckets, active slots, and caps");
+                return false;
+            }
+            if (params_base.speculative.draft.sps_record_identity.empty()) {
+                SRV_ERR("%s\n", "SPS recording requires --spec-draft-sps-record-identity from the guarded orchestrator");
+                return false;
+            }
+            if (params_base.speculative.draft.sps_record_active_slots.back() > params_base.n_parallel) {
+                SRV_ERR("SPS record active-slot count %d exceeds --parallel %d\n",
+                        params_base.speculative.draft.sps_record_active_slots.back(), params_base.n_parallel);
+                return false;
+            }
+            if (params_base.speculative.draft.sps_record_caps.back() > params_base.speculative.draft.n_max) {
+                SRV_ERR("SPS record cap %d exceeds --spec-draft-n-max %d\n",
+                        params_base.speculative.draft.sps_record_caps.back(), params_base.speculative.draft.n_max);
+                return false;
+            }
+            SRV_INF("DSpark SPS recorder enabled: output='%s', samples=%u, warmup=%u, forced_rows=%d\n",
+                    sps_record_path.c_str(), params_base.speculative.draft.sps_record_samples,
+                    params_base.speculative.draft.sps_record_warmup,
+                    params_base.speculative.draft.sps_force_verify_rows);
+
+            std::filesystem::path sidecar_path = std::filesystem::u8path(sps_record_path);
+            sidecar_path.replace_extension(".samples.json");
+            spec_sps_record_sidecar_path = sidecar_path.u8string();
+            const std::filesystem::path primary_path = std::filesystem::u8path(sps_record_path);
+            const bool sidecar_exists = std::filesystem::exists(sidecar_path);
+            if (!sidecar_exists && std::filesystem::exists(primary_path)) {
+                SRV_ERR("SPS recorder output '%s' already exists without its matching resume sidecar\n",
+                        sps_record_path.c_str());
+                return false;
+            }
+
+            common_speculative_sps_profile_recorder_config recorder_config;
+            recorder_config.source_identity = params_base.speculative.draft.sps_record_identity;
+            recorder_config.context_buckets = params_base.speculative.draft.sps_record_context_buckets;
+            recorder_config.max_draft_tokens_per_slot = params_base.speculative.draft.n_max;
+            recorder_config.retained_samples_per_coordinate = params_base.speculative.draft.sps_record_samples;
+            recorder_config.warmup_samples_per_coordinate = params_base.speculative.draft.sps_record_warmup;
+            recorder_config.aggregate_quantile = 0.95;
+            if (sidecar_exists) {
+                recorder_config.resume_sidecar_path = spec_sps_record_sidecar_path;
+            }
+            for (const int32_t active : params_base.speculative.draft.sps_record_active_slots) {
+                auto & rows = recorder_config.verify_rows_by_active[active];
+                for (const int32_t cap : params_base.speculative.draft.sps_record_caps) {
+                    const int64_t row64 = (int64_t) active * (1 + (int64_t) cap);
+                    if (row64 > std::numeric_limits<int32_t>::max()) {
+                        SRV_ERR("SPS recorder row coordinate overflows int32: active=%d cap=%d\n", active, cap);
+                        return false;
+                    }
+                    rows.push_back((int32_t) row64);
+                }
+            }
+            if (params_base.speculative.draft.sps_force_verify_rows >= 0) {
+                if (recorder_config.verify_rows_by_active.size() != 1) {
+                    SRV_ERR("%s\n", "forced SPS verify rows require exactly one --spec-draft-sps-record-active value");
+                    return false;
+                }
+                const auto & rows = recorder_config.verify_rows_by_active.begin()->second;
+                if (!std::binary_search(
+                            rows.begin(), rows.end(),
+                            params_base.speculative.draft.sps_force_verify_rows)) {
+                    SRV_ERR("forced SPS verify rows %d are not a configured active/cap coordinate\n",
+                            params_base.speculative.draft.sps_force_verify_rows);
+                    return false;
+                }
+            }
+
+            try {
+                spec_sps_recorder.reset(new common_speculative_sps_profile_recorder(std::move(recorder_config)));
+                if (!spec_sps_recorder->ready() && std::filesystem::exists(primary_path)) {
+                    throw std::runtime_error("incomplete SPS sidecar has a stale primary profile at the requested output path");
+                }
+                spec_sps_recorder->write_atomic(sps_record_path, spec_sps_record_sidecar_path);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to initialize SPS recorder: %s\n", e.what());
+                return false;
+            }
+            metrics.n_sps_record_coordinates_ready = spec_sps_recorder->ready_coordinates();
+            metrics.n_sps_record_coordinates_total = spec_sps_recorder->expected_coordinates();
+        } else if (params_base.speculative.draft.sps_force_verify_rows >= 0) {
+            SRV_ERR("%s\n", "--spec-draft-sps-force-verify-rows requires --spec-draft-sps-record");
+            return false;
         }
 
         const auto output_limits = server_output_limits(params_base);
@@ -1390,8 +1503,8 @@ private:
             model_dft = nullptr;
         }
 
-        if (spec_sps_profile && !spec) {
-            SRV_ERR("%s\n", "DSpark SPS profile was requested but the speculative context did not initialize");
+        if ((spec_sps_profile || spec_sps_recorder) && !spec) {
+            SRV_ERR("%s\n", "DSpark SPS profile or recorder was requested but the speculative context did not initialize");
             return false;
         }
 
@@ -3030,6 +3143,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        spec_sps_record_tick = {};
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3161,6 +3275,77 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+        }
+
+        // Record-mode profiling arms may force a precise whole-batch verify-row
+        // shape. Resize only fresh drafts and only after every slot has proved
+        // it can supply its balanced share; checkpoint replays are never
+        // modified. A failed arm remains unarmed and is excluded downstream.
+        if (!params_base.speculative.draft.sps_record.empty() && !generating.empty()) {
+            const int32_t active = (int32_t) generating.size();
+            int32_t context_tokens = 1;
+            for (const server_slot * slot : generating) {
+                context_tokens = std::max(context_tokens, slot->prompt.n_tokens());
+            }
+
+            std::vector<int32_t> selected_prefixes((size_t) active, 0);
+            bool arm_valid = true;
+            int32_t requested_rows = params_base.speculative.draft.sps_force_verify_rows;
+
+            if (requested_rows >= 0) {
+                // Profiling arms are exact-active experiments. During request
+                // ramp-up/drain, never reshape a different number of slots to
+                // the configured global row count.
+                if (active != params_base.speculative.draft.sps_record_active_slots.front() ||
+                        requested_rows < active) {
+                    arm_valid = false;
+                } else {
+                    const int32_t extra = requested_rows - active;
+                    const int32_t base = extra / active;
+                    const int32_t remainder = extra % active;
+                    for (int32_t i = 0; i < active; ++i) {
+                        selected_prefixes[(size_t) i] = base + (i < remainder ? 1 : 0);
+                    }
+                }
+            } else {
+                requested_rows = active;
+                for (int32_t i = 0; i < active; ++i) {
+                    selected_prefixes[(size_t) i] = (int32_t) generating[(size_t) i]->spec_draft.size();
+                    requested_rows += selected_prefixes[(size_t) i];
+                }
+            }
+
+            if (arm_valid) {
+                for (int32_t i = 0; i < active; ++i) {
+                    server_slot * slot = generating[(size_t) i];
+                    const bool fresh = std::find(drafting.begin(), drafting.end(), slot) != drafting.end();
+                    if (!fresh || selected_prefixes[(size_t) i] > (int32_t) slot->spec_draft.size()) {
+                        arm_valid = false;
+                        break;
+                    }
+                }
+            }
+
+            if (arm_valid) {
+                for (int32_t i = 0; i < active; ++i) {
+                    server_slot * slot = generating[(size_t) i];
+                    const size_t selected = (size_t) selected_prefixes[(size_t) i];
+                    slot->spec_draft.resize(selected);
+                    if (slot->spec_draft_survival.size() > selected) {
+                        slot->spec_draft_survival.resize(selected);
+                    }
+                }
+                spec_sps_record_tick = {
+                    /* .valid             = */ true,
+                    /* .context_tokens    = */ context_tokens,
+                    /* .active_slots      = */ active,
+                    /* .total_verify_rows = */ requested_rows,
+                    /* .prefixes          = */ std::move(selected_prefixes),
+                };
+            } else {
+                SRV_DBG("SPS record arm skipped: active=%d forced_rows=%d cannot be supplied by fresh drafts\n",
+                        active, requested_rows);
+            }
         }
 
         // Phase 1 keeps the existing full DSpark draft pass, then applies a
@@ -3909,15 +4094,102 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        const bool record_enabled = spec_sps_recorder != nullptr;
+        const llama_graph_execution_stats graph_stats_before = record_enabled ?
+                llama_get_graph_execution_stats(ctx_tgt) : llama_graph_execution_stats {};
+        int64_t record_begin_us = 0;
+        int64_t record_end_us   = 0;
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            if (record_enabled) {
+                record_begin_us = ggml_time_us();
+            }
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            if (record_enabled) {
+                record_end_us = ggml_time_us();
+            }
         });
+
+        if (record_enabled) {
+            const llama_graph_execution_stats graph_stats_after = llama_get_graph_execution_stats(ctx_tgt);
+            const bool whole_batch = off == 0 && batch_view.n_tokens == batch.size();
+            bool pure_generation = whole_batch;
+            if (whole_batch) {
+                for (int32_t i = 0; i < batch.size(); ++i) {
+                    pure_generation = pure_generation && !batch.tokens[(size_t) i].is_prompt;
+                }
+            }
+
+            common_speculative_sps_execution_kind execution_kind = COMMON_SPECULATIVE_SPS_EXECUTION_UNKNOWN;
+            if (graph_stats_after.capture > graph_stats_before.capture) {
+                execution_kind = COMMON_SPECULATIVE_SPS_EXECUTION_GRAPH_CAPTURE;
+            } else if (graph_stats_after.replay > graph_stats_before.replay) {
+                execution_kind = COMMON_SPECULATIVE_SPS_EXECUTION_GRAPH_REPLAY;
+            } else if (graph_stats_after.direct > graph_stats_before.direct) {
+                execution_kind = COMMON_SPECULATIVE_SPS_EXECUTION_GRAPHS_DISABLED;
+            }
+
+            common_speculative_sps_profile_sample sample;
+            sample.actual_context_tokens = spec_sps_record_tick.context_tokens;
+            sample.active_slots          = spec_sps_record_tick.active_slots;
+            sample.total_verify_rows     = spec_sps_record_tick.total_verify_rows;
+            sample.cost_us               = (double) std::max<int64_t>(1, record_end_us - record_begin_us);
+            sample.decode_succeeded      = ret == 0;
+            sample.synchronized          = ret == 0 && has_output;
+            sample.pure_generation       = pure_generation;
+            sample.whole_batch           = whole_batch && spec_sps_record_tick.valid &&
+                    batch_view.n_tokens == spec_sps_record_tick.total_verify_rows;
+            sample.execution_kind        = execution_kind;
+            sample.prefixes              = spec_sps_record_tick.prefixes;
+
+            const auto record_result = spec_sps_recorder->observe(sample);
+            switch (record_result) {
+                case COMMON_SPECULATIVE_SPS_RECORD_RETAINED:
+                case COMMON_SPECULATIVE_SPS_RECORD_COORDINATE_READY:
+                case COMMON_SPECULATIVE_SPS_RECORD_ALL_READY:
+                    metrics.n_sps_record_retained_samples++;
+                    break;
+                case COMMON_SPECULATIVE_SPS_RECORD_SKIPPED_WARMUP:
+                    metrics.n_sps_record_skipped_warmup++;
+                    break;
+                case COMMON_SPECULATIVE_SPS_RECORD_SKIPPED_CAPTURE:
+                    metrics.n_sps_record_skipped_capture++;
+                    break;
+                case COMMON_SPECULATIVE_SPS_RECORD_SKIPPED_INELIGIBLE:
+                    if (ret != 0) {
+                        metrics.n_sps_record_skipped_retry++;
+                    } else if (!whole_batch) {
+                        metrics.n_sps_record_skipped_partial++;
+                    } else if (!pure_generation) {
+                        metrics.n_sps_record_skipped_mixed++;
+                    } else {
+                        metrics.n_sps_record_skipped_other++;
+                    }
+                    break;
+                case COMMON_SPECULATIVE_SPS_RECORD_SKIPPED_OUTSIDE_GRID:
+                case COMMON_SPECULATIVE_SPS_RECORD_SKIPPED_FULL:
+                    metrics.n_sps_record_skipped_other++;
+                    break;
+            }
+            metrics.n_sps_record_coordinates_ready = spec_sps_recorder->ready_coordinates();
+            metrics.n_sps_record_coordinates_total = spec_sps_recorder->expected_coordinates();
+
+            try {
+                spec_sps_recorder->write_atomic(
+                        params_base.speculative.draft.sps_record,
+                        spec_sps_record_sidecar_path);
+            } catch (const std::exception & e) {
+                metrics.n_sps_record_write_errors++;
+                SRV_ERR("failed to persist SPS recorder state: %s\n", e.what());
+                throw;
+            }
+        }
 
         if (ret != 0) {
             {

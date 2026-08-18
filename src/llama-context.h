@@ -202,6 +202,8 @@ struct llama_context {
 
     llama_recurrent_resize_stats recurrent_resize_stats() const;
 
+    llama_graph_execution_stats graph_execution_stats() const;
+
     void set_recurrent_load_hint(uint32_t load);
     uint32_t get_recurrent_load_hint() const;
     uint64_t get_recurrent_load_epoch() const;

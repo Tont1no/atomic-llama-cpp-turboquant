@@ -485,6 +485,17 @@ struct server_metrics {
     uint64_t n_sps_planned_verify_rows   = 0;
     uint64_t n_sps_executed_verify_rows  = 0;
 
+    uint64_t n_sps_record_retained_samples = 0;
+    uint64_t n_sps_record_skipped_warmup   = 0;
+    uint64_t n_sps_record_skipped_capture  = 0;
+    uint64_t n_sps_record_skipped_mixed    = 0;
+    uint64_t n_sps_record_skipped_partial  = 0;
+    uint64_t n_sps_record_skipped_retry    = 0;
+    uint64_t n_sps_record_skipped_other    = 0;
+    uint64_t n_sps_record_write_errors     = 0;
+    uint64_t n_sps_record_coordinates_ready = 0;
+    uint64_t n_sps_record_coordinates_total = 0;
+
     void init() {
         t_start = ggml_time_us();
     }

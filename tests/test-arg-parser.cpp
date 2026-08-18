@@ -274,6 +274,35 @@ static void test(void) {
     assert(sps_params.speculative.draft.sps_profile == "profile.json");
     assert(sps_params.speculative.draft.sps_shadow);
 
+    common_params sps_record_params;
+    argv = {
+        "binary_name", "--spec-type", "draft-dspark",
+        "--spec-draft-sps-record", "record.json",
+        "--spec-draft-sps-record-identity", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--spec-draft-sps-record-context-buckets", "2048,4096,8192",
+        "--spec-draft-sps-record-active", "1,2,4,8",
+        "--spec-draft-sps-record-caps", "0,1,2,3,7",
+        "--spec-draft-sps-record-samples", "32",
+        "--spec-draft-sps-record-warmup", "4",
+        "--spec-draft-sps-force-verify-rows", "16",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_record_params, LLAMA_EXAMPLE_SERVER));
+    assert(sps_record_params.speculative.draft.sps_record == "record.json");
+    assert(sps_record_params.speculative.draft.sps_record_identity == std::string(64, 'a'));
+    assert((sps_record_params.speculative.draft.sps_record_context_buckets == std::vector<int32_t>{2048, 4096, 8192}));
+    assert((sps_record_params.speculative.draft.sps_record_active_slots == std::vector<int32_t>{1, 2, 4, 8}));
+    assert((sps_record_params.speculative.draft.sps_record_caps == std::vector<int32_t>{0, 1, 2, 3, 7}));
+    assert(sps_record_params.speculative.draft.sps_record_samples == 32);
+    assert(sps_record_params.speculative.draft.sps_record_warmup == 4);
+    assert(sps_record_params.speculative.draft.sps_force_verify_rows == 16);
+
+    argv = {"binary_name", "--spec-draft-sps-record-caps", "0,7,3"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_record_params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--spec-draft-sps-record-context-buckets", "2048,2048"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_record_params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--spec-draft-sps-record-identity", "not-a-sha256"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_record_params, LLAMA_EXAMPLE_SERVER));
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);

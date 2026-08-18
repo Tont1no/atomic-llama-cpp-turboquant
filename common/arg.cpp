@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
@@ -73,6 +74,31 @@ static std::string read_file(const std::string & fname) {
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     return content;
+}
+
+static std::vector<int32_t> parse_sps_positive_list(const std::string & value, const char * name) {
+    const auto parts = string_split<std::string>(value, ',');
+    std::vector<int32_t> result;
+    result.reserve(parts.size());
+    for (const auto & part : parts) {
+        size_t consumed = 0;
+        int32_t parsed;
+        try {
+            parsed = std::stoi(part, &consumed);
+        } catch (const std::exception &) {
+            throw std::invalid_argument(std::string(name) + " must contain only positive integers");
+        }
+        if (part.empty() || consumed != part.size() || parsed <= 0) {
+            throw std::invalid_argument(std::string(name) + " must contain only positive integers");
+        }
+        result.push_back(parsed);
+    }
+    if (result.empty() || result.size() > 4096 ||
+            !std::is_sorted(result.begin(), result.end()) ||
+            std::adjacent_find(result.begin(), result.end()) != result.end()) {
+        throw std::invalid_argument(std::string(name) + " must be a non-empty sorted unique list");
+    }
+    return result;
 }
 
 static const std::vector<common_arg> & get_common_arg_defs() {
@@ -4220,6 +4246,103 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.sps_shadow = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_SHADOW"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-record"}, "FILE",
+        "record synchronized pure target-decode costs and atomically emit an SPS-v2 profile",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("SPS record path must not be empty");
+            }
+            params.speculative.draft.sps_record = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-record-identity"}, "SHA256",
+        "immutable SHA-256 fingerprint of the target/draft models, build, backend, GPU, and profiling runtime",
+        [](common_params & params, const std::string & value) {
+            if (value.size() != 64 || !std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+                    return std::isxdigit(ch) != 0;
+                })) {
+                throw std::invalid_argument("SPS record identity must be exactly 64 hexadecimal characters");
+            }
+            params.speculative.draft.sps_record_identity = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD_IDENTITY"));
+
+    add_opt(common_arg(
+        {"--spec-draft-sps-record-context-buckets"}, "N1,N2,...",
+        "sorted context-token ceiling buckets to record",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sps_record_context_buckets =
+                    parse_sps_positive_list(value, "SPS record context buckets");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD_CONTEXT_BUCKETS"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-record-active"}, "N1,N2,...",
+        "sorted exact active-slot counts to record (normally 1,2,4,8)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.sps_record_active_slots =
+                    parse_sps_positive_list(value, "SPS record active slots");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD_ACTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-record-caps"}, "N1,N2,...",
+        "sorted per-slot draft-prefix caps to record; zero is allowed",
+        [](common_params & params, const std::string & value) {
+            const auto parts = string_split<std::string>(value, ',');
+            std::vector<int32_t> result;
+            result.reserve(parts.size());
+            for (const auto & part : parts) {
+                size_t consumed = 0;
+                int32_t parsed;
+                try {
+                    parsed = std::stoi(part, &consumed);
+                } catch (const std::exception &) {
+                    throw std::invalid_argument("SPS record caps must contain only non-negative integers");
+                }
+                if (part.empty() || consumed != part.size() || parsed < 0) {
+                    throw std::invalid_argument("SPS record caps must contain only non-negative integers");
+                }
+                result.push_back(parsed);
+            }
+            if (result.empty() || result.size() > 4096 ||
+                    !std::is_sorted(result.begin(), result.end()) ||
+                    std::adjacent_find(result.begin(), result.end()) != result.end()) {
+                throw std::invalid_argument("SPS record caps must be a non-empty sorted unique list");
+            }
+            params.speculative.draft.sps_record_caps = std::move(result);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD_CAPS"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-record-samples"}, "N",
+        string_format("retained samples required per coordinate (default: %u)", params.speculative.draft.sps_record_samples),
+        [](common_params & params, int value) {
+            if (value <= 0 || value > 1000000) {
+                throw std::invalid_argument("SPS record samples must be between 1 and 1000000");
+            }
+            params.speculative.draft.sps_record_samples = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD_SAMPLES"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-record-warmup"}, "N",
+        string_format("non-capture warmup executions excluded per coordinate (default: %u)", params.speculative.draft.sps_record_warmup),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1000000) {
+                throw std::invalid_argument("SPS record warmup must be between 0 and 1000000");
+            }
+            params.speculative.draft.sps_record_warmup = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_RECORD_WARMUP"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-force-verify-rows"}, "N",
+        "record mode only: force the exact total target verify-row count for the profiling arm",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("forced SPS verify rows must be positive");
+            }
+            params.speculative.draft.sps_force_verify_rows = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_FORCE_VERIFY_ROWS"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

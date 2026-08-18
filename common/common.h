@@ -346,6 +346,18 @@ struct common_params_speculative_draft {
     std::string sps_profile;
     bool sps_shadow = false; // plan and report, but do not cap verification
 
+    // Reproducible SPS target-cost recording. The primary file is emitted in
+    // strict SPS-v2 loader format only after every requested coordinate is
+    // ready; an atomic audit sidecar is updated incrementally.
+    std::string sps_record;
+    std::string sps_record_identity; // orchestrator-supplied SHA-256 runtime fingerprint
+    std::vector<int32_t> sps_record_context_buckets;
+    std::vector<int32_t> sps_record_active_slots;
+    std::vector<int32_t> sps_record_caps;
+    uint32_t sps_record_samples = 64;
+    uint32_t sps_record_warmup  = 3;
+    int32_t sps_force_verify_rows = -1; // -1 leaves the normal static rows
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

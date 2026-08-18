@@ -583,6 +583,15 @@ extern "C" {
     LLAMA_API struct llama_recurrent_resize_stats llama_get_recurrent_resize_stats(const struct llama_context * ctx);
     LLAMA_API void llama_set_recurrent_load_hint(struct llama_context * ctx, uint32_t load);
 
+    struct llama_graph_execution_stats {
+        uint64_t direct;
+        uint64_t capture;
+        uint64_t replay;
+    };
+
+    // Monotonic backend execution counters. CPU-only contexts return zeros.
+    LLAMA_API struct llama_graph_execution_stats llama_get_graph_execution_stats(const struct llama_context * ctx);
+
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
     DEPRECATED(LLAMA_API int32_t llama_n_layer    (const struct llama_model * model), "use llama_model_n_layer instead");
