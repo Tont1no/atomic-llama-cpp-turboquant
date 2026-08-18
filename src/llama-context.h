@@ -319,6 +319,9 @@ private:
     std::vector<ggml_tensor *> external_layer_inputs;
     std::vector<llama_seq_id> device_layer_inp_seq_ids;
     std::vector<llama_pos>    device_layer_inp_pos;
+    uint32_t device_layer_inp_n_tokens = 0;
+    uint32_t device_layer_inp_n_pos    = 0;
+    bool device_layer_inp_text_tokens  = false;
     bool external_layer_inputs_rejected = false;
     uint32_t external_layer_inputs_actual_tokens = 0;
     int32_t  external_layer_inputs_mismatch_row  = -1;

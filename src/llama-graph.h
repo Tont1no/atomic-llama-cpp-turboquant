@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <array>
 #include <vector>
 #include <memory>
 #include <set>
@@ -757,6 +758,21 @@ struct llm_graph_params {
     // these as graph leaves to keep feature fusion and KV injection on-device.
     std::vector<ggml_tensor *> external_layer_inputs;
 
+    struct external_tensor_signature {
+        const ggml_tensor * tensor = nullptr;
+        const void * buffer = nullptr;
+        const void * data = nullptr;
+        int32_t type = 0;
+        std::array<int64_t, 4> ne = {};
+        std::array<size_t, 4> nb = {};
+
+        bool operator==(const external_tensor_signature & other) const {
+            return tensor == other.tensor && buffer == other.buffer && data == other.data &&
+                    type == other.type && ne == other.ne && nb == other.nb;
+        }
+    };
+    std::vector<external_tensor_signature> external_layer_input_signatures;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -842,6 +858,9 @@ struct llm_graph_params {
         }
 
         if (external_layer_inputs != other.external_layer_inputs) {
+            return false;
+        }
+        if (external_layer_input_signatures != other.external_layer_input_signatures) {
             return false;
         }
 
