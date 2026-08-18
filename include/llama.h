@@ -533,6 +533,15 @@ extern "C" {
                      struct llama_model * model,
             struct llama_context_params   params);
 
+    // Creates a context with an explicit recurrent SSM state-cache type.
+    // Existing callers should use llama_init_from_model(), which keeps the
+    // historical F32 recurrent-state behavior. Currently, type_s may be F32 or
+    // F16; F16 is supported only by compatible recurrent Qwen architectures.
+    LLAMA_API struct llama_context * llama_init_from_model_with_recurrent_cache_type(
+                     struct llama_model * model,
+            struct llama_context_params   params,
+                     enum ggml_type       type_s);
+
     DEPRECATED(LLAMA_API struct llama_context * llama_new_context_with_model(
                      struct llama_model * model,
             struct llama_context_params   params),

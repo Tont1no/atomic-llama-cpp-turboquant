@@ -82,7 +82,8 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              ggml_type type_s) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
@@ -387,6 +388,7 @@ llama_context::llama_context(
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
+            /*.type_s    =*/ type_s,
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
@@ -3553,9 +3555,10 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
+static llama_context * llama_init_from_model_impl(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params,
+                 ggml_type     type_s) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -3589,6 +3592,22 @@ llama_context * llama_init_from_model(
 
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (type_s != GGML_TYPE_F32 && type_s != GGML_TYPE_F16) {
+        LLAMA_LOG_ERROR("%s: recurrent state cache type must be f32 or f16 (got enum value %d)\n",
+                __func__, (int) type_s);
+        return nullptr;
+    }
+
+    const bool supports_f16_recurrent_state =
+        model->arch == LLM_ARCH_QWEN3NEXT ||
+        model->arch == LLM_ARCH_QWEN35 ||
+        model->arch == LLM_ARCH_QWEN35MOE;
+    if (type_s == GGML_TYPE_F16 && !supports_f16_recurrent_state) {
+        LLAMA_LOG_ERROR("%s: f16 recurrent state cache is currently supported only for Qwen3-Next/3.5/3.6/3.8 models\n",
+                __func__);
         return nullptr;
     }
 
@@ -3640,13 +3659,26 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, type_s);
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(
+                 llama_model * model,
+        llama_context_params   params) {
+    return llama_init_from_model_impl(model, params, GGML_TYPE_F32);
+}
+
+llama_context * llama_init_from_model_with_recurrent_cache_type(
+                 llama_model * model,
+        llama_context_params   params,
+                 ggml_type     type_s) {
+    return llama_init_from_model_impl(model, params, type_s);
 }
 
 // deprecated

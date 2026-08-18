@@ -89,7 +89,8 @@ int main(int argc, char ** argv) {
         ctx_params.n_samplers = sampler_configs.size();
     }
 
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model_with_recurrent_cache_type(
+            model, ctx_params, common_params_get_recurrent_cache_type(params));
 
     if (ctx == NULL) {
         LOG_ERR("%s: error: failed to create the llama_context\n" , __func__);

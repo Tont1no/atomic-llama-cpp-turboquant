@@ -26,11 +26,28 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+common_params_fit_status common_fit_params(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams,
+                              float * tensor_split,
+   llama_model_tensor_buft_override * tensor_buft_overrides,
+                             size_t * margins,
+                           uint32_t   n_ctx_min,
+                     ggml_log_level   log_level,
+                         ggml_type   type_s);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,
                  llama_model_params * mparams,
                llama_context_params * cparams);
+
+void common_fit_print(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams,
+                         ggml_type   type_s);
 
 void common_memory_breakdown_print(const llama_context * ctx);
 
@@ -54,3 +71,14 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+common_device_memory_data_vec common_get_device_memory_data(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+    std::vector<ggml_backend_dev_t> & devs,
+                           uint32_t & hp_ngl,
+                           uint32_t & hp_n_ctx_train,
+                           uint32_t & hp_n_expert,
+                     ggml_log_level   log_level,
+                         ggml_type   type_s);

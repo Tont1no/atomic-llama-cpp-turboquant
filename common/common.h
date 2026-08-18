@@ -932,6 +932,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
+// Recurrent state-cache type is kept out of common_params to preserve its
+// shared-library layout. CLI users are registered by object identity.
+ggml_type common_params_get_recurrent_cache_type(const common_params & params);
+void common_params_set_recurrent_cache_type(common_params & params, ggml_type type_s);
+
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 

@@ -22,10 +22,12 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -62,6 +64,24 @@
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+static std::mutex g_recurrent_cache_types_mutex;
+static std::unordered_map<const common_params *, ggml_type> g_recurrent_cache_types;
+
+ggml_type common_params_get_recurrent_cache_type(const common_params & params) {
+    std::lock_guard<std::mutex> lock(g_recurrent_cache_types_mutex);
+    const auto it = g_recurrent_cache_types.find(&params);
+    return it == g_recurrent_cache_types.end() ? GGML_TYPE_F32 : it->second;
+}
+
+void common_params_set_recurrent_cache_type(common_params & params, ggml_type type_s) {
+    std::lock_guard<std::mutex> lock(g_recurrent_cache_types_mutex);
+    if (type_s == GGML_TYPE_F32) {
+        g_recurrent_cache_types.erase(&params);
+    } else {
+        g_recurrent_cache_types[&params] = type_s;
+    }
+}
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1299,7 +1319,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            common_params_get_recurrent_cache_type(params));
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1371,7 +1392,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = llama_init_from_model_with_recurrent_cache_type(
+            model, cparams, common_params_get_recurrent_cache_type(params));
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;

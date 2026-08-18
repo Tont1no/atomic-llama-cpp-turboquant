@@ -14,7 +14,8 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     cparams.n_rs_seq  = 8;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
-    return llama_init_from_model(model, cparams);
+    return llama_init_from_model_with_recurrent_cache_type(
+            model, cparams, common_params_get_recurrent_cache_type(params));
 }
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {

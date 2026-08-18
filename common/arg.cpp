@@ -331,6 +331,16 @@ static std::string get_all_kv_cache_types() {
     return msg.str();
 }
 
+static ggml_type recurrent_cache_type_from_str(const std::string & s) {
+    if (s == "f32") {
+        return GGML_TYPE_F32;
+    }
+    if (s == "f16") {
+        return GGML_TYPE_F16;
+    }
+    throw std::runtime_error("Unsupported recurrent state cache type: " + s + " (allowed: f32, f16)");
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -1284,12 +1294,17 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
     }
 #endif
 
+    // common_params intentionally keeps its historical binary layout. Reset
+    // the sidecar option before each parse so reused stack addresses are safe.
+    common_params_set_recurrent_cache_type(params, GGML_TYPE_F32);
+
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
 
     try {
         if (!common_params_parse_ex(argc, argv, ctx_arg)) {
             ctx_arg.params = params_org;
+            common_params_set_recurrent_cache_type(params, GGML_TYPE_F32);
             return false;
         }
         if (ctx_arg.params.usage) {
@@ -1308,6 +1323,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
+        common_params_set_recurrent_cache_type(params, GGML_TYPE_F32);
         return false;
     } catch (std::exception & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2449,6 +2465,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--recurrent-cache-type"}, "TYPE",
+        string_format(
+            "recurrent SSM state cache data type (Qwen3-Next/3.5/3.6/3.8 only)\n"
+            "allowed values: f32, f16\n"
+            "(default: %s)",
+            ggml_type_name(common_params_get_recurrent_cache_type(params))
+        ),
+        [](common_params & params, const std::string & value) {
+            common_params_set_recurrent_cache_type(params, recurrent_cache_type_from_str(value));
+        }
+    ).set_env("LLAMA_ARG_RECURRENT_CACHE_TYPE"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

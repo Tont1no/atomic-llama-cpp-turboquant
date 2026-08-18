@@ -951,6 +951,8 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        common_params_set_recurrent_cache_type(
+                params_base, common_params_get_recurrent_cache_type(params));
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;

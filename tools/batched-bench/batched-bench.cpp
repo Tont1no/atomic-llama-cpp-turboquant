@@ -57,7 +57,8 @@ int llama_batched_bench(int argc, char ** argv) {
     // ensure enough sequences are available
     ctx_params.n_seq_max = n_pl.empty() ? 1 : *std::max_element(n_pl.begin(), n_pl.end());
 
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model_with_recurrent_cache_type(
+            model, ctx_params, common_params_get_recurrent_cache_type(params));
 
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);

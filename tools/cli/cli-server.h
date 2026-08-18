@@ -40,11 +40,13 @@ struct cli_server {
 
         is_alive.store(true, std::memory_order_release);
 
+        const ggml_type type_s = common_params_get_recurrent_cache_type(params);
         common_params server_params = params; // copy
         server_params.port = port;
 
-        th = std::thread([this, server_params]() mutable {
+        th = std::thread([this, server_params, type_s]() mutable {
             // argc / argv are only used in router mode, we can skip them for now
+            common_params_set_recurrent_cache_type(server_params, type_s);
             int res = llama_server(server_params, 0, nullptr);
             if (res != 0) {
                 fprintf(stderr, "llama_server exited with code %d\n", res);

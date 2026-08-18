@@ -141,7 +141,8 @@ int main(int argc, char ** argv) {
     ctx_params.type_k               = params.cache_type_k;
     ctx_params.type_v               = params.cache_type_v;
 
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model_with_recurrent_cache_type(
+            model, ctx_params, common_params_get_recurrent_cache_type(params));
     if (!ctx) {
         LOG_ERR("error: failed to create context\n");
         llama_model_free(model);

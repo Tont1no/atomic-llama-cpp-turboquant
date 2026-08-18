@@ -84,7 +84,8 @@ int main(int argc, char ** argv) {
 
     GGML_ASSERT(ctx_params.n_batch % n_grp == 0 && "n_batch must be divisible by n_grp");
 
-    llama_context * ctx = llama_init_from_model(model, ctx_params);
+    llama_context * ctx = llama_init_from_model_with_recurrent_cache_type(
+            model, ctx_params, common_params_get_recurrent_cache_type(params));
     if (ctx == NULL) {
         LOG_ERR("%s: failed to create the llama_context\n" , __func__);
         return 1;
