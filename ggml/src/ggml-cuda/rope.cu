@@ -774,6 +774,7 @@ static __global__ void rms_norm_mul_neox_rope_quant_set_rows_f32(
         const int32_t * pos,
         const float freq_scale, const float ext_factor, const float attn_factor,
         const rope_corr_dims corr_dims, const float theta_scale,
+        const float fwht_scale,
         const float * freq_factors,
         const int64_t * row_indices, const int64_t set_rows_stride_blocks) {
     static_assert(128 % qk == 0, "DFlash quantized K rows must contain whole quant blocks");
@@ -833,7 +834,6 @@ static __global__ void rms_norm_mul_neox_rope_quant_set_rows_f32(
         if (tid < 32) {
             constexpr int el_w = 4;
             float reg[el_w];
-            const float fwht_scale = 1.0f/sqrtf(128.0f);
 #pragma unroll
             for (int i = 0; i < el_w; ++i) {
                 reg[i] = rotated[i*32 + tid] * fwht_scale;
@@ -905,6 +905,10 @@ static void rms_norm_mul_neox_rope_quant_set_rows_cuda(
     };
 
     const float theta_scale = powf(freq_base, -2.0f/ncols);
+    // Keep this host-side expression identical to ggml_cuda_op_fwht().  The
+    // quantized cache path is sensitive to even a one-ULP scale difference at
+    // a Q4/Q8 rounding boundary.
+    const float fwht_scale = 1 / sqrtf(ncols);
     const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
     const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
@@ -916,14 +920,14 @@ static void rms_norm_mul_neox_rope_quant_set_rows_cuda(
                 x, dst, ncols, s01, s02, s03, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride_blocks);
+                fwht_scale, freq_factors, row_indices, set_rows_stride_blocks);
     } else {
         ggml_cuda_kernel_launch((rms_norm_mul_neox_rope_quant_set_rows_f32<
                     256, true, apply_fwht, block_t, qk, quantize_func>), launch_params,
                 x, dst, ncols, s01, s02, s03, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride_blocks);
+                fwht_scale, freq_factors, row_indices, set_rows_stride_blocks);
     }
 }
 

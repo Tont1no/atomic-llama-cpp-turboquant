@@ -2587,6 +2587,7 @@ struct test_rms_norm_mul_rope : public test_case {
     const bool set_rows;
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
     const bool use_fwht;
+    const int64_t cache_rows; // larger than token count to exercise sparse/permuted cache placement
     int mode;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2597,14 +2598,14 @@ struct test_rms_norm_mul_rope : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR8(ne, cache_type, eps, multi_add, set_rows, broadcast, use_fwht, mode);
+        return VARS_TO_STR9(ne, cache_type, eps, multi_add, set_rows, broadcast, use_fwht, cache_rows, mode);
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
                            bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
-                           ggml_type cache_type = GGML_TYPE_F16, bool use_fwht = false)
+                           ggml_type cache_type = GGML_TYPE_F16, bool use_fwht = false, int64_t cache_rows = 0)
         : ne(ne), cache_type(cache_type), eps(eps), multi_add(multi_add), set_rows(set_rows),
-          broadcast(broadcast), use_fwht(use_fwht), mode(mode) {}
+          broadcast(broadcast), use_fwht(use_fwht), cache_rows(cache_rows), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
@@ -2638,7 +2639,8 @@ struct test_rms_norm_mul_rope : public test_case {
         if (set_rows) {
             ggml_tensor * view = ggml_view_2d(ctx, rope, ne[0] * ne[1], ne[2], rope->nb[2], 0);
 
-            ggml_tensor * dst = ggml_new_tensor_4d(ctx, cache_type, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
+            const int64_t n_cache_rows = cache_rows > 0 ? cache_rows : ne[2] * ne[3];
+            ggml_tensor * dst = ggml_new_tensor_4d(ctx, cache_type, ne[0] * ne[1], n_cache_rows, 1, 1);
             ggml_set_name(dst, "dst");
 
             ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, ne[2], 1, 1);
@@ -2655,7 +2657,17 @@ struct test_rms_norm_mul_rope : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+            if (strcmp(t->name, "row_idxs") == 0 && cache_rows > 0) {
+                GGML_ASSERT(t->type == GGML_TYPE_I64 && cache_rows >= t->ne[0]);
+                std::vector<int64_t> rows(t->ne[0]);
+                // A deterministic permutation with gaps and both ends of the
+                // cache range, representative of unified multi-sequence/iSWA
+                // global row IDs rather than the old dense [0,n_tokens) case.
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    rows[i] = i == 0 ? cache_rows - 1 : i == 1 ? 0 : (31 + 17*(i - 2)) % cache_rows;
+                }
+                ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int64_t));
+            } else if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) {
                     continue;
                 }
@@ -9058,12 +9070,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // execute the unfused graph and serve as the numerical reference.
     for (ggml_type cache_type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_rms_norm_mul_rope(
-                {128, 8, 7, 1}, 1e-6f, false, true, true, GGML_ROPE_TYPE_NEOX, cache_type));
+                {128, 8, 7, 1}, 1e-6f, false, true, true, GGML_ROPE_TYPE_NEOX, cache_type, false, 37));
     }
     for (ggml_type cache_type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_rms_norm_mul_rope(
                 {128, 8, 7, 1}, 1e-6f, false, true, true,
-                GGML_ROPE_TYPE_NEOX, cache_type, true));
+                GGML_ROPE_TYPE_NEOX, cache_type, true, 37));
     }
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {

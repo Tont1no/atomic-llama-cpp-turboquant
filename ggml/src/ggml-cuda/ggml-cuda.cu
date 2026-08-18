@@ -2854,7 +2854,9 @@ static bool ggml_cuda_should_fuse_dflash_k_fwht_set_rows(
 
     if ((set_rows->type != GGML_TYPE_Q4_0 && set_rows->type != GGML_TYPE_Q8_0) ||
         set_rows->src[1] == nullptr || set_rows->src[1]->type != GGML_TYPE_I64 ||
-        set_rows->src[1]->ne[0] != n_tokens ||
+        set_rows->src[1]->ne[0] != n_tokens || set_rows->src[1]->ne[1] != 1 ||
+        set_rows->src[1]->ne[2] != 1 || set_rows->src[1]->ne[3] != 1 ||
+        set_rows->src[1]->nb[0] != sizeof(int64_t) || !ggml_is_contiguous(set_rows->src[1]) ||
         set_rows->src[2] == nullptr || set_rows->src[2]->ne[0] != 128*n_heads ||
         set_rows->src[2]->ne[2] != 1 || set_rows->src[2]->ne[3] != 1 ||
         !ggml_is_contiguous_rows(set_rows->src[2])) {
@@ -3423,6 +3425,107 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     }
 
     return false;
+}
+
+struct ggml_cuda_dflash_k_snapshot {
+    std::vector<int64_t> rows;
+    std::vector<uint8_t> data;
+    uint64_t hash = 14695981039346656037ULL;
+};
+
+static ggml_cuda_dflash_k_snapshot ggml_cuda_dflash_k_snapshot_rows(
+        ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * set_rows) {
+    GGML_ASSERT(set_rows->op == GGML_OP_SET_ROWS);
+    GGML_ASSERT(set_rows->src[1] != nullptr && set_rows->src[1]->type == GGML_TYPE_I64);
+
+    ggml_cuda_dflash_k_snapshot result;
+    result.rows.resize(ggml_nelements(set_rows->src[1]));
+
+    cudaStream_t stream = cuda_ctx->stream();
+    CUDA_CHECK(cudaMemcpyAsync(result.rows.data(), set_rows->src[1]->data,
+            result.rows.size()*sizeof(int64_t), cudaMemcpyDefault, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<int64_t> sorted_rows = result.rows;
+    std::sort(sorted_rows.begin(), sorted_rows.end());
+    GGML_ASSERT(std::adjacent_find(sorted_rows.begin(), sorted_rows.end()) == sorted_rows.end() &&
+            "DFlash-K raw validation requires unique cache row indices");
+
+    const size_t row_bytes = set_rows->nb[1];
+    result.data.resize(result.rows.size()*row_bytes);
+    for (size_t i = 0; i < result.rows.size(); ++i) {
+        GGML_ASSERT(result.rows[i] >= 0 && result.rows[i] < set_rows->ne[1]);
+        const char * src = static_cast<const char *>(set_rows->data) + result.rows[i]*row_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(result.data.data() + i*row_bytes, src,
+                row_bytes, cudaMemcpyDefault, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (uint8_t value : result.data) {
+        result.hash ^= value;
+        result.hash *= 1099511628211ULL;
+    }
+    return result;
+}
+
+// Debug-only, fail-fast byte comparison against the exact fallback selected
+// when GGML_CUDA_DFLASH_K_FUSION=0: fused RMS/MUL/ROPE, standalone FWHT, then
+// ordinary quantized SET_ROWS.  It intentionally synchronizes and must never
+// be enabled for performance measurements.
+static void ggml_cuda_validate_dflash_k_fwht_fusion(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_tensor * rms_norm,
+        ggml_tensor * mul,
+        ggml_tensor * rope,
+        ggml_tensor * reshape_pre,
+        ggml_tensor * fwht,
+        ggml_tensor * set_rows) {
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        GGML_ABORT("GGML_CUDA_DFLASH_K_VALIDATE requires GGML_CUDA_DISABLE_GRAPHS=1");
+    }
+
+    ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, nullptr);
+    GGML_ASSERT(ggml_cuda_op_fwht(*cuda_ctx, reshape_pre, fwht));
+    ggml_cuda_op_set_rows(*cuda_ctx, set_rows);
+    const ggml_cuda_dflash_k_snapshot legacy = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+
+    // Poison every target byte with the inverse of its legacy result before
+    // launching the fused writer.  Without this, an incomplete fused write
+    // could inherit bytes from SET_ROWS and falsely pass the comparison.
+    std::vector<uint8_t> poison = legacy.data;
+    for (uint8_t & value : poison) {
+        value = ~value;
+    }
+    for (size_t i = 0; i < legacy.rows.size(); ++i) {
+        char * dst = static_cast<char *>(set_rows->data) + legacy.rows[i]*set_rows->nb[1];
+        CUDA_CHECK(cudaMemcpyAsync(dst, poison.data() + i*set_rows->nb[1],
+                set_rows->nb[1], cudaMemcpyDefault, cuda_ctx->stream()));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, set_rows, true);
+    const ggml_cuda_dflash_k_snapshot fused = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+
+    GGML_ASSERT(legacy.rows == fused.rows && legacy.data.size() == fused.data.size());
+    const auto mismatch = std::mismatch(legacy.data.begin(), legacy.data.end(), fused.data.begin());
+    if (mismatch.first != legacy.data.end()) {
+        const size_t byte_index = (size_t) std::distance(legacy.data.begin(), mismatch.first);
+        const size_t row_bytes  = set_rows->nb[1];
+        const size_t token      = byte_index / row_bytes;
+        const size_t row_byte   = byte_index % row_bytes;
+        GGML_LOG_ERROR("ggml_cuda: DFlash-K raw cache validation FAILED: cache = %s, tokens = %zu, "
+                       "row = %" PRId64 ", row_byte = %zu, legacy = 0x%02x, fused = 0x%02x, "
+                       "legacy_hash = %016" PRIx64 ", fused_hash = %016" PRIx64 "\n",
+                ggml_type_name(set_rows->type), legacy.rows.size(), legacy.rows[token], row_byte,
+                (unsigned int) *mismatch.first, (unsigned int) *(mismatch.second), legacy.hash, fused.hash);
+        GGML_ABORT("DFlash-K fused cache bytes differ from legacy SET_ROWS");
+    }
+
+    GGML_LOG_INFO("ggml_cuda: DFlash-K raw cache validation PASS: cache = %s, tokens = %zu, "
+                  "row_bytes = %zu, hash = %016" PRIx64 "\n",
+            ggml_type_name(set_rows->type), legacy.rows.size(), set_rows->nb[1], legacy.hash);
 }
 
 // try and fuse nodes and return the number of nodes to skip
@@ -4115,6 +4218,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const char * env = getenv("GGML_CUDA_DFLASH_K_FUSION");
         return env == nullptr || atoi(env) != 0;
     }();
+    static const bool dflash_k_validate = [] {
+        const char * env = getenv("GGML_CUDA_DFLASH_K_VALIDATE");
+        return env != nullptr && atoi(env) != 0;
+    }();
 
     if (dflash_k_fusion_enabled && ggml_cuda_can_fuse(cgraph, i,
             { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE,
@@ -4122,8 +4229,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // The FWHT + quantized cache specialization is intentionally SM120
         // only.  Other devices execute the original eight-node graph.
         if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL) {
-            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
-                    cgraph->nodes[i + 2], cgraph->nodes[i + 7], true);
+            if (dflash_k_validate) {
+                ggml_cuda_validate_dflash_k_fwht_fusion(cuda_ctx, node, cgraph->nodes[i + 1],
+                        cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4],
+                        cgraph->nodes[i + 7]);
+            } else {
+                ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
+                        cgraph->nodes[i + 2], cgraph->nodes[i + 7], true);
+            }
             ggml_cuda_record_dflash_k_dispatch(
                     cuda_ctx, cgraph->nodes[i + 7], /*fused=*/ true, /*apply_fwht=*/ true);
             return 7;

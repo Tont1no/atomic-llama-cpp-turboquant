@@ -44,6 +44,36 @@ backend-op tests do not carry the tag and therefore cannot produce a false
 end-to-end success marker.  CUDA graph capture counts as one host dispatch;
 later replays remain fused but do not increment the host-side total.
 
+## Raw-cache byte validation
+
+`GGML_CUDA_DFLASH_K_VALIDATE=1` enables a diagnostic, fail-fast self-check for
+the eight-node Q4_0/Q8_0 path.  For each matching dispatch it executes the
+exact normal fallback sequence (fused RMS/MUL/ROPE, standalone FWHT, ordinary
+`SET_ROWS`), copies only the indexed cache rows to the host, poisons every byte
+of those rows with the inverse reference value, then executes the direct fused
+writer and compares the raw quantized bytes.  A mismatch logs the global cache
+row, byte offset, values, and hashes before aborting.  The poison prevents an
+incomplete fused write from inheriting reference bytes and falsely passing.
+
+The focused cases use seven deterministic, permuted global row IDs in a
+37-row cache, so they cover sparse/wrapped multi-sequence-style placement
+rather than only dense rows 0 through 6.  Validation synchronizes the CUDA
+stream and is incompatible with graph capture, so it must never be used for a
+performance result:
+
+```powershell
+$env:GGML_CUDA_DFLASH_K_VALIDATE = '1'
+$env:GGML_CUDA_DISABLE_GRAPHS = '1'
+& .\build-fused-sm120\bin\Release\test-backend-ops.exe `
+  -b CUDA -o RMS_NORM_MUL_ROPE `
+  -p 'cache_type=(q4_0|q8_0).*use_fwht=1,cache_rows=37'
+Remove-Item Env:GGML_CUDA_DFLASH_K_VALIDATE
+Remove-Item Env:GGML_CUDA_DISABLE_GRAPHS
+```
+
+A `DFlash-K raw cache validation PASS` line is the byte-identity signal.  The
+ordinary numerical backend result alone is not sufficient for this gate.
+
 DSpark is intentionally not enabled here.  Its DSV4 graph currently expresses
 full-head normal RoPE as a zero-length NOPE split plus RoPE and concat.  A safe
 follow-up should first remove that redundant split/concat only when
