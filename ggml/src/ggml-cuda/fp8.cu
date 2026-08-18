@@ -221,8 +221,7 @@ bool ggml_cuda_mul_mat_f8_e4m3(
     GGML_ASSERT(weight_scale->type == GGML_TYPE_F32 && input_scale->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_scalar(weight_scale) && ggml_is_scalar(input_scale));
     GGML_ASSERT(ggml_is_contiguous(weight) && ggml_is_contiguous(activation) && ggml_is_contiguous(dst));
-    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1 &&
-                activation->ne[2] == 1 && activation->ne[3] == 1);
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (cc < GGML_CUDA_CC_BLACKWELL || cc >= 1300 ||
@@ -232,8 +231,8 @@ bool ggml_cuda_mul_mat_f8_e4m3(
 
     const int64_t k = weight->ne[0];
     const int64_t n = weight->ne[1];
-    const int64_t m = activation->ne[1];
-    GGML_ASSERT(activation->ne[0] == k && dst->ne[0] == n && dst->ne[1] == m);
+    const int64_t m = ggml_nrows(activation);
+    GGML_ASSERT(activation->ne[0] == k && dst->ne[0] == n && ggml_nrows(dst) == m);
     if (k % 16 != 0 || n % 16 != 0 || m <= 0) {
         GGML_ABORT("Unsupported F8_E4M3 shape K=%lld N=%lld M=%lld",
                    (long long) k, (long long) n, (long long) m);

@@ -5374,7 +5374,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                             ggml_is_scalar(op->src[2]) && ggml_is_scalar(op->src[3]) &&
                             ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
-                            a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+                            a->ne[2] == 1 && a->ne[3] == 1 && a->ne[0] == b->ne[0] &&
+                            op->ne[0] == a->ne[1] && ggml_nrows(b) > 0 &&
+                            ggml_nrows(b) == ggml_nrows(op) &&
                             a->ne[0] % 16 == 0 && a->ne[1] % 16 == 0 &&
                             cc >= GGML_CUDA_CC_BLACKWELL && cc < 1300 &&
                             ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL;

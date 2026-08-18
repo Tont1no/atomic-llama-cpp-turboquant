@@ -456,10 +456,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             if (src0->type == GGML_TYPE_F8_E4M3) {
                 const char * fp8_reference = std::getenv("GGML_FP8_E4M3_CPU_REFERENCE");
                 return fp8_reference && std::strcmp(fp8_reference, "1") == 0 &&
-                    src1->type == GGML_TYPE_F32 && op->src[2] && op->src[3] &&
+                    src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[2] && op->src[3] &&
                     op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                     ggml_is_scalar(op->src[2]) && ggml_is_scalar(op->src[3]) &&
-                    src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                    src0->ne[2] == 1 && src0->ne[3] == 1 && src0->ne[0] == src1->ne[0] &&
+                    op->ne[0] == src0->ne[1] && ggml_nrows(src1) > 0 &&
+                    ggml_nrows(src1) == ggml_nrows(op);
             }
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {
