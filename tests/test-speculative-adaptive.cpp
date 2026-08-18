@@ -36,6 +36,22 @@ static void test_per_sequence_limit() {
     assert(common_speculative_draft_n_max_for_seq(7, 12) == 7);
 }
 
+static void test_dflash_family_type_normalization() {
+    assert(common_speculative_is_only_dflash_family({ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH }));
+    assert(common_speculative_is_only_dflash_family({ COMMON_SPECULATIVE_TYPE_NONE, COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH }));
+    assert(common_speculative_is_only_dflash_family({ COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, COMMON_SPECULATIVE_TYPE_NONE }));
+
+    assert(!common_speculative_is_only_dflash_family({ COMMON_SPECULATIVE_TYPE_NONE }));
+    assert(!common_speculative_is_only_dflash_family({
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+            COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+    }));
+    assert(!common_speculative_is_only_dflash_family({
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+            COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
+    }));
+}
+
 static void test_acceptance_ema() {
     common_params_speculative_draft params;
     params.n_max = 7;
@@ -87,6 +103,7 @@ static void test_fail_closed() {
 
 int main() {
     test_per_sequence_limit();
+    test_dflash_family_type_normalization();
     test_load_caps();
     test_acceptance_ema();
     test_fail_closed();

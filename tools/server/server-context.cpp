@@ -1277,9 +1277,7 @@ private:
         }
 
         if (params_base.speculative.draft.adaptive) {
-            const bool pure_dflash_family = params_base.speculative.types.size() == 1 &&
-                    (params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-                     params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+            const bool pure_dflash_family = common_speculative_is_only_dflash_family(params_base.speculative.types);
             if (!pure_dflash_family) {
                 SRV_WRN("%s\n", "adaptive draft length requires exactly one speculative type: draft-dflash or draft-dspark; disabling adaptation");
             } else {
@@ -2971,9 +2969,7 @@ private:
         });
 
         const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
-                params_base.speculative.types.size() == 1 &&
-                (params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-                 params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+                common_speculative_is_only_dflash_family(params_base.speculative.types);
         const int32_t active_slots = (int32_t) generating.size();
 
         for (server_slot * slot : generating) {
@@ -3806,11 +3802,8 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
-        const auto & types = params_base.speculative.types;
         const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
-                types.size() == 1 &&
-                (types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-                 types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+                common_speculative_is_only_dflash_family(params_base.speculative.types);
 
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {

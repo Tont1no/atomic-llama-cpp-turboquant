@@ -230,6 +230,44 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    {
+        common_params single_spec_params;
+        argv = {"binary_name", "--spec-type", "draft-dflash"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), single_spec_params, LLAMA_EXAMPLE_SERVER));
+        assert((single_spec_params.speculative.types ==
+                std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH }));
+
+        common_params mixed_spec_params;
+        argv = {"binary_name", "--spec-type", "draft-dflash,ngram-simple"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), mixed_spec_params, LLAMA_EXAMPLE_SERVER));
+        assert((mixed_spec_params.speculative.types == std::vector<common_speculative_type>{
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+                COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+        }));
+
+        common_params repeated_spec_params;
+        argv = {"binary_name", "--spec-type", "draft-dflash", "--spec-type", "draft-dflash", "--spec-type", "ngram-simple"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), repeated_spec_params, LLAMA_EXAMPLE_SERVER));
+        assert((repeated_spec_params.speculative.types == std::vector<common_speculative_type>{
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+                COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+        }));
+
+        common_params none_spec_params;
+        argv = {"binary_name", "--spec-type", "draft-dflash", "--spec-type", "none"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), none_spec_params, LLAMA_EXAMPLE_SERVER));
+        assert((none_spec_params.speculative.types ==
+                std::vector<common_speculative_type>{ COMMON_SPECULATIVE_TYPE_NONE }));
+
+        common_params invalid_none_mixed_params;
+        argv = {"binary_name", "--spec-type", "none,draft-dflash"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_none_mixed_params, LLAMA_EXAMPLE_SERVER));
+
+        common_params invalid_none_unknown_params;
+        argv = {"binary_name", "--spec-type", "none,garbage"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_none_unknown_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
