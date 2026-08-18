@@ -2670,7 +2670,10 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
+    const bool legacy_dst = set_rows->type == GGML_TYPE_F32 || set_rows->type == GGML_TYPE_F16;
+    const bool dflash_dst = set_rows->type == GGML_TYPE_BF16 ||
+                            set_rows->type == GGML_TYPE_Q4_0 || set_rows->type == GGML_TYPE_Q8_0;
+    if (!legacy_dst && !dflash_dst) {
         return false;
     }
 
@@ -2687,6 +2690,18 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     const int mode = ((const int32_t *) rope->op_params)[2];
     if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
         return false;
+    }
+
+    // The new direct-write path is intentionally bounded to the text-only
+    // Qwen DFlash K shape.  Other RoPE modes, partial rotation, and batched
+    // samples keep the established materialize + SET_ROWS fallback.
+    if (dflash_dst) {
+        const int n_dims = ((const int32_t *) rope->op_params)[1];
+        if (mode != GGML_ROPE_TYPE_NEOX || rope->src[0]->ne[0] != 128 ||
+            n_dims != 128 || rope->src[0]->ne[3] != 1 ||
+            set_rows->src[2]->ne[2] != 1 || set_rows->src[2]->ne[3] != 1) {
+            return false;
+        }
     }
 
     return true;
@@ -2736,6 +2751,73 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     }
 
     return true;
+}
+
+static bool ggml_cuda_should_fuse_dflash_k_fwht_set_rows(
+        const ggml_tensor * rms_norm,
+        const ggml_tensor * mul,
+        const ggml_tensor * rope,
+        const ggml_tensor * reshape_pre,
+        const ggml_tensor * fwht,
+        const ggml_tensor * reshape_post,
+        const ggml_tensor * view,
+        const ggml_tensor * set_rows) {
+    if (!ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope)) {
+        return false;
+    }
+
+    if (reshape_pre->op != GGML_OP_RESHAPE || fwht->op != GGML_OP_MUL_MAT ||
+        reshape_post->op != GGML_OP_RESHAPE || view->op != GGML_OP_VIEW ||
+        set_rows->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+
+    const int n_dims = ((const int32_t *) rope->op_params)[1];
+    const int mode   = ((const int32_t *) rope->op_params)[2];
+    if (mode != GGML_ROPE_TYPE_NEOX || n_dims != 128 || rope->ne[0] != 128 ||
+        rope->ne[3] != 1 || rope->src[2] != nullptr) {
+        return false;
+    }
+
+    const int64_t n_heads  = rope->ne[1];
+    const int64_t n_tokens = rope->ne[2];
+    if (n_heads <= 0 || n_tokens <= 0 ||
+        reshape_pre->type != GGML_TYPE_F32 || reshape_pre->ne[0] != 128 ||
+        reshape_pre->ne[1] != n_heads*n_tokens || !ggml_is_contiguous(reshape_pre)) {
+        return false;
+    }
+
+    const ggml_tensor * rot = fwht->src[0];
+    if (rot == nullptr || rot->type != GGML_TYPE_F32 || rot->ne[0] != 128 || rot->ne[1] != 128 ||
+        ggml_get_op_params_i32(fwht, 1) != GGML_HINT_SRC0_IS_HADAMARD ||
+        fwht->type != GGML_TYPE_F32 || !ggml_is_contiguous(fwht)) {
+        return false;
+    }
+
+    if (reshape_post->type != GGML_TYPE_F32 || reshape_post->ne[0] != 128 ||
+        reshape_post->ne[1] != n_heads || reshape_post->ne[2] != n_tokens ||
+        reshape_post->ne[3] != 1 || !ggml_is_contiguous(reshape_post)) {
+        return false;
+    }
+
+    if (view->type != GGML_TYPE_F32 || view->view_offs != 0 ||
+        view->ne[0] != 128*n_heads || view->ne[1] != n_tokens ||
+        view->nb[0] != sizeof(float) || view->nb[1] != reshape_post->nb[2] ||
+        !ggml_is_contiguous_rows(view)) {
+        return false;
+    }
+
+    if ((set_rows->type != GGML_TYPE_Q4_0 && set_rows->type != GGML_TYPE_Q8_0) ||
+        set_rows->src[1] == nullptr || set_rows->src[1]->type != GGML_TYPE_I64 ||
+        set_rows->src[1]->ne[0] != n_tokens ||
+        set_rows->src[2] == nullptr || set_rows->src[2]->ne[0] != 128*n_heads ||
+        set_rows->src[2]->ne[2] != 1 || set_rows->src[2]->ne[3] != 1 ||
+        !ggml_is_contiguous_rows(set_rows->src[2])) {
+        return false;
+    }
+
+    const int qk = set_rows->type == GGML_TYPE_Q4_0 ? QK4_0 : QK8_0;
+    return 128 % qk == 0 && set_rows->src[2]->ne[0] % qk == 0;
 }
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
@@ -3069,6 +3151,32 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_set_rows_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+    std::initializer_list<enum ggml_op> dflash_k_fwht_set_rows_ops = {
+        GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE,
+        GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS
+    };
+
+    if (is_equal(dflash_k_fwht_set_rows_ops, ops) &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 7 })) {
+        const ggml_tensor * rms_norm     = cgraph->nodes[node_idx];
+        const ggml_tensor * mul          = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * rope         = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * reshape_pre  = cgraph->nodes[node_idx + 3];
+        const ggml_tensor * fwht         = cgraph->nodes[node_idx + 4];
+        const ggml_tensor * reshape_post = cgraph->nodes[node_idx + 5];
+        const ggml_tensor * view         = cgraph->nodes[node_idx + 6];
+        const ggml_tensor * set_rows     = cgraph->nodes[node_idx + 7];
+
+        if (ggml_check_edges(cgraph, node_idx,
+                    {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 1, 3},
+                     {5, 0, 4}, {6, 0, 5}, {7, 0, 6}}) &&
+            ggml_cuda_should_fuse_dflash_k_fwht_set_rows(
+                    rms_norm, mul, rope, reshape_pre, fwht, reshape_post, view, set_rows)) {
+            int out_nodes[] = { node_idx + 7 };
+            return ggml_cuda_check_fusion_memory_ranges(
+                    cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+        }
+    }
 
     if (is_equal(rms_norm_mul_rope_set_rows_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
         const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
@@ -3958,9 +4066,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    static const bool dflash_k_fusion_enabled = [] {
+        const char * env = getenv("GGML_CUDA_DFLASH_K_FUSION");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    if (dflash_k_fusion_enabled && ggml_cuda_can_fuse(cgraph, i,
+            { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RESHAPE,
+              GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+        // The FWHT + quantized cache specialization is intentionally SM120
+        // only.  Other devices execute the original eight-node graph.
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
+                    cgraph->nodes[i + 2], cgraph->nodes[i + 7], true);
+            return 7;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
-        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
-        return 4;
+        const ggml_tensor * set_rows = cgraph->nodes[i + 4];
+        const bool extended_dst = set_rows->type == GGML_TYPE_BF16 ||
+                                  set_rows->type == GGML_TYPE_Q4_0 || set_rows->type == GGML_TYPE_Q8_0;
+        // Keep the new quantized/BF16 side-effect path SM120-only while it is
+        // being qualified.  Returning to the normal dispatcher preserves the
+        // established graph on every other device.
+        if (!extended_dst || (dflash_k_fusion_enabled &&
+                              ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL)) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
+                    cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+            return 4;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
