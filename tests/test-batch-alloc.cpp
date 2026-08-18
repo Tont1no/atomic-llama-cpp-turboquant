@@ -409,6 +409,138 @@ static void test_split(testing & t) {
         t.assert_equal(1, ub.seq_idx[1]);
     });
 
+    t.test("split_equal_complete_ragged_source_groups", [&](testing & t) {
+        batch_builder bb;
+        const int widths[] = { 7, 4, 4, 2 };
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            for (int i = 0; i < widths[s]; ++i) {
+                bb.add(i, {s}, i == widths[s] - 1);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_equal_complete(32, true, true);
+        t.assert_equal(7u, ub.n_tokens);
+        t.assert_equal(1u, ub.n_seqs);
+        t.assert_equal(7u, ub.n_seq_tokens);
+        t.assert_equal(0, ub.seq_id[0][0]);
+
+        ub = ba.split_equal_complete(32, true, true);
+        t.assert_equal(8u, ub.n_tokens);
+        t.assert_equal(2u, ub.n_seqs);
+        t.assert_equal(4u, ub.n_seq_tokens);
+        for (uint32_t i = 0; i < 4; ++i) {
+            t.assert_equal(1, ub.seq_id[i][0]);
+            t.assert_equal(2, ub.seq_id[4 + i][0]);
+        }
+
+        ub = ba.split_equal_complete(32, true, true);
+        t.assert_equal(2u, ub.n_tokens);
+        t.assert_equal(1u, ub.n_seqs);
+        t.assert_equal(3, ub.seq_id[0][0]);
+        t.assert_equal(17u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal_complete(32, true, true).n_tokens);
+    });
+
+    t.test("split_equal_complete_never_splits_one_run", [&](testing & t) {
+        batch_builder bb;
+        for (int i = 0; i < 7; ++i) {
+            bb.add(i, {0}, i == 6);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 1, false));
+        t.assert_equal(0u, ba.split_equal_complete(4, true, true).n_tokens);
+        t.assert_equal(0u, ba.get_n_used());
+    });
+
+    t.test("split_equal_complete_dspark_n4_ragged", [&](testing & t) {
+        batch_builder bb;
+        const int widths[] = { 7, 4, 2, 1 };
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            for (int i = 0; i < widths[s]; ++i) {
+                bb.add(i, {s}, i == widths[s] - 1);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            const llama_ubatch ub = ba.split_equal_complete(32, true, true);
+            t.assert_equal((uint32_t) widths[s], ub.n_tokens);
+            t.assert_equal(1u, ub.n_seqs);
+            t.assert_equal((uint32_t) widths[s], ub.n_seq_tokens);
+            t.assert_equal(s, ub.seq_id[0][0]);
+            t.assert_equal(0, ub.pos[0]); // every emitted graph begins at the real anchor
+        }
+        t.assert_equal(14u, ba.get_n_used());
+    });
+
+    t.test("split_simple_dspark_n4_packed_throughput_path", [&](testing & t) {
+        batch_builder bb;
+        const int widths[] = { 7, 4, 2, 1 };
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            for (int i = 0; i < widths[s]; ++i) {
+                bb.add(i, {s}, i == widths[s] - 1);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+        const llama_ubatch ub = ba.split_simple(32);
+        t.assert_equal(14u, ub.n_tokens);
+        t.assert_equal(14u, ba.get_n_used());
+
+        uint32_t row = 0;
+        for (llama_seq_id s = 0; s < 4; ++s) {
+            for (int i = 0; i < widths[s]; ++i, ++row) {
+                t.assert_equal(s, ub.seq_id[row][0]);
+                t.assert_equal(i, ub.pos[row]);
+            }
+        }
+    });
+
+    t.test("split_equal_complete_dspark_n8_sparse_active", [&](testing & t) {
+        batch_builder bb;
+        const int widths[] = { 7, 0, 4, 1, 2, 7, 0, 4 };
+        const llama_seq_id active[] = { 0, 2, 3, 4, 5, 7 };
+        for (llama_seq_id s = 0; s < 8; ++s) {
+            for (int i = 0; i < widths[s]; ++i) {
+                bb.add(i, {s}, i == widths[s] - 1);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 8, false));
+        for (llama_seq_id s : active) {
+            const llama_ubatch ub = ba.split_equal_complete(32, true, true);
+            t.assert_equal((uint32_t) widths[s], ub.n_tokens);
+            t.assert_equal(s, ub.seq_id[0][0]);
+            t.assert_equal(0, ub.pos[0]);
+        }
+        t.assert_equal(25u, ba.get_n_used());
+    });
+
+    t.test("split_equal_complete_single_run_retry", [&](testing & t) {
+        batch_builder bb;
+        for (llama_seq_id s = 0; s < 2; ++s) {
+            for (int i = 0; i < 4; ++i) {
+                bb.add(i, {s}, i == 3);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 2, false));
+        llama_ubatch ub = ba.split_equal_complete(32, true, false);
+        t.assert_equal(4u, ub.n_tokens);
+        t.assert_equal(0, ub.seq_id[0][0]);
+        ub = ba.split_equal_complete(32, true, false);
+        t.assert_equal(4u, ub.n_tokens);
+        t.assert_equal(1, ub.seq_id[0][0]);
+    });
+
     t.test("split_seq_per_sequence", [&](testing & t) {
         batch_builder bb;
         for (llama_seq_id s = 0; s < 3; ++s) {

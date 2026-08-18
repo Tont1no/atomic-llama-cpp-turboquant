@@ -678,6 +678,91 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     return ubatch_add(idxs, n_seqs, true);
 }
 
+llama_ubatch llama_batch_allocr::split_equal_complete(
+        uint32_t n_ubatch,
+        bool sequential,
+        bool group_equal) {
+    uint32_t first = 0;
+    while (first < used.size() && used[first]) {
+        ++first;
+    }
+    if (first >= used.size()) {
+        return {};
+    }
+
+    std::vector<idx_vec_t> idxs_per_seq;
+    llama_seq_id last_seq_id = -1;
+    uint32_t expected_width = 0;
+    uint32_t next_row = first;
+    uint32_t total = 0;
+
+    while (next_row < used.size() && !used[next_row]) {
+        const auto & candidate_set = seq_set[next_row];
+        const auto map_it = seq_set_map.find(candidate_set);
+        if (map_it == seq_set_map.end()) {
+            break;
+        }
+
+        idx_vec_t candidate;
+        for (const int32_t idx : map_it->second) {
+            if (!used[idx]) {
+                candidate.push_back(idx);
+            }
+        }
+        if (candidate.empty() || candidate.front() != (int32_t) next_row) {
+            break;
+        }
+
+        // Packed DSpark source runs are contiguous. Refuse interleaved or
+        // partial sets rather than constructing a topology whose indptr no
+        // longer matches the logical batch.
+        bool contiguous = true;
+        for (size_t i = 0; i < candidate.size(); ++i) {
+            contiguous = contiguous && candidate[i] == (int32_t) next_row + (int32_t) i;
+        }
+        if (!contiguous) {
+            break;
+        }
+
+        const uint32_t width = (uint32_t) candidate.size();
+        if (idxs_per_seq.empty()) {
+            expected_width = width;
+        } else if (!group_equal || width != expected_width) {
+            break;
+        }
+
+        const llama_seq_id candidate_seq_id = batch.seq_id[next_row][0];
+        if (sequential && !idxs_per_seq.empty() && candidate_seq_id != last_seq_id + 1) {
+            break;
+        }
+        if (width == 0 || width > n_ubatch - total) {
+            break;
+        }
+
+        idxs_per_seq.push_back(std::move(candidate));
+        total += width;
+        last_seq_id = candidate_seq_id;
+        next_row += width;
+    }
+
+    if (idxs_per_seq.empty()) {
+        return {};
+    }
+
+    std::vector<int32_t> idxs;
+    idxs.reserve(total);
+    for (const auto & per_seq : idxs_per_seq) {
+        for (const int32_t idx : per_seq) {
+            GGML_ASSERT(!used[idx]);
+            used[idx] = true;
+            ++n_used;
+            idxs.push_back(idx);
+        }
+    }
+
+    return ubatch_add(idxs, (uint32_t) idxs_per_seq.size(), true);
+}
+
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
     // find the first unused token
     uint32_t cur_idx = 0;

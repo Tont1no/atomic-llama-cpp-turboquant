@@ -92,6 +92,7 @@ public:
 
 private:
     const bool unified;
+    const bool packed_dspark;
 
     std::unique_ptr<llama_kv_cache> kv_base;
     std::unique_ptr<llama_kv_cache> kv_swa;

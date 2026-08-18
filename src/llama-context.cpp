@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "llama-arch.h"
+#include "llama-dspark-packed.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -15,10 +16,12 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -33,6 +36,20 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static uint32_t llama_dspark_trained_gamma(const llama_model & model) {
+    if (model.arch != LLM_ARCH_DFLASH || model.dspark_markov_w1 == nullptr) {
+        return 0;
+    }
+
+    const auto it = model.gguf_kv.find("dflash.block_size");
+    if (it == model.gguf_kv.end()) {
+        return 0;
+    }
+
+    uint32_t result = 0;
+    return llama_dspark_parse_gamma(it->second, result) ? result : 0;
 }
 
 struct llm_fused_op_probe {
@@ -673,6 +690,37 @@ void llama_context::sched_reserve() {
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
         n_nodes_tg  = ggml_graph_n_nodes(gf);
+    }
+
+    // The generic PP reserve is rectangular and may have a per-sequence width
+    // larger than DSpark's trained gamma, so the Markov head intentionally
+    // skips it. Reserve valid worst-case DSpark shapes explicitly: one dense
+    // equal-width group and one near-dense alternating-width topology that
+    // exercises the additional group concat temporaries.
+    if (model.arch == LLM_ARCH_DFLASH && model.dspark_markov_w1) {
+        const uint32_t gamma = llama_dspark_trained_gamma(model);
+        if (gamma > 0 && gamma <= cparams.n_ubatch) {
+            const auto reserve_widths = llama_dspark_reserve_widths(
+                    gamma, cparams.n_ubatch, cparams.n_seq_max);
+
+            std::vector<size_t> dspark_sizes(backend_ptrs.size());
+            for (const auto & widths : reserve_widths) {
+                std::fill(dspark_sizes.begin(), dspark_sizes.end(), 0);
+                const uint32_t rows = std::accumulate(widths.begin(), widths.end(), 0u);
+                const uint32_t outputs = std::max(1u, std::min(rows, cparams.n_outputs_max));
+                auto * gf = graph_reserve_dspark(widths, outputs, mctx.get(),
+                        model.hparams.no_alloc,
+                        model.hparams.no_alloc ? dspark_sizes.data() : nullptr);
+                if (!gf) {
+                    throw std::runtime_error("failed to allocate DSpark reserve buffers");
+                }
+                if (model.hparams.no_alloc) {
+                    for (size_t i = 0; i < dspark_sizes.size(); ++i) {
+                        backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], dspark_sizes[i]);
+                    }
+                }
+            }
+        }
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
@@ -1835,8 +1883,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    const bool packed_dspark_token_batch = batch_inp.token && model.dspark_markov_w1;
+    if (packed_dspark_token_batch) {
+        const uint32_t gamma = llama_dspark_trained_gamma(model);
+        const auto packed = llama_dspark_packed_layout_from_batch(balloc->get_batch(), gamma);
+        if (!packed.valid) {
+            LLAMA_LOG_ERROR("%s: invalid packed DSpark batch: %s\n", __func__, packed.reason.c_str());
+            return -1;
+        }
+        if (balloc->get_n_tokens() > cparams.n_ubatch) {
+            // Bound the complete logical transaction to one configured row
+            // tier. iSWA may still execute several complete-run ubatches, but
+            // no individual Markov run may be split.
+            LLAMA_LOG_ERROR("%s: packed DSpark batch has %u rows, exceeding n_ubatch=%u\n",
+                    __func__, balloc->get_n_tokens(), cparams.n_ubatch);
+            return -1;
+        }
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    std::array<llama_pos, LLAMA_MAX_SEQ> packed_dspark_pos_min;
+    packed_dspark_pos_min.fill(std::numeric_limits<llama_pos>::max());
+    if (packed_dspark_token_batch) {
+        const llama_batch & logical = balloc->get_batch();
+        for (uint32_t i = 0; i < n_tokens_all; ++i) {
+            const llama_seq_id seq = logical.seq_id[i][0];
+            if (seq >= 0 && seq < LLAMA_MAX_SEQ) {
+                packed_dspark_pos_min[seq] = std::min(packed_dspark_pos_min[seq], logical.pos[i]);
+            }
+        }
+    }
+
+    const auto rollback_packed_dspark = [&]() {
+        for (int32_t seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+            if (packed_dspark_pos_min[seq] == std::numeric_limits<llama_pos>::max()) {
+                continue;
+            }
+            LLAMA_LOG_WARN("%s: rolling back packed DSpark memory for seq_id = %d, pos = [%d, +inf)\n",
+                    __func__, seq, packed_dspark_pos_min[seq]);
+            if (!memory->seq_rm(seq, packed_dspark_pos_min[seq], -1)) {
+                LLAMA_LOG_ERROR("%s: packed DSpark rollback failed for seq_id = %d\n", __func__, seq);
+            }
+        }
+    };
 
     const int dflash_shape_bucket = n_tokens_all == 1 ? 0 : n_tokens_all <= 16 ? 1 : 2;
     const char * dflash_shape_name = dflash_shape_bucket == 0 ? "single" :
@@ -1940,6 +2031,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    if (packed_dspark_token_batch && hparams.dsv4_hc_mult == 0) {
+        const llama_ubatch & actual = mctx->get_ubatch();
+        const llama_batch  & logical = balloc->get_batch();
+        bool exact = actual.n_tokens == n_tokens_all && actual.token && actual.pos &&
+                actual.n_seq_id && actual.seq_id;
+        for (uint32_t i = 0; exact && i < n_tokens_all; ++i) {
+            exact = actual.n_seq_id[i] == 1 && actual.seq_id[i] &&
+                    logical.n_seq_id[i] == 1 && logical.seq_id[i] &&
+                    actual.token[i] == logical.token[i] &&
+                    actual.pos[i] == logical.pos[i] &&
+                    actual.seq_id[i][0] == logical.seq_id[i][0];
+        }
+        if (!exact) {
+            // Generic recurrent/hybrid memories may wave-split unequal
+            // sequences. Until they implement complete-run splitting, reject
+            // before mctx->apply() can mutate KV/recurrent state.
+            LLAMA_LOG_ERROR("%s: memory backend cannot preserve packed DSpark row runs\n", __func__);
+            return -1;
+        }
+    }
+
     if (!external_layer_inputs.empty()) {
         const llama_ubatch & actual = mctx->get_ubatch();
         external_layer_inputs_actual_tokens = actual.n_tokens;
@@ -1989,6 +2101,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
     do {
         const auto & ubatch = mctx->get_ubatch();
 
+        if (packed_dspark_token_batch) {
+            // Independently verify the memory backend's actual prepared rows
+            // immediately before apply(). This catches reordered or wave-split
+            // batches even if a future backend bypasses iSWA's complete-run
+            // splitter. A later-group mismatch rolls back all earlier groups.
+            const llama_batch & logical = balloc->get_batch();
+            const uint32_t row_begin = (uint32_t) n_tokens_prev;
+            bool exact = row_begin + ubatch.n_tokens <= n_tokens_all &&
+                    ubatch.n_tokens > 0 && ubatch.token && ubatch.pos &&
+                    ubatch.n_seq_id && ubatch.seq_id;
+            for (uint32_t i = 0; exact && i < ubatch.n_tokens; ++i) {
+                const uint32_t row = row_begin + i;
+                exact = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i] &&
+                        logical.n_seq_id[row] == 1 && logical.seq_id[row] &&
+                        ubatch.token[i] == logical.token[row] &&
+                        ubatch.pos[i] == logical.pos[row] &&
+                        ubatch.seq_id[i][0] == logical.seq_id[row][0];
+            }
+
+            const uint32_t row_end = row_begin + ubatch.n_tokens;
+            if (exact && row_end < n_tokens_all) {
+                // The ubatch boundary must coincide with a logical source-run
+                // boundary; otherwise the next MASK would become an anchor.
+                exact = logical.seq_id[row_end - 1][0] != logical.seq_id[row_end][0];
+            }
+
+            if (!exact) {
+                LLAMA_LOG_ERROR("%s: memory backend reordered or split a packed DSpark run\n", __func__);
+                rollback_packed_dspark();
+                return -1;
+            }
+        }
+
         if (dflash_target_diag) {
             if (dflash_target_ubatch_count < 4) {
                 dflash_target_ubatch_sizes[dflash_target_ubatch_count] = ubatch.n_tokens;
@@ -2031,7 +2176,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+            // A packed DSpark logical batch can comprise several complete-run
+            // ubatches. If any later graph fails, remove every proposal row,
+            // including rows already applied by earlier groups.
+            if (packed_dspark_token_batch) {
+                rollback_packed_dspark();
+            }
+
+            // For normal batches, remove all positions of the failed ubatch.
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
                 pos_min[s] = std::numeric_limits<llama_pos>::max();
@@ -2050,7 +2202,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                if (!packed_dspark_token_batch) {
+                    memory->seq_rm(s, pos_min[s], -1);
+                }
             }
 
             switch (status) {
@@ -3241,6 +3395,93 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+ggml_cgraph * llama_context::graph_reserve_dspark(
+        const std::vector<uint32_t> & widths,
+        uint32_t n_outputs,
+        const llama_memory_context_i * mctx,
+        bool split_only,
+        size_t * sizes) {
+    GGML_ASSERT(!widths.empty());
+
+    uint32_t n_tokens = 0;
+    for (uint32_t width : widths) {
+        GGML_ASSERT(width > 0 && width <= cparams.n_ubatch - n_tokens);
+        n_tokens += width;
+    }
+    GGML_ASSERT(n_outputs >= 1 && n_outputs <= n_tokens);
+
+    ggml_backend_sched_reset(sched.get());
+    gf_res_prev->reset();
+
+    const auto save_n_outputs = this->n_outputs;
+    this->n_outputs = n_outputs;
+
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->token.resize(n_tokens, 0);
+    data->pos.resize((size_t) n_tokens * model.hparams.n_pos_per_embd());
+    data->n_seq_id.resize(n_tokens, 1);
+    data->seq_id.resize(n_tokens);
+    data->seq_id_unq.resize(widths.size());
+    data->seq_idx.resize(LLAMA_MAX_SEQ, -1);
+    data->output.resize(n_tokens, 0);
+    data->seq_id_data.resize(n_tokens);
+
+    uint32_t row = 0;
+    for (uint32_t s = 0; s < widths.size(); ++s) {
+        data->seq_id_unq[s] = (llama_seq_id) s;
+        data->seq_idx[s] = (int32_t) s;
+        for (uint32_t t = 0; t < widths[s]; ++t, ++row) {
+            data->seq_id_data[row] = (llama_seq_id) s;
+            for (uint32_t p = 0; p < model.hparams.n_pos_per_embd(); ++p) {
+                data->pos[(size_t) p * n_tokens + row] = (llama_pos) t;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < n_outputs; ++i) {
+        data->output[i] = 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        data->seq_id[i] = &data->seq_id_data[i];
+    }
+
+    llama_ubatch ubatch {
+        /*.b_equal_seqs =*/ false,
+        /*.n_tokens     =*/ n_tokens,
+        /*.n_seq_tokens =*/ 1,
+        /*.n_seqs       =*/ n_tokens,
+        /*.n_seqs_unq   =*/ (uint32_t) widths.size(),
+        /*.n_pos        =*/ model.hparams.n_pos_per_embd(),
+        /*.token        =*/ data->token.data(),
+        /*.embd         =*/ nullptr,
+        /*.pos          =*/ data->pos.data(),
+        /*.n_seq_id     =*/ data->n_seq_id.data(),
+        /*.seq_id       =*/ data->seq_id.data(),
+        /*.seq_id_unq   =*/ data->seq_id_unq.data(),
+        /*.seq_idx      =*/ data->seq_idx.data(),
+        /*.output       =*/ data->output.data(),
+        /*.data         =*/ std::move(data),
+    };
+
+    auto * res = gf_res_reserve.get();
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    res->reset();
+    auto * gf = model.build_graph(gparams);
+    this->n_outputs = save_n_outputs;
+
+    if (split_only) {
+        if (sizes) {
+            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+        } else {
+            ggml_backend_sched_split_graph(sched.get(), gf);
+        }
+    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        GGML_ASSERT(!sizes);
+        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        return nullptr;
+    }
+    return gf;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -3263,6 +3504,20 @@ llm_graph_params llama_context::graph_params(
         external_signatures.emplace_back(signature);
     }
 
+    std::vector<uint32_t> dspark_packed_indptr;
+    if (ubatch.token && model.dspark_markov_w1) {
+        const auto packed = llama_dspark_packed_layout_from_ubatch(
+                ubatch, llama_dspark_trained_gamma(model));
+        if (packed.valid) {
+            dspark_packed_indptr = packed.indptr;
+        } else {
+            // Keep malformed shapes incompatible with every valid graph. The
+            // real decode path rejects them before memory mutation; this
+            // sentinel also keeps reserve/probe mistakes from reusing a graph.
+            dspark_packed_indptr = { std::numeric_limits<uint32_t>::max() };
+        }
+    }
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -3277,6 +3532,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.external_layer_inputs =*/ external_layer_inputs,
         /*.external_layer_input_signatures =*/ std::move(external_signatures),
+        /*.dspark_packed_indptr =*/ std::move(dspark_packed_indptr),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

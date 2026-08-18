@@ -151,6 +151,10 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build(test-dspark-packed.cpp)
+target_include_directories(test-dspark-packed PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-dspark-packed)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)

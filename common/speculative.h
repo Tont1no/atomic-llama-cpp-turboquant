@@ -56,6 +56,30 @@ int32_t common_speculative_adaptive_n_max(
 // proposals for that sequence.
 int32_t common_speculative_draft_n_max_for_seq(int32_t configured_n_max, int32_t seq_n_max);
 
+struct common_speculative_dspark_pack_plan {
+    bool valid = false;
+
+    // One width per source sequence. A zero width means target-only for that
+    // sequence. indptr includes those zero-width sequences and is therefore a
+    // stable mapping back to the caller's source order.
+    std::vector<int32_t> widths;
+    std::vector<int32_t> indptr;
+
+    int32_t total_rows = 0;
+    std::string reason;
+};
+
+// Resolve per-sequence DSpark caps into compact source-order rows. The trained
+// gamma and the draft context's configured row limit are hard correctness
+// bounds; malformed or oversized plans fail closed instead of silently
+// widening a sequence to a rectangular block.
+common_speculative_dspark_pack_plan common_speculative_dspark_pack_rows(
+        int32_t configured_n_max,
+        int32_t configured_n_min,
+        int32_t trained_gamma,
+        int32_t max_total_rows,
+        const std::vector<int32_t> & seq_n_max);
+
 // Update the per-position EMA after target verification. Positions are prefix
 // survival events: a position is accepted only when the accepted prefix reaches it.
 void common_speculative_adaptive_acceptance_update(
