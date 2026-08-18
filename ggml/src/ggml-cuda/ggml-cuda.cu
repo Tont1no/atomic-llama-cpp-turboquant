@@ -3439,11 +3439,11 @@ static ggml_cuda_dflash_k_snapshot ggml_cuda_dflash_k_snapshot_rows(
     GGML_ASSERT(std::adjacent_find(sorted_rows.begin(), sorted_rows.end()) == sorted_rows.end() &&
             "DFlash-K raw validation requires unique cache row indices");
 
-    const size_t row_bytes = set_rows->nb[1];
+    const size_t row_bytes = ggml_row_size(set_rows->type, set_rows->ne[0]);
     result.data.resize(result.rows.size()*row_bytes);
     for (size_t i = 0; i < result.rows.size(); ++i) {
         GGML_ASSERT(result.rows[i] >= 0 && result.rows[i] < set_rows->ne[1]);
-        const char * src = static_cast<const char *>(set_rows->data) + result.rows[i]*row_bytes;
+        const char * src = static_cast<const char *>(set_rows->data) + result.rows[i]*set_rows->nb[1];
         CUDA_CHECK(cudaMemcpyAsync(result.data.data() + i*row_bytes, src,
                 row_bytes, cudaMemcpyDefault, stream));
     }
@@ -3496,12 +3496,43 @@ static void ggml_cuda_validate_dflash_k_fwht_fusion(
     }
 
     const ggml_cuda_dflash_k_snapshot initial = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    const size_t row_bytes   = ggml_row_size(set_rows->type, set_rows->ne[0]);
+    const size_t cache_bytes = ggml_nbytes(set_rows);
+    auto snapshot_cache = [&]() {
+        std::vector<uint8_t> data(cache_bytes);
+        CUDA_CHECK(cudaMemcpyAsync(data.data(), set_rows->data, data.size(),
+                cudaMemcpyDefault, cuda_ctx->stream()));
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        return data;
+    };
+    const std::vector<uint8_t> initial_cache = snapshot_cache();
+    std::vector<bool> target_rows(set_rows->ne[1], false);
+    for (int64_t row : initial.rows) {
+        target_rows[row] = true;
+    }
+    auto check_untouched_rows = [&](const char * path) {
+        const std::vector<uint8_t> current = snapshot_cache();
+        for (size_t offset = 0; offset < cache_bytes; ++offset) {
+            const int64_t row = offset/set_rows->nb[1];
+            const size_t row_byte = offset % set_rows->nb[1];
+            if (row < set_rows->ne[1] && target_rows[row] && row_byte < row_bytes) {
+                continue;
+            }
+            if (initial_cache[offset] != current[offset]) {
+                GGML_LOG_ERROR("ggml_cuda: DFlash-K raw cache validation FAILED: %s corrupted untouched "
+                               "row = %" PRId64 ", row_byte = %zu, before = 0x%02x, after = 0x%02x\n",
+                        path, row, row_byte,
+                        (unsigned int) initial_cache[offset], (unsigned int) current[offset]);
+                GGML_ABORT("DFlash-K cache writer modified an unaddressed row");
+            }
+        }
+    };
     auto poison_rows = [&](const std::vector<uint8_t> & poison) {
         GGML_ASSERT(poison.size() == initial.data.size());
         for (size_t i = 0; i < initial.rows.size(); ++i) {
             char * dst = static_cast<char *>(set_rows->data) + initial.rows[i]*set_rows->nb[1];
-            CUDA_CHECK(cudaMemcpyAsync(dst, poison.data() + i*set_rows->nb[1],
-                    set_rows->nb[1], cudaMemcpyDefault, cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemcpyAsync(dst, poison.data() + i*row_bytes,
+                    row_bytes, cudaMemcpyDefault, cuda_ctx->stream()));
         }
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     };
@@ -3514,6 +3545,7 @@ static void ggml_cuda_validate_dflash_k_fwht_fusion(
     poison_rows(std::vector<uint8_t>(initial.data.size(), 0xA5));
     ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, set_rows, true);
     const ggml_cuda_dflash_k_snapshot fused = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    check_untouched_rows("direct writer");
 
     // A second direct pass from inverse bytes proves that the fused writer
     // overwrites every compared byte while x is still pristine.
@@ -3524,6 +3556,7 @@ static void ggml_cuda_validate_dflash_k_fwht_fusion(
     poison_rows(poison);
     ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, set_rows, true);
     const ggml_cuda_dflash_k_snapshot fused_repeat = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    check_untouched_rows("repeated direct writer");
     if (fused.data != fused_repeat.data) {
         GGML_ABORT("DFlash-K fused cache writer did not deterministically overwrite every byte");
     }
@@ -3548,12 +3581,12 @@ static void ggml_cuda_validate_dflash_k_fwht_fusion(
     GGML_ASSERT(ggml_cuda_op_fwht(*cuda_ctx, reshape_pre, fwht));
     ggml_cuda_op_set_rows(*cuda_ctx, set_rows);
     const ggml_cuda_dflash_k_snapshot legacy = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    check_untouched_rows("fallback writer");
 
     GGML_ASSERT(legacy.rows == fused.rows && legacy.data.size() == fused.data.size());
     const auto mismatch = std::mismatch(legacy.data.begin(), legacy.data.end(), fused.data.begin());
     if (mismatch.first != legacy.data.end()) {
         const size_t byte_index = (size_t) std::distance(legacy.data.begin(), mismatch.first);
-        const size_t row_bytes  = set_rows->nb[1];
         const size_t token      = byte_index / row_bytes;
         const size_t row_byte   = byte_index % row_bytes;
         GGML_LOG_ERROR("ggml_cuda: DFlash-K raw cache validation FAILED: cache = %s, tokens = %zu, "
@@ -3566,7 +3599,7 @@ static void ggml_cuda_validate_dflash_k_fwht_fusion(
 
     GGML_LOG_INFO("ggml_cuda: DFlash-K raw cache validation PASS: cache = %s, tokens = %zu, "
                   "row_bytes = %zu, hash = %016" PRIx64 "\n",
-            ggml_type_name(set_rows->type), legacy.rows.size(), set_rows->nb[1], legacy.hash);
+            ggml_type_name(set_rows->type), legacy.rows.size(), row_bytes, legacy.hash);
 }
 
 // try and fuse nodes and return the number of nodes to skip
