@@ -35,6 +35,12 @@ static size_t context_memory_bytes(const llama_context * ctx) {
     return total;
 }
 
+static std::vector<uint32_t> tag_recurrent_depth(llama_batch & batch, size_t n_rows, uint32_t depth) {
+    std::vector<uint32_t> depths(n_rows, depth);
+    batch.rs_depth = depths.data();
+    return depths;
+}
+
 static bool decode_ragged_and_compare(
         const common_params & params,
         llama_model * model,
@@ -63,9 +69,11 @@ static bool decode_ragged_and_compare(
     }
 
     llama_batch batch = llama_batch_init(7, 0, 3);
+    std::vector<uint32_t> batch_depths;
     for (llama_seq_id seq = 0; seq < 3; ++seq) {
         for (llama_pos pos = 0; pos < (llama_pos) rows[seq].size(); ++pos) {
             common_batch_add(batch, rows[seq][pos], pos, { seq }, pos + 1 == (llama_pos) rows[seq].size());
+            batch_depths.push_back((uint32_t) rows[seq].size() - 1);
         }
         if (!decode_tokens(ctx_ref[seq], rows[seq], (uint32_t) rows[seq].size())) {
             fprintf(stderr, "%s : reference ragged decode failed for sequence %d\n", __func__, seq);
@@ -73,6 +81,7 @@ static bool decode_ragged_and_compare(
             return false;
         }
     }
+    batch.rs_depth = batch_depths.data();
     if (llama_decode(ctx_batched, batch) != 0) {
         fprintf(stderr, "%s : batched ragged decode failed\n", __func__);
         llama_batch_free(batch);
@@ -112,6 +121,7 @@ static bool decode_ragged_and_compare(
     // active depth 3 -> 0 immediately while physical shrink is deferred.
     llama_set_recurrent_load_hint(ctx_batched, 3);
     llama_batch one_each = llama_batch_init(3, 0, 3);
+    auto one_each_depths = tag_recurrent_depth(one_each, 3, 0);
     for (llama_seq_id seq = 0; seq < 3; ++seq) {
         const llama_token token = (llama_token) ((8 + seq) % n_vocab);
         const llama_pos pos = (llama_pos) rows[seq].size();
@@ -143,6 +153,7 @@ static bool decode_ragged_and_compare(
     // A second decode chunk in the same scheduling epoch must not satisfy the
     // hysteresis dwell by itself.
     llama_batch same_epoch = llama_batch_init(3, 0, 3);
+    auto same_epoch_depths = tag_recurrent_depth(same_epoch, 3, 0);
     for (llama_seq_id seq = 0; seq < 3; ++seq) {
         const llama_token token = (llama_token) ((11 + seq) % n_vocab);
         const llama_pos pos = (llama_pos) rows[seq].size() + 1;
@@ -165,6 +176,7 @@ static bool decode_ragged_and_compare(
     // The next stable scheduling epoch performs the single coalesced shrink.
     llama_set_recurrent_load_hint(ctx_batched, 3);
     llama_batch next_epoch = llama_batch_init(3, 0, 3);
+    auto next_epoch_depths = tag_recurrent_depth(next_epoch, 3, 0);
     for (llama_seq_id seq = 0; seq < 3; ++seq) {
         const llama_token token = (llama_token) ((14 + seq) % n_vocab);
         const llama_pos pos = (llama_pos) rows[seq].size() + 2;
@@ -256,6 +268,7 @@ static bool decode_multi_rollback_shrink(
     }
     std::vector<std::vector<llama_token>> tokens(2, std::vector<llama_token>(count));
     llama_batch prompt = llama_batch_init(2*count, 0, 2);
+    auto prompt_depths = tag_recurrent_depth(prompt, 2*count, count - 1);
     for (llama_seq_id seq = 0; seq < 2; ++seq) {
         for (uint32_t pos = 0; pos < count; ++pos) {
             tokens[seq][pos] = (llama_token) ((1 + seq*count + pos) % n_vocab);
@@ -286,6 +299,7 @@ static bool decode_multi_rollback_shrink(
     // Both sequences have pending rollback planes when prepare_batch shrinks
     // the resident allocation. This catches temporary-view accumulation.
     llama_batch replay = llama_batch_init(2, 0, 2);
+    auto replay_depths = tag_recurrent_depth(replay, 2, 0);
     for (llama_seq_id seq = 0; seq < 2; ++seq) {
         common_batch_add(replay, tokens[seq][rollback_pos], rollback_pos, { seq }, true);
         if (!decode_one(refs[seq], tokens[seq][rollback_pos], rollback_pos)) {
@@ -311,6 +325,7 @@ static bool decode_multi_rollback_shrink(
     }
 
     llama_batch settle = llama_batch_init(2, 0, 2);
+    auto settle_depths = tag_recurrent_depth(settle, 2, 0);
     for (llama_seq_id seq = 0; seq < 2; ++seq) {
         const llama_token token = (llama_token) ((tokens[seq][rollback_pos] + 5) % n_vocab);
         common_batch_add(settle, token, rollback_pos + 1, { seq }, true);
@@ -375,6 +390,7 @@ static bool decode_shared_rollback_shrink(
     // The first cap0 tick must retain the pending plane until find_slot has
     // detached seq0 from the tail shared with seq1.
     llama_batch first = llama_batch_init(2, 0, 2);
+    auto first_depths = tag_recurrent_depth(first, 2, 0);
     const llama_token sibling_token = (llama_token) ((tokens.back() + 1) % n_vocab);
     common_batch_add(first, tokens[rollback_pos], rollback_pos, { 0 }, true);
     common_batch_add(first, sibling_token, count, { 1 }, true);
@@ -399,6 +415,7 @@ static bool decode_shared_rollback_shrink(
     // A second cap0 tick has no pending index and arms the lower shrink target
     // without changing either independently split state.
     llama_batch second = llama_batch_init(2, 0, 2);
+    auto second_depths = tag_recurrent_depth(second, 2, 0);
     const llama_token rollback_next = (llama_token) ((tokens[rollback_pos] + 3) % n_vocab);
     const llama_token sibling_next  = (llama_token) ((sibling_token + 3) % n_vocab);
     common_batch_add(second, rollback_next, rollback_pos + 1, { 0 }, true);
@@ -421,6 +438,7 @@ static bool decode_shared_rollback_shrink(
     }
 
     llama_batch third = llama_batch_init(2, 0, 2);
+    auto third_depths = tag_recurrent_depth(third, 2, 0);
     const llama_token rollback_final = (llama_token) ((rollback_next + 3) % n_vocab);
     const llama_token sibling_final  = (llama_token) ((sibling_next + 3) % n_vocab);
     common_batch_add(third, rollback_final, rollback_pos + 2, { 0 }, true);
@@ -449,6 +467,7 @@ static bool decode_shared_rollback_shrink(
 
 static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
     llama_batch batch = llama_batch_init(count, 0, 1);
+    auto depths = tag_recurrent_depth(batch, count, count - 1);
     for (uint32_t pos = 0; pos < count; ++pos) {
         common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
     }
@@ -459,6 +478,7 @@ static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & 
 
 static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     llama_batch batch = llama_batch_init(1, 0, 1);
+    auto depths = tag_recurrent_depth(batch, 1, 0);
     common_batch_add(batch, tok, pos, { 0 }, true);
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);

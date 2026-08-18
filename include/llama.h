@@ -252,6 +252,8 @@ extern "C" {
     //               - if embeddings: all tokens are output
     //               - if not:        only the last token is output
     //            )
+    // - rs_depth : required recurrent rollback snapshot depth for each input row
+    //              (optional, experimental; NULL conservatively uses the configured maximum)
     //
     typedef struct llama_batch {
         int32_t n_tokens;
@@ -262,6 +264,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        uint32_t     *  rs_depth; // [EXPERIMENTAL]
     } llama_batch;
 
     enum llama_model_kv_override_type {

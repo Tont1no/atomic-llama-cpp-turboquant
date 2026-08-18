@@ -77,6 +77,7 @@ struct server_batch {
         bool is_prompt; // for stats tracking
     };
     std::vector<token> tokens;
+    std::vector<uint32_t> rs_depth;
     int32_t n_tokens_alloc = 0;
     int32_t n_embd = 0;
 
@@ -108,24 +109,31 @@ struct server_batch {
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
         tokens_ptr = batch.token;
         tokens.reserve(n_tokens_alloc);
+        rs_depth.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+    bool add(
+            int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt,
+            uint32_t required_rs_depth) {
         GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
         tokens.push_back({ id_slot, token, pos, output, is_prompt });
+        rs_depth.push_back(required_rs_depth);
         return true;
     }
 
-    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt) {
+    bool add(
+            int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt,
+            uint32_t required_rs_depth) {
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
         tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
+        rs_depth.push_back(required_rs_depth);
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -133,6 +141,7 @@ struct server_batch {
 
     void clear() {
         tokens.clear();
+        rs_depth.clear();
         embd.clear();
         common_batch_clear(batch);
         slot_batched      = nullptr;
@@ -163,6 +172,7 @@ struct server_batch {
             const auto & t = tokens[i];
             common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
         }
+        batch.rs_depth = rs_depth.data();
         if (has_embd) {
             batch.token = nullptr; // will be restored on clear()
             batch.embd  = embd.data();
@@ -187,6 +197,7 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
+            batch.rs_depth + off,
         };
 
         return view;
@@ -493,9 +504,9 @@ struct server_slot {
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false, 0);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false, 0);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -512,10 +523,12 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+            const uint32_t required_rs_depth = (uint32_t) std::min<size_t>(
+                    spec_draft.size(), llama_n_rs_seq(ctx_tgt));
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
+            add_ok &= batch.add(id, sampled, pos0++, true, false, required_rs_depth);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+                add_ok &= batch.add(this->id, token, pos0++, true, false, required_rs_depth);
             }
         }
 
@@ -3574,7 +3587,8 @@ private:
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                            /* is_prompt = */ true,
+                            /* rs_depth  = */ 0);
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint

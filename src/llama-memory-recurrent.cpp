@@ -36,17 +36,21 @@ uint32_t llama_recurrent_batch_active_rs_depth(
     if (configured_max == 0) {
         return 0;
     }
-    if (batch.n_tokens <= 0 || n_seq_max == 0 || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+    if (batch.n_tokens <= 0 || n_seq_max == 0 || batch.n_seq_id == nullptr ||
+            batch.seq_id == nullptr || batch.rs_depth == nullptr) {
         return fallback();
     }
 
-    std::vector<uint32_t> rows_per_seq(n_seq_max, 0);
-    uint32_t max_rows = 0;
+    uint32_t active_depth = 0;
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         const int32_t n_ids = batch.n_seq_id[i];
         if (n_ids <= 0 || n_ids > (int32_t) n_seq_max || batch.seq_id[i] == nullptr) {
             return fallback();
         }
+        if (batch.rs_depth[i] > configured_max) {
+            return fallback();
+        }
+        active_depth = std::max(active_depth, batch.rs_depth[i]);
 
         // A duplicate sequence id on one token is ambiguous metadata. Do not
         // under-estimate the required rollback window in that case.
@@ -60,19 +64,9 @@ uint32_t llama_recurrent_batch_active_rs_depth(
                     return fallback();
                 }
             }
-
-            uint32_t & rows = rows_per_seq[(size_t) seq_id];
-            if (rows == UINT32_MAX) {
-                return fallback();
-            }
-            max_rows = std::max(max_rows, ++rows);
         }
     }
-
-    if (max_rows == 0) {
-        return fallback();
-    }
-    return std::min(configured_max, max_rows - 1);
+    return active_depth;
 }
 
 llama_memory_recurrent::llama_memory_recurrent(
