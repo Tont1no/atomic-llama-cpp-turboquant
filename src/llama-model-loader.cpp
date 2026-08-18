@@ -941,7 +941,16 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         case GGML_OP_MUL_MAT:
             {
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
-                op_tensor = ggml_mul_mat(ctx, w, b);
+                if (w->type == GGML_TYPE_F8_E4M3) {
+                    // Native FP8 placement depends on the explicit scale
+                    // inputs. A plain two-input probe would make CUDA reject
+                    // every preserved FP8 weight and silently place it on CPU.
+                    ggml_tensor * weight_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+                    ggml_tensor * input_scale  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+                    op_tensor = ggml_mul_mat_f8_e4m3(ctx, w, b, weight_scale, input_scale);
+                } else {
+                    op_tensor = ggml_mul_mat(ctx, w, b);
+                }
             } break;
         case GGML_OP_MUL_MAT_ID:
             {

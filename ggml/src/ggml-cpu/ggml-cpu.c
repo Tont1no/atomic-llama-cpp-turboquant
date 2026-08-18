@@ -1258,6 +1258,42 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    if (src0->type == GGML_TYPE_F8_E4M3) {
+        const char * fp8_reference = getenv("GGML_FP8_E4M3_CPU_REFERENCE");
+        GGML_ASSERT(fp8_reference && strcmp(fp8_reference, "1") == 0 &&
+                    "F8_E4M3 CPU execution is an explicit reference-only diagnostic");
+        const struct ggml_tensor * weight_scale = dst->src[2];
+        const struct ggml_tensor * input_scale  = dst->src[3];
+        GGML_ASSERT(weight_scale && input_scale);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+        GGML_ASSERT(ggml_is_scalar(weight_scale) && ggml_is_scalar(input_scale));
+
+        const float ws = *(const float *) weight_scale->data;
+        const float is = *(const float *) input_scale->data;
+        GGML_ASSERT(isfinite(ws) && isfinite(is) && ws > 0.0f && is > 0.0f);
+
+        const int64_t k = src0->ne[0];
+        const int64_t n = src0->ne[1];
+        const int64_t m = src1->ne[1];
+        GGML_ASSERT(src1->ne[0] == k && dst->ne[0] == n && dst->ne[1] == m);
+
+        for (int64_t job = params->ith; job < n * m; job += params->nth) {
+            const int64_t row = job % n;
+            const int64_t col = job / n;
+            const uint8_t * w = (const uint8_t *) src0->data + row * src0->nb[1];
+            const float * x = (const float *) ((const char *) src1->data + col * src1->nb[1]);
+            float sum = 0.0f;
+            for (int64_t p = 0; p < k; ++p) {
+                const uint8_t xq = ggml_fp32_to_f8_e4m3(x[p] / is);
+                sum += ggml_f8_e4m3_to_fp32(w[p]) * ggml_f8_e4m3_to_fp32(xq);
+            }
+            ((float *) ((char *) dst->data + col * dst->nb[1]))[row] = sum * ws * is;
+        }
+        return;
+    }
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
@@ -2852,6 +2888,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
+                        if (node->src[0]->type == GGML_TYPE_F8_E4M3) {
+                            cur = 0;
+                            break;
+                        }
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {

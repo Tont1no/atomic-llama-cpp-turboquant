@@ -66,6 +66,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/fp8.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
@@ -703,6 +704,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    ggml_cuda_fp8_cache_clear(this);
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -715,6 +718,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+#ifdef GGML_CUDA_HAS_CUBLASLT
+        if (cublaslt_handles[i] != nullptr) {
+            CUBLAS_CHECK(cublasLtDestroy(cublaslt_handles[i]));
+        }
+#endif
     }
 }
 
@@ -1810,6 +1818,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_cuda_mul_mat_f8_e4m3(ctx, src0, src1, dst)) {
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -4962,6 +4974,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_F8_E4M3: {
+#if CUDART_VERSION >= 13020
+                        const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                        return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32 &&
+                            op->type == GGML_TYPE_F32 && op->src[2] && op->src[3] &&
+                            op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                            ggml_is_scalar(op->src[2]) && ggml_is_scalar(op->src[3]) &&
+                            ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(op) &&
+                            a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+                            a->ne[0] % 16 == 0 && a->ne[1] % 16 == 0 &&
+                            cc >= GGML_CUDA_CC_BLACKWELL && cc < 1300 &&
+                            ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL;
+#else
+                        return false;
+#endif
+                    }
                     default:
                         return false;
                 }

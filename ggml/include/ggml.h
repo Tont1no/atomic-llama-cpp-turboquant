@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // Experimental signed E4M3 finite FP8 scalar storage. This is
+        // distinct from the unsigned E4M3 block scales embedded in NVFP4.
+        GGML_TYPE_F8_E4M3 = 43,
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -1429,6 +1432,19 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Static-scaled W8A8 multiplication. Reference semantics:
+    //   Aq = satfinite_e4m3(A / a_scale)
+    //   result = (B_e4m3 @ Aq_e4m3) * a_scale * b_scale
+    // Here a is the activation and b is the stored weight in the ModelOpt
+    // naming convention; the graph sources remain weight, activation,
+    // weight_scale, input_scale to match ggml_mul_mat.
+    GGML_API struct ggml_tensor * ggml_mul_mat_f8_e4m3(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * activation,
+            struct ggml_tensor  * weight_scale,
+            struct ggml_tensor  * input_scale);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

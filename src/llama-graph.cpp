@@ -1487,10 +1487,22 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+          ggml_tensor * w_s,
+          ggml_tensor * input_s) const {
+    ggml_tensor * res;
 
-    if (w_s) {
+    if (w->type == GGML_TYPE_F8_E4M3) {
+        GGML_ASSERT(w_s && input_s && "F8_E4M3 weights require scalar weight and input scales");
+        for (const auto & lora : *loras) {
+            GGML_ASSERT(lora.first->get_weight(w) == nullptr &&
+                        "LoRA over experimental F8_E4M3 weights is not supported");
+        }
+        res = ggml_mul_mat_f8_e4m3(ctx0, w, cur, w_s, input_s);
+    } else {
+        res = ggml_mul_mat(ctx0, w, cur);
+    }
+
+    if (w_s && w->type != GGML_TYPE_F8_E4M3) {
         res = ggml_mul(ctx0, res, w_s);
     }
 

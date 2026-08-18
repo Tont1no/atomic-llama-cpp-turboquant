@@ -156,6 +156,13 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--keep-fp8-e4m3", action="store_true",
+        help=(
+            "EXPERIMENTAL: preserve ModelOpt scalar-scaled E4M3 weights for the native "
+            "SM120 CUDA runtime. Incompatible checkpoints fail instead of dequantizing."
+        ),
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -167,6 +174,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if args.fp8_as_q8 and args.keep_fp8_e4m3:
+        parser.error("--fp8-as-q8 and --keep-fp8-e4m3 are mutually exclusive")
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
     return args
@@ -290,6 +299,7 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     keep_fp8_e4m3=args.keep_fp8_e4m3,
                                      )
 
         if args.vocab_only:

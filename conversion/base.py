@@ -130,7 +130,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 keep_fp8_e4m3: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -161,7 +162,9 @@ class ModelBase:
         self._is_nvfp4 = False
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
+        self._keep_fp8_e4m3 = keep_fp8_e4m3
         self._fp8_dequantized: set[str] = set()
+        self._fp8_preserved: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -546,6 +549,42 @@ class ModelBase:
                 # Mixed-precision ModelOpt models: NVFP4 tensors are handled by
                 # _generate_nvfp4_tensors; FP8 tensors have 1D weight_scale and
                 # are dequantized here. k/v scale tensors are unused.
+                # Discover the native FP8 triplets before removing auxiliaries:
+                # safetensors key order is not guaranteed to put weight_scale
+                # ahead of input_scale.
+                if self._keep_fp8_e4m3:
+                    for weight_name, weight_gen in self.model_tensors.items():
+                        if not weight_name.endswith(".weight"):
+                            continue
+                        dtype = weight_gen().dtype
+                        if dtype == getattr(torch, "float8_e5m2", None):
+                            raise ValueError(
+                                f"{weight_name}: E5M2 is unsupported by --keep-fp8-e4m3"
+                            )
+                        if dtype != getattr(torch, "float8_e4m3fn", None):
+                            continue
+
+                        weight_scale_name = weight_name.removesuffix(".weight") + ".weight_scale"
+                        input_scale_name = weight_name.removesuffix(".weight") + ".input_scale"
+                        if weight_scale_name not in self.model_tensors:
+                            raise ValueError(f"{weight_name}: missing required scalar {weight_scale_name}")
+                        if input_scale_name not in self.model_tensors:
+                            raise ValueError(f"{weight_name}: missing required scalar {input_scale_name}")
+
+                        weight_scale = LazyTorchTensor.to_eager(self.model_tensors[weight_scale_name]())
+                        input_scale = LazyTorchTensor.to_eager(self.model_tensors[input_scale_name]())
+                        if weight_scale.numel() != 1:
+                            raise ValueError(
+                                f"{weight_scale_name}: expected one scalar ModelOpt weight scale, "
+                                f"got shape {tuple(weight_scale.shape)}"
+                            )
+                        if input_scale.numel() != 1:
+                            raise ValueError(
+                                f"{input_scale_name}: expected one scalar ModelOpt input scale, "
+                                f"got shape {tuple(input_scale.shape)}"
+                            )
+                        self._fp8_preserved.add(weight_name)
+
                 for name in self.model_tensors.keys():
                     if name.endswith(".weight_scale"):
                         weight_name = name.removesuffix("_scale")
@@ -554,6 +593,10 @@ class ModelBase:
                             continue
                         w = self.model_tensors[weight_name]
                         s = self.model_tensors[name]
+                        if weight_name in self._fp8_preserved:
+                            # _generate_fp8_e4m3_tensors writes and consumes
+                            # the weight and both scale sidecars losslessly.
+                            continue
                         is_fp8_weight = False
                         if self._fp8_as_q8:
                             is_fp8_weight = w().dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -562,6 +605,8 @@ class ModelBase:
                         if is_fp8_weight:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith((".input_scale", ".k_scale", ".v_scale")):
+                        if self._keep_fp8_e4m3 and name.removesuffix(".input_scale") + ".weight" in self._fp8_preserved:
+                            continue
                         tensors_to_remove.append(name)
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
@@ -653,6 +698,69 @@ class ModelBase:
         if self._fp8_as_q8 and name in self._fp8_dequantized and n_dims >= 2:
             return gguf.GGMLQuantizationType.Q8_0
         return False
+
+    def _generate_fp8_e4m3_tensors(self) -> None:
+        """Write ModelOpt scalar W8A8 tensors without changing their code bytes."""
+        consumed: list[str] = []
+        for name in sorted(self._fp8_preserved):
+            weight_gen = self.model_tensors.get(name)
+            if weight_gen is None:
+                raise ValueError(f"preserved FP8 tensor disappeared before conversion: {name}")
+
+            weight = LazyTorchTensor.to_eager(weight_gen())
+            if weight.dtype != getattr(torch, "float8_e4m3fn", None):
+                raise ValueError(f"{name}: expected torch.float8_e4m3fn, got {weight.dtype}")
+            if weight.ndim != 2:
+                raise ValueError(f"{name}: native FP8 runtime currently supports 2D weights, got {tuple(weight.shape)}")
+            if weight.shape[0] % 16 != 0 or weight.shape[1] % 16 != 0:
+                raise ValueError(
+                    f"{name}: native FP8 runtime requires both matrix dimensions divisible by 16, "
+                    f"got {tuple(weight.shape)}"
+                )
+
+            weight_scale_name = name.removesuffix(".weight") + ".weight_scale"
+            input_scale_name = name.removesuffix(".weight") + ".input_scale"
+            weight_scale = LazyTorchTensor.to_eager(self.model_tensors[weight_scale_name]()).float().reshape(-1)
+            input_scale = LazyTorchTensor.to_eager(self.model_tensors[input_scale_name]()).float().reshape(-1)
+            if weight_scale.numel() != 1 or input_scale.numel() != 1:
+                raise ValueError(f"{name}: only scalar ModelOpt weight/input scales are supported")
+            if not torch.isfinite(weight_scale).all() or not torch.isfinite(input_scale).all():
+                raise ValueError(f"{name}: non-finite FP8 scale")
+            if float(weight_scale[0]) <= 0.0 or float(input_scale[0]) <= 0.0:
+                raise ValueError(f"{name}: FP8 scales must be positive")
+
+            bid = next((int(part) for part in name.split(".") if part.isdecimal()), None)
+            transformed = list(self.modify_tensors(weight, name, bid))
+            if len(transformed) != 1:
+                raise ValueError(f"{name}: FP8 transform unexpectedly produced {len(transformed)} tensors")
+            new_name, transformed_weight = transformed[0]
+            supported_roles = (
+                ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
+                ".attn_qkv.weight", ".attn_gate.weight", ".ssm_alpha.weight", ".ssm_beta.weight",
+                ".ssm_out.weight", ".nextn_eh_proj.weight", ".nextn_shared_head_head.weight",
+                "output.weight",
+            )
+            if not new_name.endswith(supported_roles):
+                raise ValueError(
+                    f"{name}: mapped tensor {new_name} has no native Qwen FP8 graph consumer"
+                )
+            raw = transformed_weight.contiguous().view(torch.uint8).cpu().numpy()
+            if raw.size != weight.numel():
+                raise ValueError(f"{name}: FP8 transform changed element count")
+
+            logger.info(
+                "%s, torch.float8_e4m3fn --> F8_E4M3, shape = {%s}",
+                new_name,
+                ", ".join(str(n) for n in reversed(transformed_weight.shape)),
+            )
+            self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+            base_name = new_name.removesuffix(".weight")
+            self.gguf_writer.add_tensor(base_name + ".scale", weight_scale.cpu().numpy())
+            self.gguf_writer.add_tensor(base_name + ".input_scale", input_scale.cpu().numpy())
+            consumed.extend((name, weight_scale_name, input_scale_name))
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
 
     # some models need extra generated tensors (like rope_freqs)
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
@@ -898,6 +1006,15 @@ class ModelBase:
             self._generate_nvfp4_tensors()
 
         self.dequant_model()
+
+        if self._keep_fp8_e4m3:
+            if self.model_arch not in (gguf.MODEL_ARCH.QWEN35, gguf.MODEL_ARCH.QWEN35MOE):
+                raise ValueError(
+                    "--keep-fp8-e4m3 currently supports only Qwen3.5/3.6/3.8 dense or MoE models"
+                )
+            if not self._fp8_preserved:
+                raise ValueError("--keep-fp8-e4m3 requested, but no scalar ModelOpt E4M3 weights were found")
+            self._generate_fp8_e4m3_tensors()
 
         # Handle empty tensor_map for models with block_count=0 (like MobileNetV5)
         if self.tensor_map.mapping:

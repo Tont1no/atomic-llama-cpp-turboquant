@@ -1535,7 +1535,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         // output scales
-        if (output && output->type == GGML_TYPE_NVFP4) {
+        if (output && (output->type == GGML_TYPE_NVFP4 || output->type == GGML_TYPE_F8_E4M3)) {
             // weight scale
             if (!output_s) {
                 output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
@@ -1548,11 +1548,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     ml.done_getting_tensors();
 
-    // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+    // Tied scaled output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
-            output->type == GGML_TYPE_NVFP4 &&
+            (output->type == GGML_TYPE_NVFP4 || output->type == GGML_TYPE_F8_E4M3) &&
             (output_s || output_in_s)));
     // populate tensors_by_name
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
@@ -1687,6 +1687,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // Fail closed for externally produced/corrupt preserved-FP8 GGUFs too,
+    // not only files emitted by this tree's converter. cuBLASLt reads scale
+    // values directly from device memory and cannot validate them itself.
+    for (const auto & [name, weight] : tensors_by_name) {
+        if (weight->type != GGML_TYPE_F8_E4M3) {
+            continue;
+        }
+        const std::string suffix = ".weight";
+        if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            throw std::runtime_error(format("F8_E4M3 tensor '%s' is not a supported weight tensor", name.c_str()));
+        }
+        const std::string base = name.substr(0, name.size() - suffix.size());
+        for (const char * scale_suffix : { ".scale", ".input_scale" }) {
+            const std::string scale_name = base + scale_suffix;
+            const auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
+                [&scale_name](const auto & item) { return item.first == scale_name; });
+            if (it == tensors_by_name.end() || it->second->type != GGML_TYPE_F32 || !ggml_is_scalar(it->second)) {
+                throw std::runtime_error(format(
+                    "F8_E4M3 tensor '%s' requires scalar F32 sidecar '%s'",
+                    name.c_str(), scale_name.c_str()));
+            }
+            float scale = 0.0f;
+            ggml_backend_tensor_get(it->second, &scale, 0, sizeof(scale));
+            if (!std::isfinite(scale) || scale <= 0.0f) {
+                throw std::runtime_error(format(
+                    "F8_E4M3 tensor '%s' has invalid sidecar '%s' value %.9g",
+                    name.c_str(), scale_name.c_str(), scale));
+            }
         }
     }
 

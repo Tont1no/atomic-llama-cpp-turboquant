@@ -7,6 +7,8 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -451,6 +453,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (src0->type == GGML_TYPE_F8_E4M3) {
+                const char * fp8_reference = std::getenv("GGML_FP8_E4M3_CPU_REFERENCE");
+                return fp8_reference && std::strcmp(fp8_reference, "1") == 0 &&
+                    src1->type == GGML_TYPE_F32 && op->src[2] && op->src[3] &&
+                    op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                    ggml_is_scalar(op->src[2]) && ggml_is_scalar(op->src[3]) &&
+                    src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+            }
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
