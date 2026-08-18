@@ -116,6 +116,9 @@ LLAMA_API void llama_set_embeddings_layer_inp_device(struct llama_context * ctx,
 
 // Fuse target features and inject the DFlash KV cache in one device graph.
 // Returns false when the guarded fast path is unsupported; ret then remains 0.
+// batch.pos is plane-major and must contain n_tokens times the target model's
+// n_pos_per_embd values. The implementation validates the complete target row
+// identity before any IMROPE-to-NEOX text-position projection.
 LLAMA_API bool llama_decode_dflash_features(
         struct llama_context * ctx_dft,
         struct llama_context * ctx_tgt,

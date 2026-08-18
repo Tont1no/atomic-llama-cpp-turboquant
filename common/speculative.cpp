@@ -923,6 +923,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
+    uint32_t    n_pos_tgt     = 1;
+    uint32_t    n_pos_dft     = 1;
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
@@ -933,6 +935,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool device_fastpath_reported = false;
     bool device_fallback_reported = false;
     bool device_guard_reported[3] = {};
+
+    // The special device API receives the complete target position vector for
+    // row-identity validation. llama_batch_init() allocates only one position
+    // per row, so keep the multi-axis storage separately.
+    std::vector<llama_pos> batch_device_pos;
+    std::vector<llama_pos> batch_inject_pos;
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -957,6 +965,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         n_embd_tgt    = llama_model_n_embd(model_tgt);
         n_embd_dec    = llama_model_n_embd(model_dft);
         n_embd_enc    = (int32_t) target_layer_ids_n * n_embd_tgt;
+
+        auto model_n_pos = [](const llama_model * model) -> uint32_t {
+            const llama_rope_type type = llama_model_rope_type(model);
+            return type == LLAMA_ROPE_TYPE_MROPE || type == LLAMA_ROPE_TYPE_IMROPE ? 4 : 1;
+        };
+        n_pos_tgt = model_n_pos(model_tgt);
+        n_pos_dft = model_n_pos(model_dft);
 
         // read the trained block size from the dflash.block_size metadata key
         block_size = 16;
@@ -1107,32 +1122,47 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // and KV metadata, and verifies shape and CUDA device identity.
         bool device_candidate = has_tokens && n_tokens <= n_ubatch &&
                 n_tokens <= (int32_t) llama_n_ubatch(ctx_tgt) &&
-                batch_in.pos && batch_in.n_seq_id && batch_in.seq_id;
+                batch_in.pos && batch_in.n_seq_id && batch_in.seq_id &&
+                (n_pos_tgt == n_pos_dft || (n_pos_tgt == 4 && n_pos_dft == 1));
 
         if (device_candidate) {
             batch_device.n_tokens = n_tokens;
+            batch_device_pos.resize((size_t) n_tokens * n_pos_tgt);
             for (int32_t i = 0; i < n_tokens; ++i) {
                 if (batch_in.n_seq_id[i] != 1) {
                     device_candidate = false;
                     break;
                 }
-                batch_device.pos[i]       = batch_in.pos[i];
                 batch_device.n_seq_id[i]  = 1;
                 batch_device.seq_id[i][0] = batch_in.seq_id[i][0];
                 batch_device.logits[i]    = false;
+
+                // Target token input is converted by llm_graph_input_pos to
+                // [p,p,p,0] for M/IMROPE. Pass the complete effective vector
+                // to the special API; it will validate before projecting to
+                // the NEOX draft's single text position.
+                for (uint32_t p = 0; p < n_pos_tgt; ++p) {
+                    batch_device_pos[(size_t) p * n_tokens + i] =
+                            n_pos_tgt == 4 && p == 3 ? 0 : batch_in.pos[i];
+                }
             }
         }
 
         if (has_tokens && !device_candidate && !device_guard_reported[device_shape_bucket]) {
-            LOG_INF("%s: device-resident DFlash reject=common_batch_guard bucket=%s n_tokens=%d draft_ubatch=%d target_ubatch=%d metadata=%d\n",
+            LOG_INF("%s: device-resident DFlash reject=common_batch_guard bucket=%s n_tokens=%d draft_ubatch=%d target_ubatch=%d target_n_pos=%u draft_n_pos=%u metadata=%d\n",
                     __func__, device_shape_name, n_tokens, n_ubatch, (int32_t) llama_n_ubatch(ctx_tgt),
+                    n_pos_tgt, n_pos_dft,
                     (int) (batch_in.pos && batch_in.n_seq_id && batch_in.seq_id));
             device_guard_reported[device_shape_bucket] = true;
         }
 
         if (device_candidate) {
             int32_t rc = 0;
-            if (llama_decode_dflash_features(ctx_dft, ctx_tgt, batch_device, &rc)) {
+            llama_pos * batch_device_pos_alloc = batch_device.pos;
+            batch_device.pos = batch_device_pos.data();
+            const bool device_attempted = llama_decode_dflash_features(ctx_dft, ctx_tgt, batch_device, &rc);
+            batch_device.pos = batch_device_pos_alloc;
+            if (device_attempted) {
                 if (rc != 0) {
                     LOG_ERR("%s: device-resident DFlash injection failed rc=%d (n_tokens=%d)\n",
                             __func__, rc, n_tokens);
@@ -1159,6 +1189,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
+                // Embedding batches require plane-major n_tokens*n_pos input,
+                // while llama_batch_init() allocates only n_tokens positions.
+                // DFlash currently uses NEOX (one plane), but keep the host
+                // fallback bounded for future multi-axis draft architectures.
+                batch_inject_pos.resize((size_t) n_chunk * n_pos_dft);
+                for (uint32_t p = 0; p < n_pos_dft; ++p) {
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t src = i_batch_beg[seq_id] + offset + i;
+                        llama_pos value;
+                        if (has_tokens) {
+                            value = n_pos_dft == 4 && p == 3 ? 0 : batch_in.pos[src];
+                        } else {
+                            const uint32_t src_plane = std::min(p, n_pos_tgt - 1);
+                            value = batch_in.pos[(size_t) src_plane * n_tokens + src];
+                        }
+                        batch_inject_pos[(size_t) p * n_chunk + i] = value;
+                    }
+                }
+
                 // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
@@ -1178,7 +1227,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     /*.n_tokens =*/ n_chunk,
                     /*.token    =*/ nullptr,
                     /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ nullptr,
+                    /*.pos      =*/ batch_inject_pos.data(),
                     /*.n_seq_id =*/ nullptr,
                     /*.seq_id   =*/ nullptr,
                     /*.logits   =*/ nullptr,
@@ -1199,12 +1248,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                llama_pos * batch_inject_pos_alloc = batch_inject.pos;
+                batch_inject.pos = batch_inject_pos.data();
                 rc = llama_decode(ctx_dft, batch_inject);
+                batch_inject.pos = batch_inject_pos_alloc;
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);

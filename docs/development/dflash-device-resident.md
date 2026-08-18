@@ -22,6 +22,9 @@ The fast path is used only when all of the following are true:
 - the draft uses unified KV and its actually prepared memory context contains
   the complete logical batch in exactly the retained target-ubatch order;
 - target activations and draft KV metadata use the same retained ubatch order;
+- the complete target position vector and sequence ID match for every row;
+- Qwen3.6's target position is the text-only IMROPE pattern `[p,p,p,0]`,
+  which is validated before projecting `p` to the NEOX DFlash draft;
 - every selected layer input is contiguous F32 with the expected shape;
 - every source tensor and the DFlash fusion weight are on the same CUDA device;
 - positions and sequence IDs match the target batch exactly.
@@ -50,6 +53,15 @@ pointer, shape, and strides. Before allocation, the draft context walks all
 reachable nodes and ancestors. It rejects the graph if a raw target tensor is
 reachable or any detached source leaf is missing, and logs the graph node/leaf
 counts with `target_ancestors=0` on the first validated graph.
+
+Target ubatch metadata is captured directly inside the decode loop before the
+memory context advances. Four-axis positions use the plane-major layout
+`[p0 rows][p1 rows][p2 rows][p3 rows]`. This avoids stale positions when a
+same-shaped graph is reused. The graph result's owned ubatch parameters are
+also refreshed on reuse so diagnostics and guarded host materialization observe
+the current decode. Multimodal target rows never enter the IMROPE-to-NEOX
+projection. Separate plane-major scratch storage is used for embedding batches,
+because the public batch allocator otherwise owns only one position per row.
 
 Guard failures are reported once per low-cardinality reason and batch-shape
 bucket (`single`, `verify` up to 16 rows, or `prompt`) to keep production logs
