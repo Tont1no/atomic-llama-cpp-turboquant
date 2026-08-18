@@ -37,6 +37,29 @@ struct common_speculative_output_limits {
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
+// Select an adaptive per-sequence proposal length. The scheduler is intentionally
+// model-agnostic; callers decide which speculative implementations opt into it.
+// Invalid runtime state fails closed with a zero-token proposal.
+int32_t common_speculative_adaptive_n_max(
+        const common_params_speculative_draft & params,
+        int32_t active_slots,
+        int32_t hard_cap,
+        const std::vector<float> & acceptance_ema,
+        const std::vector<uint64_t> & offered_per_pos);
+
+// Resolve a caller's per-sequence override against the configured model limit.
+// A negative override preserves fixed-depth behavior; zero explicitly disables
+// proposals for that sequence.
+int32_t common_speculative_draft_n_max_for_seq(int32_t configured_n_max, int32_t seq_n_max);
+
+// Update the per-position EMA after target verification. Positions are prefix
+// survival events: a position is accepted only when the accepted prefix reaches it.
+void common_speculative_adaptive_acceptance_update(
+        std::vector<float> & acceptance_ema,
+        size_t n_offered,
+        size_t n_accepted,
+        float alpha);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -66,6 +89,11 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
+
+// Disable or enable an implementation's per-sequence maintenance work. DFlash/
+// DSpark use this to provide a true target-only fallback after an adaptive n=0
+// decision. Other implementations ignore it.
+void common_speculative_set_enabled(common_speculative * spec, llama_seq_id seq_id, bool enabled);
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
