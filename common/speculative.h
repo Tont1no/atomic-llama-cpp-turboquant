@@ -87,6 +87,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional DSpark prefix-survival output. The server owns the vector and
+    // may use it to cap the target verification prefix after the batched draft
+    // pass. Other speculative implementations leave it empty.
+    std::vector<float> * survival = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

@@ -4201,6 +4201,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_WARMUP"));
 
     add_opt(common_arg(
+        {"--spec-draft-sps-profile"}, "FILE",
+        "measured DSpark server-step cost table used by the global prefix planner; "
+        "cannot be combined with --spec-draft-adaptive; unset preserves the existing scheduler",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("SPS profile path must not be empty");
+            }
+            params.speculative.draft.sps_profile = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_PROFILE"));
+    add_opt(common_arg(
+        {"--spec-draft-sps-shadow"},
+        {"--no-spec-draft-sps-shadow"},
+        string_format("compute DSpark SPS plans without applying verification caps (default: %s)",
+                      params.speculative.draft.sps_shadow ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.sps_shadow = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_SPS_SHADOW"));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

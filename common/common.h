@@ -340,6 +340,12 @@ struct common_params_speculative_draft {
     // behavior; deterministic in-process regressions set an explicit value.
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
+    // Optional measured server-step cost table for the DSpark global prefix
+    // planner. An empty path disables SPS and leaves the existing fixed or
+    // adaptive scheduler unchanged.
+    std::string sps_profile;
+    bool sps_shadow = false; // plan and report, but do not cap verification
+
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 

@@ -260,6 +260,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-acceptance-ema ALPHA` | EMA weight for new per-position acceptance samples; 0 disables EMA adaptation (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_EMA) |
 | `--spec-draft-acceptance-threshold P` | minimum warmed-up per-position acceptance EMA (default: 0.55)<br/>(env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_THRESHOLD) |
 | `--spec-draft-acceptance-warmup N` | number of offers required at a position before its EMA can reduce depth (default: 8)<br/>(env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_WARMUP) |
+| `--spec-draft-sps-profile FILE` | measured DSpark server-step cost table used by the global prefix planner; cannot be combined with `--spec-draft-adaptive`; unset preserves the existing scheduler<br/>(env: LLAMA_ARG_SPEC_DRAFT_SPS_PROFILE) |
+| `--spec-draft-sps-shadow, --no-spec-draft-sps-shadow` | compute DSpark SPS plans without applying verification caps (default: disabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_SPS_SHADOW) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |

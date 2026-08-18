@@ -268,6 +268,12 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_none_unknown_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    common_params sps_params;
+    argv = {"binary_name", "--spec-type", "draft-dspark", "--spec-draft-sps-profile", "profile.json", "--spec-draft-sps-shadow"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_params, LLAMA_EXAMPLE_SERVER));
+    assert(sps_params.speculative.draft.sps_profile == "profile.json");
+    assert(sps_params.speculative.draft.sps_shadow);
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
