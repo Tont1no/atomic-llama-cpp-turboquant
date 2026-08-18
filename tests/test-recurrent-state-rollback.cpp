@@ -6,6 +6,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
@@ -39,13 +40,28 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+    // The complete test also exercises a second rollback/replay cycle. Some
+    // architectures currently fail that independent baseline behavior. Keep a
+    // narrow mode for validating one rollback plus a full checkpoint roundtrip.
+    bool full_restore_only = false;
+    std::vector<char *> common_argv;
+    common_argv.reserve(argc);
+    common_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--full-restore-only") == 0) {
+            full_restore_only = true;
+        } else {
+            common_argv.push_back(argv[i]);
+        }
+    }
+
     common_params params;
     params.sampling.seed = 1234;
     params.n_predict = 1;
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse((int) common_argv.size(), common_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
@@ -121,8 +137,8 @@ int main(int argc, char ** argv) {
     ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr float eps = 1e-5f;
-    std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    std::vector<std::vector<float>> logits_full_replay(n_rollback);
+    const auto replay_and_compare = [&](const char * mode, bool capture_full) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
             if (!decode_one(ctx_src, tokens[pos], pos) ||
@@ -138,7 +154,18 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            if (capture_full) {
+                logits_full_replay[i].assign(logits_src, logits_src + n_vocab);
+            } else {
+                for (int token = 0; token < n_vocab; ++token) {
+                    if (std::fabs(logits_full_replay[i][token] - logits_src[token]) > eps) {
+                        fprintf(stderr, "%s : %s source differs from full replay at position %d, token %d (%g != %g)\n",
+                                __func__, mode, pos, token,
+                                (double) logits_full_replay[i][token], (double) logits_src[token]);
+                        return false;
+                    }
+                }
+            }
             for (int token = 0; token < n_vocab; ++token) {
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
@@ -149,22 +176,7 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
-    if (!replay_and_compare("full")) {
-        return 1;
-    }
-
-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
-        return 1;
-    }
-
-    constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    common_prompt_checkpoint ckpt_partial;
-    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
-    ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
-
-    if (!replay_and_compare("partial")) {
+    if (!replay_and_compare("full", true)) {
         return 1;
     }
 
@@ -209,17 +221,44 @@ int main(int argc, char ** argv) {
         }
 
         for (int token = 0; token < n_vocab; ++token) {
-            if (std::fabs(logits_src_replay[i][token] - logits_dirty[token]) > eps) {
+            if (std::fabs(logits_full_replay[i][token] - logits_dirty[token]) > eps) {
                 fprintf(stderr, "%s : dirty-ctx logits mismatch at position %d, token %d (%g != %g)\n",
-                        __func__, pos, token, (double) logits_src_replay[i][token], (double) logits_dirty[token]);
+                        __func__, pos, token, (double) logits_full_replay[i][token], (double) logits_dirty[token]);
                 return 1;
             }
         }
     }
 
+    llama_free(ctx_dirty);
+
+    if (full_restore_only) {
+        fprintf(stderr, "%s : recurrent full rollback checkpoint restored successfully\n", __func__);
+        llama_free(ctx_src);
+        llama_free(ctx_dst);
+        return 0;
+    }
+
+    // A second rollback after replaying each token in its own decode call does
+    // not have a valid multi-token snapshot history on all recurrent models.
+    // Keep this coverage in the complete test, but do not use it for the narrow
+    // full-checkpoint correctness gate above.
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
+        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
+        fprintf(stderr, "%s : partial rollback failed\n", __func__);
+        return 1;
+    }
+
+    constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    common_prompt_checkpoint ckpt_partial;
+    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
+    ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+
+    if (!replay_and_compare("partial", false)) {
+        return 1;
+    }
+
     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
     llama_free(ctx_src);
     llama_free(ctx_dst);
-    llama_free(ctx_dirty);
     return 0;
 }
