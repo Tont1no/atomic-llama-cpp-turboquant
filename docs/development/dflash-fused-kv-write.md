@@ -48,16 +48,21 @@ later replays remain fused but do not increment the host-side total.
 
 `GGML_CUDA_DFLASH_K_VALIDATE=1` enables a diagnostic, fail-fast self-check for
 the eight-node Q4_0/Q8_0 path.  For each matching dispatch it executes the
-exact normal fallback sequence (fused RMS/MUL/ROPE, standalone FWHT, ordinary
-`SET_ROWS`), copies only the indexed cache rows to the host, poisons every byte
-of those rows with the inverse reference value, then executes the direct fused
-writer and compares the raw quantized bytes.  A mismatch logs the global cache
-row, byte offset, values, and hashes before aborting.  The poison prevents an
-incomplete fused write from inheriting reference bytes and falsely passing.
+direct fused writer first, then executes the exact normal fallback sequence
+(three-op fused, two-op RMS/MUL fused, or individual RMS/MUL/ROPE according to
+the same runtime fusion priority, standalone FWHT, ordinary `SET_ROWS`) and compares only
+the indexed raw quantized cache rows. Direct-first ordering is required because
+the graph allocator may reuse the dead RMS input allocation for a later FWHT
+intermediate; fallback-first would then corrupt the input before the diagnostic
+direct launch. The direct writer is repeated after poisoning its destination
+with inverse bytes, and the fallback is run after another poison, so both paths
+must deterministically overwrite every compared byte. A mismatch logs the
+global cache row, byte offset, values, and hashes before aborting.
 
-The focused cases use seven deterministic, permuted global row IDs in a
-37-row cache, so they cover sparse/wrapped multi-sequence-style placement
-rather than only dense rows 0 through 6.  Validation synchronizes the CUDA
+The focused cases use deterministic, permuted global row IDs in both a small
+seven-token/37-row cache and a model-like 286-token/313-row cache. They cover
+sparse/wrapped multi-sequence-style placement, transient source allocation and
+allocator reuse rather than only dense rows. Validation synchronizes the CUDA
 stream and is incompatible with graph capture, so it must never be used for a
 performance result:
 
@@ -66,7 +71,7 @@ $env:GGML_CUDA_DFLASH_K_VALIDATE = '1'
 $env:GGML_CUDA_DISABLE_GRAPHS = '1'
 & .\build-fused-sm120\bin\Release\test-backend-ops.exe `
   -b CUDA0 -o RMS_NORM_MUL_ROPE `
-  -p 'cache_type=(q4_0|q8_0).*use_fwht=1,cache_rows=37'
+  -p 'cache_type=(q4_0|q8_0).*use_fwht=1,cache_rows=(37|313)'
 Remove-Item Env:GGML_CUDA_DFLASH_K_VALIDATE
 Remove-Item Env:GGML_CUDA_DISABLE_GRAPHS
 ```

@@ -3457,9 +3457,10 @@ static ggml_cuda_dflash_k_snapshot ggml_cuda_dflash_k_snapshot_rows(
 }
 
 // Debug-only, fail-fast byte comparison against the exact fallback selected
-// when GGML_CUDA_DFLASH_K_FUSION=0: fused RMS/MUL/ROPE, standalone FWHT, then
-// ordinary quantized SET_ROWS.  It intentionally synchronizes and must never
-// be enabled for performance measurements.
+// when GGML_CUDA_DFLASH_K_FUSION=0: runtime-selected 3-op/2-op/generic
+// RMS/MUL/ROPE, standalone FWHT, then ordinary quantized SET_ROWS. It
+// intentionally synchronizes and must never be enabled for performance
+// measurements.
 static void ggml_cuda_validate_dflash_k_fwht_fusion(
         ggml_backend_cuda_context * cuda_ctx,
         ggml_tensor * rms_norm,
@@ -3467,34 +3468,86 @@ static void ggml_cuda_validate_dflash_k_fwht_fusion(
         ggml_tensor * rope,
         ggml_tensor * reshape_pre,
         ggml_tensor * fwht,
-        ggml_tensor * set_rows) {
+        ggml_tensor * set_rows,
+        bool fallback_fuses_rms_norm_mul_rope,
+        bool fallback_fuses_rms_norm_mul) {
     cudaStreamCaptureStatus capture_status;
     CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &capture_status));
     if (capture_status != cudaStreamCaptureStatusNone) {
         GGML_ABORT("GGML_CUDA_DFLASH_K_VALIDATE requires GGML_CUDA_DISABLE_GRAPHS=1");
     }
 
-    ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, nullptr);
-    GGML_ASSERT(ggml_cuda_op_fwht(*cuda_ctx, reshape_pre, fwht));
-    ggml_cuda_op_set_rows(*cuda_ctx, set_rows);
-    const ggml_cuda_dflash_k_snapshot legacy = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a_beg = reinterpret_cast<uintptr_t>(a->data);
+        const uintptr_t b_beg = reinterpret_cast<uintptr_t>(b->data);
+        const uintptr_t a_end = a_beg + ggml_nbytes(a);
+        const uintptr_t b_end = b_beg + ggml_nbytes(b);
+        return a_beg < b_end && b_beg < a_end;
+    };
+    const ggml_tensor * x = rms_norm->src[0];
+    const bool alias_rope = overlaps(x, rope);
+    const bool alias_fwht = overlaps(x, fwht);
+    static std::atomic<bool> alias_reported{false};
+    if ((alias_rope || alias_fwht) && !alias_reported.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_INFO("ggml_cuda: DFlash-K validator detected allocator source reuse: rope=%d, FWHT=%d; "
+                      "using direct-first comparison, fallback RMS/MUL/ROPE fusion=%d, RMS/MUL fusion=%d\n",
+                (int) alias_rope, (int) alias_fwht,
+                (int) fallback_fuses_rms_norm_mul_rope, (int) fallback_fuses_rms_norm_mul);
+    }
 
-    // Poison every target byte with the inverse of its legacy result before
-    // launching the fused writer.  Without this, an incomplete fused write
-    // could inherit bytes from SET_ROWS and falsely pass the comparison.
-    std::vector<uint8_t> poison = legacy.data;
+    const ggml_cuda_dflash_k_snapshot initial = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    auto poison_rows = [&](const std::vector<uint8_t> & poison) {
+        GGML_ASSERT(poison.size() == initial.data.size());
+        for (size_t i = 0; i < initial.rows.size(); ++i) {
+            char * dst = static_cast<char *>(set_rows->data) + initial.rows[i]*set_rows->nb[1];
+            CUDA_CHECK(cudaMemcpyAsync(dst, poison.data() + i*set_rows->nb[1],
+                    set_rows->nb[1], cudaMemcpyDefault, cuda_ctx->stream()));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    };
+
+    // Run the direct writer first. In real model graphs, the allocator may
+    // legally reuse the now-dead RMS input allocation for rope/FWHT outputs.
+    // Running the materialized fallback first can therefore overwrite x and
+    // make a subsequent fused launch consume corrupted input, even though the
+    // actual fused graph would consume x before any intermediate exists.
+    poison_rows(std::vector<uint8_t>(initial.data.size(), 0xA5));
+    ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, set_rows, true);
+    const ggml_cuda_dflash_k_snapshot fused = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+
+    // A second direct pass from inverse bytes proves that the fused writer
+    // overwrites every compared byte while x is still pristine.
+    std::vector<uint8_t> poison = fused.data;
     for (uint8_t & value : poison) {
         value = ~value;
     }
-    for (size_t i = 0; i < legacy.rows.size(); ++i) {
-        char * dst = static_cast<char *>(set_rows->data) + legacy.rows[i]*set_rows->nb[1];
-        CUDA_CHECK(cudaMemcpyAsync(dst, poison.data() + i*set_rows->nb[1],
-                set_rows->nb[1], cudaMemcpyDefault, cuda_ctx->stream()));
-    }
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-
+    poison_rows(poison);
     ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, set_rows, true);
-    const ggml_cuda_dflash_k_snapshot fused = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    const ggml_cuda_dflash_k_snapshot fused_repeat = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
+    if (fused.data != fused_repeat.data) {
+        GGML_ABORT("DFlash-K fused cache writer did not deterministically overwrite every byte");
+    }
+
+    // Poison again before the materialized fallback so that path must also
+    // overwrite every destination byte.
+    poison_rows(poison);
+    if (fallback_fuses_rms_norm_mul_rope) {
+        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, rms_norm, mul, rope, nullptr);
+    } else if (fallback_fuses_rms_norm_mul) {
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, rms_norm, mul);
+        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, rope));
+    } else {
+        // Match the actual fusion-disabled graph traversal. In particular,
+        // the three-node fusion is rejected when its rope output aliases an
+        // external input allocation, even though the eight-node direct cache
+        // writer remains safe because it only writes the cache.
+        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, rms_norm));
+        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, mul));
+        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, rope));
+    }
+    GGML_ASSERT(ggml_cuda_op_fwht(*cuda_ctx, reshape_pre, fwht));
+    ggml_cuda_op_set_rows(*cuda_ctx, set_rows);
+    const ggml_cuda_dflash_k_snapshot legacy = ggml_cuda_dflash_k_snapshot_rows(cuda_ctx, set_rows);
 
     GGML_ASSERT(legacy.rows == fused.rows && legacy.data.size() == fused.data.size());
     const auto mismatch = std::mismatch(legacy.data.begin(), legacy.data.end(), fused.data.begin());
@@ -4209,9 +4262,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // only.  Other devices execute the original eight-node graph.
         if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL) {
             if (cuda_ctx->dflash_k_validate) {
+                const bool fallback_fuses_rms_norm_mul_rope = ggml_cuda_can_fuse(
+                        cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {});
+                const bool fallback_fuses_rms_norm_mul = ggml_cuda_can_fuse(
+                        cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {});
                 ggml_cuda_validate_dflash_k_fwht_fusion(cuda_ctx, node, cgraph->nodes[i + 1],
                         cgraph->nodes[i + 2], cgraph->nodes[i + 3], cgraph->nodes[i + 4],
-                        cgraph->nodes[i + 7]);
+                        cgraph->nodes[i + 7], fallback_fuses_rms_norm_mul_rope,
+                        fallback_fuses_rms_norm_mul);
             } else {
                 ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
                         cgraph->nodes[i + 2], cgraph->nodes[i + 7], true);

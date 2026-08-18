@@ -2664,8 +2664,16 @@ struct test_rms_norm_mul_rope : public test_case {
                 // cache range, representative of unified multi-sequence/iSWA
                 // global row IDs rather than the old dense [0,n_tokens) case.
                 for (int64_t i = 0; i < t->ne[0]; ++i) {
-                    rows[i] = i == 0 ? cache_rows - 1 : i == 1 ? 0 : (31 + 17*(i - 2)) % cache_rows;
+                    // Keep endpoints explicit and generate the remaining
+                    // permutation strictly inside [1, cache_rows - 2]. This
+                    // avoids duplicate SET_ROWS destinations in long cases.
+                    rows[i] = i == 0 ? cache_rows - 1 :
+                              i == 1 ? 0 :
+                              1 + (31 + 17*(i - 2)) % (cache_rows - 2);
                 }
+                std::vector<int64_t> sorted_rows = rows;
+                std::sort(sorted_rows.begin(), sorted_rows.end());
+                GGML_ASSERT(std::adjacent_find(sorted_rows.begin(), sorted_rows.end()) == sorted_rows.end());
                 ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(int64_t));
             } else if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
                 if (ggml_is_view_op(t->op)) {
@@ -9076,6 +9084,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_rope(
                 {128, 8, 7, 1}, 1e-6f, false, true, true,
                 GGML_ROPE_TYPE_NEOX, cache_type, true, 37));
+        // Model-like transient producer and prompt-sized token count. The
+        // allocator may reuse the dead producer allocation for a later FWHT
+        // intermediate, which regresses validation ordering and source aliasing.
+        test_cases.emplace_back(new test_rms_norm_mul_rope(
+                {128, 8, 286, 1}, 1e-6f, true, true, true,
+                GGML_ROPE_TYPE_NEOX, cache_type, true, 313));
     }
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
