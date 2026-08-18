@@ -104,6 +104,7 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
     void commit_rs_depth(const llama_ubatch & ubatch, uint32_t active_depth);
+    void invalidate_rs_depth(const llama_ubatch & ubatch);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -211,6 +212,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void finalize(bool success) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -259,3 +261,13 @@ uint32_t llama_recurrent_batch_active_rs_depth(
         uint32_t configured_max,
         uint32_t n_seq_max,
         bool * used_fallback = nullptr);
+
+// Pure fail-closed rollback guard shared by the cache implementation and
+// metadata tests. Dynamic contexts may address a snapshot only when both the
+// physical plane and the per-sequence last-written depth still cover it.
+bool llama_recurrent_rollback_is_valid(
+        bool dynamic,
+        uint32_t rollback,
+        uint32_t configured_max,
+        uint32_t resident_depth,
+        uint32_t valid_depth);

@@ -57,7 +57,9 @@ bool llama_memory_status_is_fail(llama_memory_status status);
 //   - llama_kv_cache_iswa_context
 //   ...
 //
-// the only method that should mutate the memory and the memory context is llama_memory_i::apply()
+// apply() stages the memory state before graph construction. finalize() closes
+// that transaction after graph construction/allocation and compute submission
+// have succeeded or failed. Most memory types do not need a post-submit action.
 struct llama_memory_context_i {
     virtual ~llama_memory_context_i() = default;
 
@@ -68,6 +70,12 @@ struct llama_memory_context_i {
     // apply the memory state for the current ubatch to the memory object
     // return false on failure
     virtual bool apply() = 0;
+
+    // finalize the current ubatch after apply(). Called exactly once when
+    // apply() was attempted, including graph-build/allocation/submit failures.
+    virtual void finalize(bool success) {
+        (void) success;
+    }
 
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;

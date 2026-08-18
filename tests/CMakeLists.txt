@@ -157,6 +157,7 @@ llama_test(test-dspark-packed)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    target_compile_definitions(test-recurrent-state-rollback PRIVATE LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE=1)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)

@@ -43,17 +43,7 @@ using json = nlohmann::ordered_json;
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static bool server_speculative_is_only_dspark(const std::vector<common_speculative_type> & types) {
-    int n_enabled = 0;
-    for (const auto type : types) {
-        if (type == COMMON_SPECULATIVE_TYPE_NONE) {
-            continue;
-        }
-        if (type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
-            return false;
-        }
-        ++n_enabled;
-    }
-    return n_enabled == 1;
+    return common_speculative_is_only_dspark(types);
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1343,6 +1333,11 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        // Seed recurrent gauges before the first decode. Later decode-boundary
+        // updates keep this cached snapshot current without racing a yielded
+        // metrics worker against prepare_batch()/finalize().
+        metrics_update_recurrent();
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -2681,6 +2676,13 @@ private:
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
+                    // During queue yielding, llama_decode() may be mutating
+                    // recurrent resize fields on the main thread. Read the
+                    // cached decode-boundary snapshot instead of racing it.
+                    if (!is_yielding) {
+                        metrics_update_recurrent();
+                    }
+
                     json slots_data = json::array();
 
                     int n_idle_slots       = 0;
@@ -4560,10 +4562,14 @@ private:
 
     // call before submitting a decode, so that the queued prompt stats can be timed
     void metrics_update_recurrent() {
+        if (ctx_tgt == nullptr) {
+            return;
+        }
         const llama_recurrent_resize_stats rs_stats = llama_get_recurrent_resize_stats(ctx_tgt);
         metrics.n_recurrent_resizes            = rs_stats.count;
         metrics.t_recurrent_resize_us          = rs_stats.time_us;
         metrics.recurrent_resident_depth       = rs_stats.resident_depth;
+        metrics.recurrent_configured_depth     = rs_stats.configured_depth;
         metrics.recurrent_required_depth       = rs_stats.required_depth;
         metrics.recurrent_pending_depth        = rs_stats.pending_depth;
         metrics.recurrent_shrink_stable_ticks  = rs_stats.stable_ticks;

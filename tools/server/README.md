@@ -1103,6 +1103,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:recurrent_snapshot_resizes_total` | Counter | Dynamic recurrent snapshot storage reallocations. |
 | `llamacpp:recurrent_snapshot_resize_seconds_total` | Counter | Time spent synchronizing and reallocating recurrent snapshot storage. |
 | `llamacpp:recurrent_snapshot_resident_depth` | Gauge | Currently resident recurrent rollback depth. |
+| `llamacpp:recurrent_snapshot_configured_depth` | Gauge | Configured maximum recurrent rollback depth. |
 | `llamacpp:recurrent_snapshot_required_depth` | Gauge | Latest correctness-required recurrent rollback depth. |
 | `llamacpp:recurrent_snapshot_pending_depth` | Gauge | Pending shrink depth, or -1 when no shrink is pending. |
 | `llamacpp:recurrent_snapshot_shrink_stable_ticks` | Gauge | Distinct stable scheduling epochs observed for the pending shrink. |

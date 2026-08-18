@@ -2,6 +2,12 @@
 #include "common.h"
 #include "llama.h"
 #include "llama-ext.h"
+#if defined(LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE)
+#include "llama-batch.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -40,6 +46,104 @@ static std::vector<uint32_t> tag_recurrent_depth(llama_batch & batch, size_t n_r
     batch.rs_depth = depths.data();
     return depths;
 }
+
+#if defined(LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE)
+static llama_memory_recurrent * get_recurrent_memory(llama_context * ctx) {
+    llama_memory_i * memory = llama_get_memory(ctx);
+    if (auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory)) {
+        return recurrent;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
+        return hybrid->get_mem_recr();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory)) {
+        return hybrid_iswa->get_mem_recr();
+    }
+    return nullptr;
+}
+
+static bool staged_growth_failure_fails_closed(
+        const common_params & params,
+        llama_model * model) {
+    llama_context * ctx = make_ctx(params, model, 1, true);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    llama_memory_recurrent * memory = get_recurrent_memory(ctx);
+    if (memory == nullptr) {
+        fprintf(stderr, "%s : missing recurrent memory\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    llama_batch planning = llama_batch_init(4, 0, 1);
+    auto planning_depths = tag_recurrent_depth(planning, 4, 3);
+    for (llama_pos p = 0; p < 4; ++p) {
+        common_batch_add(planning, 1, p, { 0 }, p == 3);
+    }
+    const bool prepared = memory->prepare_batch(ctx, planning, false);
+    llama_batch_free(planning);
+    if (!prepared || memory->n_rs_seq_alloc < 3) {
+        fprintf(stderr, "%s : failed to prepare resident growth\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    std::array<llama_pos, 4> pos = { 0, 1, 2, 3 };
+    std::array<int32_t, 4> n_seq_id = { 1, 1, 1, 1 };
+    std::array<llama_seq_id, 4> seq_id_data = { 0, 0, 0, 0 };
+    std::array<llama_seq_id *, 4> seq_id = {};
+    for (llama_pos pos = 0; pos < 4; ++pos) {
+        seq_id[pos] = &seq_id_data[pos];
+    }
+
+    llama_ubatch ubatch = {};
+    ubatch.b_equal_seqs = 1;
+    ubatch.n_tokens = 4;
+    ubatch.n_seq_tokens = 4;
+    ubatch.n_seqs = 1;
+    ubatch.n_seqs_unq = 1;
+    ubatch.n_pos = 1;
+    ubatch.pos = pos.data();
+    ubatch.n_seq_id = n_seq_id.data();
+    ubatch.seq_id = seq_id.data();
+
+    // Seed a previously successful depth so failure invalidation proves it
+    // clears stale validity rather than merely preserving the initial zero.
+    memory->commit_rs_depth(ubatch, 3);
+    if (memory->rs_valid_depth.empty() || memory->rs_valid_depth[0] != 3) {
+        fprintf(stderr, "%s : failed to seed prior valid snapshot depth\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    // Exercise the exact apply -> graph failure transaction without the
+    // public decode wrapper's automatic seq_rm cleanup hiding validity state.
+    llama_memory_recurrent_context staged(memory, { ubatch }, 3);
+    if (!staged.apply()) {
+        fprintf(stderr, "%s : failed to stage recurrent metadata\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    staged.finalize(false);
+
+    if (memory->rs_valid_depth.empty() || memory->rs_valid_depth[0] != 0) {
+        fprintf(stderr, "%s : failed graph left planned snapshots valid\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    if (memory->seq_rm(0, 1, -1)) {
+        fprintf(stderr, "%s : rollback accepted a snapshot from an aborted graph\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    memory->clear(false);
+    llama_free(ctx);
+    return true;
+}
+#endif
 
 static bool decode_ragged_and_compare(
         const common_params & params,
@@ -514,6 +618,12 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
+
+#if defined(LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE)
+    if (!staged_growth_failure_fails_closed(params, model)) {
+        return 1;
+    }
+#endif
 
     if (!decode_ragged_and_compare(params, model, n_vocab)) {
         return 1;

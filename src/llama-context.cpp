@@ -881,7 +881,9 @@ bool llama_context::memory_update(bool optimize) {
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
 
-        if (!mctx->apply()) {
+        const bool applied = mctx->apply();
+        mctx->finalize(applied);
+        if (!applied) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
         }
     }
@@ -1410,6 +1412,7 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
+        mctx->finalize(false);
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1450,6 +1453,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
+            if (mctx) {
+                mctx->finalize(false);
+            }
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
@@ -1518,6 +1524,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             const bool all_imported = n_imported == (int) imported.size();
             if (source_reachable || !all_imported) {
+                if (mctx) {
+                    mctx->finalize(false);
+                }
                 LLAMA_LOG_ERROR("%s: unsafe DFlash external graph (nodes=%d, leafs=%d, imported=%d/%d, source_reachable=%d)\n",
                         __func__, n_nodes, n_leafs_reachable, n_imported,
                         (int) imported.size(), (int) source_reachable);
@@ -1533,6 +1542,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            if (mctx) {
+                mctx->finalize(false);
+            }
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1551,12 +1563,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        if (mctx) {
+            mctx->finalize(false);
+        }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (mctx) {
+        mctx->finalize(true);
+    }
 
     return res;
 }
@@ -4535,6 +4554,7 @@ void llama_context::opt_epoch_iter(
             n_outputs = ubatch.n_tokens;
 
             if (!mctx->apply()) {
+                mctx->finalize(false);
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
                 break;
             }
@@ -4574,6 +4594,7 @@ void llama_context::opt_epoch_iter(
                 }
             }
             ggml_opt_eval(opt_ctx, result);
+            mctx->finalize(true);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }

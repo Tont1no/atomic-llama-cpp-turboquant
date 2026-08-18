@@ -1652,6 +1652,10 @@ std::string server_task_result_metrics::to_metrics() {
             "Currently resident recurrent rollback depth",
             (double) metrics.recurrent_resident_depth
         }, {
+            "recurrent_snapshot_configured_depth",
+            "Configured maximum recurrent rollback depth",
+            (double) metrics.recurrent_configured_depth
+        }, {
             "recurrent_snapshot_required_depth",
             "Latest correctness-required recurrent rollback depth",
             (double) metrics.recurrent_required_depth

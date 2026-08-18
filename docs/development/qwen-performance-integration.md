@@ -11,8 +11,8 @@ model files, or the measured-regression experiments.
 | --- | --- | --- |
 | Device-resident DFlash feature injection | `73c6d7f58` | Guarded fast path; host path remains the automatic fallback |
 | Load-adaptive DFlash/DSpark proposal length | `c7943bf4c` | Experimental, disabled by default |
-| Active recurrent execution depth | `24b8479a9` | Used only by the adaptive DFlash-family path |
-| Compact recurrent snapshot storage and per-row depth | `9af282e74` | Used only by the adaptive DFlash-family path; requires all callers to be rebuilt |
+| Active recurrent execution depth | `24b8479a9` | Adaptive DFlash-family and pure packed DSpark paths |
+| Compact recurrent snapshot storage and per-row depth | `9af282e74` | Adaptive DFlash-family and pure packed DSpark paths; requires all callers to be rebuilt |
 | Native ModelOpt E4M3 matmul | `620079c4e` | Experimental, model-conversion opt-in, SM120 and CUDA 13.2 build required |
 | Official Qwen DSpark draft schema | `a593261bc` | Adds the `DSparkDraftModel` alias and forwards `output_in_s` correctly |
 
@@ -56,9 +56,10 @@ server:
 ```
 
 Disable it with `--no-spec-draft-adaptive` or the environment value
-`LLAMA_ARG_SPEC_DRAFT_ADAPTIVE=0`. Disabling adaptive scheduling also disables
-dynamic recurrent execution depth and compact recurrent snapshot resizing;
-the configured fixed rollback layout is retained.
+`LLAMA_ARG_SPEC_DRAFT_ADAPTIVE=0`. DFlash then retains the configured fixed
+rollback layout. A pure DSpark chain continues to use dynamic recurrent depth
+because its fixed, SPS-planned, shadow, and recorder batches all carry exact
+packed per-row depth metadata. Remove `draft-dspark` to disable that path.
 
 The load-cap entries correspond to one, two, and subsequent active slots. Only
 `0`, `1`, `2`, `3`, and `7` are valid caps. Acceptance-based EMA adaptation is

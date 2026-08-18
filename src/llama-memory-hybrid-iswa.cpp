@@ -281,6 +281,11 @@ bool llama_memory_hybrid_iswa_context::apply() {
     return res;
 }
 
+void llama_memory_hybrid_iswa_context::finalize(bool success) {
+    ctx_attn->finalize(success);
+    ctx_recr->finalize(success);
+}
+
 llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
     return status;
 }
