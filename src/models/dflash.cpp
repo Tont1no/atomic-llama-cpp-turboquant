@@ -224,15 +224,20 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_build_forward_expand(gf, cur);
 }
 
-static ggml_tensor * dflash_import_external_leaf(ggml_context * ctx, const ggml_tensor * source) {
+static ggml_tensor * dflash_import_external_leaf(
+        ggml_context * ctx,
+        const ggml_tensor * source,
+        int64_t n_tokens) {
     GGML_ASSERT(source && source->buffer && source->data && ggml_is_contiguous(source));
+    GGML_ASSERT(source->ne[1] >= n_tokens && source->ne[2] == 1 && source->ne[3] == 1);
 
-    ggml_tensor * leaf = ggml_dup_tensor(ctx, source);
+    // A split target decode exposes a persistent capacity tensor. Import only
+    // the exact populated prefix as an op-less leaf while keeping the stable
+    // source pointer in graph-reuse eligibility.
+    ggml_tensor * leaf = ggml_new_tensor_2d(ctx, source->type, source->ne[0], n_tokens);
     leaf->buffer = source->buffer;
     leaf->data   = source->data;
-    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-        leaf->nb[d] = source->nb[d];
-    }
+    GGML_ASSERT(leaf->nb[0] == source->nb[0] && leaf->nb[1] == source->nb[1]);
 
     GGML_ASSERT(leaf->op == GGML_OP_NONE && leaf->view_src == nullptr);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
@@ -355,14 +360,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     // KV cache injection
-    if (ubatch.embd) {
+    if (ubatch.embd || !params.external_layer_inputs.empty()) {
         ggml_tensor * inp_g = nullptr;
         if (!params.external_layer_inputs.empty()) {
+            GGML_ASSERT(!ubatch.token && !ubatch.embd);
             GGML_ASSERT(params.external_layer_inputs.size() == model.target_layer_ids.size());
 
-            inp_g = dflash_import_external_leaf(ctx0, params.external_layer_inputs[0]);
+            inp_g = dflash_import_external_leaf(ctx0, params.external_layer_inputs[0], n_tokens);
             for (size_t i = 1; i < params.external_layer_inputs.size(); ++i) {
-                ggml_tensor * leaf = dflash_import_external_leaf(ctx0, params.external_layer_inputs[i]);
+                ggml_tensor * leaf = dflash_import_external_leaf(ctx0, params.external_layer_inputs[i], n_tokens);
                 inp_g = ggml_concat(ctx0, inp_g, leaf, 0);
             }
             cb(inp_g, "inp_target_features", -1);
@@ -557,14 +563,15 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
     // KV cache injection: fused target features from the encoder
-    if (ubatch.embd) {
+    if (ubatch.embd || !params.external_layer_inputs.empty()) {
         ggml_tensor * inp_g = nullptr;
         if (!params.external_layer_inputs.empty()) {
+            GGML_ASSERT(!ubatch.token && !ubatch.embd);
             GGML_ASSERT(params.external_layer_inputs.size() == model.target_layer_ids.size());
 
-            inp_g = dflash_import_external_leaf(ctx0, params.external_layer_inputs[0]);
+            inp_g = dflash_import_external_leaf(ctx0, params.external_layer_inputs[0], n_tokens);
             for (size_t i = 1; i < params.external_layer_inputs.size(); ++i) {
-                ggml_tensor * leaf = dflash_import_external_leaf(ctx0, params.external_layer_inputs[i]);
+                ggml_tensor * leaf = dflash_import_external_leaf(ctx0, params.external_layer_inputs[i], n_tokens);
                 inp_g = ggml_concat(ctx0, inp_g, leaf, 0);
             }
             cb(inp_g, "inp_target_features", -1);

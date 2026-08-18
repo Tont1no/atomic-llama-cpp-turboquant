@@ -1,8 +1,10 @@
 # DFlash device-resident feature injection
 
-This private-fork fast path removes the host staging loop from the steady-state
-DFlash and DSpark generation path. Selected target layer inputs are imported as
-preallocated graph leaves by the draft context. The draft graph performs:
+This private-fork fast path removes the host staging loop from the guarded
+DFlash generation path. Selected target layer inputs are imported as
+preallocated graph leaves by the draft context. DSV4 DSpark remains on the
+host path, but batches active sequences into one encoder/injection pair. The
+DFlash device graph performs:
 
 1. feature concatenation;
 2. the DFlash `fc` projection and encoder RMS normalization;
@@ -16,8 +18,9 @@ copied through host memory on the guarded path.
 
 The fast path is used only when all of the following are true:
 
-- the target batch contains token IDs and the complete logical batch fits in a
-  single retained target graph;
+- the target batch contains token IDs and the complete logical batch fits in
+  the target ubatch limit; a single target UBatch stays zero-copy, while a
+  hybrid/recurrent split is assembled in same-device staging;
 - the logical target and draft batches each fit in one ubatch;
 - the draft uses unified KV and its actually prepared memory context contains
   the complete logical batch in exactly the retained target-ubatch order;
@@ -30,8 +33,8 @@ The fast path is used only when all of the following are true:
 - positions and sequence IDs match the target batch exactly.
 
 If any check fails, `common/speculative.cpp` executes the previous encoder and
-host injection path. Target feature extraction is deferred only for eligible
-single-ubatch batches. If the device path is rejected, all retained target
+host injection path. Target host extraction is deferred only for eligible
+bounded batches. If the device path is rejected, all retained target
 tensors are materialized together before continuing the fallback, preserving
 the established recurrent output reordering behavior.
 
@@ -62,6 +65,26 @@ also refreshed on reuse so diagnostics and guarded host materialization observe
 the current decode. Multimodal target rows never enter the IMROPE-to-NEOX
 projection. Separate plane-major scratch storage is used for embedding batches,
 because the public batch allocator otherwise owns only one position per row.
+The external injection call itself carries no token or embedding payload: its
+batch contains only positions and sequence metadata, while the retained target
+tensors are the feature payload. This avoids both the persistent
+`n_batch * n_embd_enc` dummy allocation and the per-call
+`n_tokens * n_embd_enc` host copy.
+
+If Qwen's hybrid/recurrent memory splits an uneven multi-sequence verification
+batch, each actual target UBatch is copied immediately into a target-owned CUDA
+staging buffer at its logical row offset. Full IMROPE metadata is written in the
+same order. The external graph imports only the populated prefix, while the
+persistent capacity-tensor pointer remains stable for graph reuse. Allocation,
+layout, backend, or copy preflight failures fall closed to the per-UBatch host
+path; a partial stage is never published as device-ready. Uniform one-UBatch
+decodes retain the original zero-copy path.
+
+When device injection is unavailable, uniform verification batches can still
+inject every active sequence in one host encoder/decode pair. The feature
+encoder is row-independent and the cache decode receives the original position
+and sequence ID for every row. Prompt, mixed-logit, and oversized batches keep
+the established chunked fallback.
 
 Guard failures are reported once per low-cardinality reason and batch-shape
 bucket (`single`, `verify` up to 16 rows, or `prompt`) to keep production logs
