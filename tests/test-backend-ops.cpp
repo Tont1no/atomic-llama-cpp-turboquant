@@ -2581,10 +2581,12 @@ struct test_rope_set_rows : public test_case {
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ROPE (+ GGML_OP_VIEW + GGML_OP_SET_ROWS)
 struct test_rms_norm_mul_rope : public test_case {
     const std::array<int64_t, 4> ne;
+    const ggml_type cache_type;
     const float eps;
     const bool multi_add; // test a sequence of adds feeding into rms_norm
     const bool set_rows;
     const bool broadcast; // multiply by a 1D [ne0] weight, as model norm weights are
+    const bool use_fwht;
     int mode;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -2595,12 +2597,14 @@ struct test_rms_norm_mul_rope : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR6(ne, eps, multi_add, set_rows, broadcast, mode);
+        return VARS_TO_STR8(ne, cache_type, eps, multi_add, set_rows, broadcast, use_fwht, mode);
     }
 
     test_rms_norm_mul_rope(std::array<int64_t, 4> ne, float eps = 1e-6f, bool multi_add = false,
-                           bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL)
-        : ne(ne), eps(eps), multi_add(multi_add), set_rows(set_rows), broadcast(broadcast), mode(mode) {}
+                           bool set_rows = false, bool broadcast = false, int mode = GGML_ROPE_TYPE_NORMAL,
+                           ggml_type cache_type = GGML_TYPE_F16, bool use_fwht = false)
+        : ne(ne), cache_type(cache_type), eps(eps), multi_add(multi_add), set_rows(set_rows),
+          broadcast(broadcast), use_fwht(use_fwht), mode(mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], 1);
@@ -2619,12 +2623,22 @@ struct test_rms_norm_mul_rope : public test_case {
 
         ggml_tensor * rope = ggml_rope(ctx, a, pos, ne[0], mode);
 
+        if (use_fwht) {
+            GGML_ASSERT(ne[0] == 128);
+            ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne[0], ne[0]);
+            ggml_set_name(rot, "rot");
+            ggml_tensor * flat = ggml_reshape_2d(ctx, rope, ne[0], ne[1]*ne[2]);
+            ggml_tensor * fwht = ggml_mul_mat(ctx, rot, flat);
+            ggml_mul_mat_set_hint(fwht, GGML_HINT_SRC0_IS_HADAMARD);
+            rope = ggml_reshape_4d(ctx, fwht, ne[0], ne[1], ne[2], 1);
+        }
+
         ggml_tensor * out;
 
         if (set_rows) {
             ggml_tensor * view = ggml_view_2d(ctx, rope, ne[0] * ne[1], ne[2], rope->nb[2], 0);
 
-            ggml_tensor * dst = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
+            ggml_tensor * dst = ggml_new_tensor_4d(ctx, cache_type, ne[0] * ne[1], ne[2] * ne[3], 1, 1);
             ggml_set_name(dst, "dst");
 
             ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, ne[2], 1, 1);
@@ -2647,6 +2661,22 @@ struct test_rms_norm_mul_rope : public test_case {
                 }
 
                 init_set_rows_row_ids(t, ne[2]);
+            } else if (strcmp(t->name, "rot") == 0) {
+                GGML_ASSERT(t->type == GGML_TYPE_F32 && t->ne[0] == t->ne[1]);
+                const int n = t->ne[0];
+                std::vector<float> data(n*n, 0.0f);
+                data[0] = 1.0f/sqrtf((float) n);
+                for (int s = 1; s < n; s *= 2) {
+                    for (int i = 0; i < s; ++i) {
+                        for (int j = 0; j < s; ++j) {
+                            const float val = data[i*n + j];
+                            data[(i + s)*n + j]       =  val;
+                            data[i*n + (j + s)]       =  val;
+                            data[(i + s)*n + (j + s)] = -val;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
             } else {
                 init_tensor_uniform(t);
             }
@@ -9022,6 +9052,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+    // DFlash K-cache shape.  F16 exercises the established direct write;
+    // BF16/Q4_0/Q8_0 cover the bounded SM120 extensions.  Non-CUDA backends
+    // execute the unfused graph and serve as the numerical reference.
+    for (ggml_type cache_type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rope(
+                {128, 8, 7, 1}, 1e-6f, false, true, true, GGML_ROPE_TYPE_NEOX, cache_type));
+    }
+    for (ggml_type cache_type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_rms_norm_mul_rope(
+                {128, 8, 7, 1}, 1e-6f, false, true, true,
+                GGML_ROPE_TYPE_NEOX, cache_type, true));
     }
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
