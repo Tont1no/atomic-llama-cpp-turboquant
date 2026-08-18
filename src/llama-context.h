@@ -322,7 +322,10 @@ private:
     bool external_layer_inputs_rejected = false;
     uint32_t external_layer_inputs_actual_tokens = 0;
     int32_t  external_layer_inputs_mismatch_row  = -1;
-    uint64_t dflash_device_reject_reported       = 0;
+    // Reject and target-retention diagnostics are rate-limited independently
+    // for single-token, DFlash verify-sized, and prompt-sized batches.
+    uint64_t dflash_device_reject_reported[3] = {};
+    uint64_t dflash_target_decode_reported[3] = {};
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
