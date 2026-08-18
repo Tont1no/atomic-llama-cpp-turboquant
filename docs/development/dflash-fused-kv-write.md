@@ -25,6 +25,25 @@ same guarded direct write for BF16.  Every unsupported shape or device uses the
 original graph.  Set `GGML_CUDA_DFLASH_K_FUSION=0` to force that fallback for
 an A/B comparison.
 
+## End-to-end qualification marker
+
+The DFlash model graph names only its real K-cache writes
+`dflash_k_cache_write_<layer>`.  The CUDA backend requires that model-side tag
+before emitting either of these release-visible messages:
+
+- `DFlash-K FWHT cache fusion active`: the new eight-node FWHT plus
+  quantized-cache kernel was dispatched;
+- `DFlash-K model fusion fallback`: the tagged cache write reached ordinary
+  `SET_ROWS` because fusion was disabled or a runtime guard did not match.
+
+The first occurrence of each path is logged once per CUDA backend context, and
+context shutdown reports FWHT-fused and fallback host-dispatch totals.  The
+older five-node no-FWHT fusion does not increment the success metric, so F16 or
+a disabled cache rotation cannot falsely qualify the new path.  Synthetic
+backend-op tests do not carry the tag and therefore cannot produce a false
+end-to-end success marker.  CUDA graph capture counts as one host dispatch;
+later replays remain fused but do not increment the host-side total.
+
 DSpark is intentionally not enabled here.  Its DSV4 graph currently expresses
 full-head normal RoPE as a zero-length NOPE split plus RoPE and concat.  A safe
 follow-up should first remove that redundant split/concat only when
@@ -37,6 +56,7 @@ cmake -S . -B build-fused-sm120 -G "Visual Studio 17 2022" -A x64 `
   -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 `
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON
 cmake --build build-fused-sm120 --config Release --target test-backend-ops -j 8
+cmake --build build-fused-sm120 --config Release --target llama-server -j 8
 ```
 
 Before promotion, run the focused `RMS_NORM_MUL_ROPE` backend cases on SM120,
