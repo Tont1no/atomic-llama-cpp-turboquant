@@ -4087,9 +4087,100 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
         [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+
+    add_opt(common_arg(
+        {"--spec-draft-adaptive"},
+        {"--no-spec-draft-adaptive"},
+        string_format("adapt DFlash/DSpark proposal length to active server load (default: %s)",
+                      params.speculative.draft.adaptive ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-load-caps"}, "N1,N2,...",
+        "adaptive maximum proposal length for 1,2,... active generating slots; "
+        "the last value covers larger loads and every value must be one of 0,1,2,3,7 "
+        "(default: 7,3,2,1,1,1,1,0)",
+        [](common_params & params, const std::string & value) {
+            const auto parts = string_split<std::string>(value, ',');
+            std::vector<int32_t> caps;
+            caps.reserve(parts.size());
+            for (const auto & part : parts) {
+                size_t consumed = 0;
+                int32_t cap;
+                try {
+                    cap = std::stoi(part, &consumed);
+                } catch (const std::exception &) {
+                    throw std::invalid_argument("load caps must contain only integers");
+                }
+                if (part.empty() || consumed != part.size()) {
+                    throw std::invalid_argument("load caps must contain only integers");
+                }
+                caps.push_back(cap);
+            }
+            static constexpr int valid[] = { 0, 1, 2, 3, 7 };
+            if (caps.empty() || caps.size() > 1024 || std::any_of(caps.begin(), caps.end(), [](int cap) {
+                    return std::find(std::begin(valid), std::end(valid), cap) == std::end(valid);
+                })) {
+                throw std::invalid_argument("load caps must be a non-empty comma-separated list using only 0,1,2,3,7");
+            }
+            params.speculative.draft.adaptive_load_caps = std::move(caps);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_LOAD_CAPS"));
+    add_opt(common_arg(
+        {"--spec-draft-acceptance-ema"}, "ALPHA",
+        string_format("EMA weight for new per-position acceptance samples; 0 disables EMA adaptation (default: %.2f)",
+                      (double) params.speculative.draft.adaptive_ema_alpha),
+        [](common_params & params, const std::string & value) {
+            size_t consumed = 0;
+            float alpha;
+            try {
+                alpha = std::stof(value, &consumed);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("acceptance EMA alpha must be a number between 0 and 1");
+            }
+            if (consumed != value.size() || !std::isfinite(alpha) || alpha < 0.0f || alpha > 1.0f) {
+                throw std::invalid_argument("acceptance EMA alpha must be between 0 and 1");
+            }
+            params.speculative.draft.adaptive_ema_alpha = alpha;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_EMA"));
+    add_opt(common_arg(
+        {"--spec-draft-acceptance-threshold"}, "P",
+        string_format("minimum warmed-up per-position acceptance EMA (default: %.2f)",
+                      (double) params.speculative.draft.adaptive_ema_threshold),
+        [](common_params & params, const std::string & value) {
+            size_t consumed = 0;
+            float threshold;
+            try {
+                threshold = std::stof(value, &consumed);
+            } catch (const std::exception &) {
+                throw std::invalid_argument("acceptance threshold must be a number between 0 and 1");
+            }
+            if (consumed != value.size() || !std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+                throw std::invalid_argument("acceptance threshold must be between 0 and 1");
+            }
+            params.speculative.draft.adaptive_ema_threshold = threshold;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_THRESHOLD"));
+    add_opt(common_arg(
+        {"--spec-draft-acceptance-warmup"}, "N",
+        string_format("number of offers required at a position before its EMA can reduce depth (default: %u)",
+                      params.speculative.draft.adaptive_ema_warmup),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("acceptance warmup must be non-negative");
+            }
+            params.speculative.draft.adaptive_ema_warmup = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_WARMUP"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

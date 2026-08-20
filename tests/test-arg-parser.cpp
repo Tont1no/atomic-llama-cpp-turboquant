@@ -197,6 +197,39 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    {
+        common_params adaptive_params;
+        argv = {
+            "binary_name",
+            "--spec-draft-adaptive",
+            "--spec-draft-load-caps", "7,3,2,1,0",
+            "--spec-draft-acceptance-ema", "0.25",
+            "--spec-draft-acceptance-threshold", "0.60",
+            "--spec-draft-acceptance-warmup", "12",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+        assert(adaptive_params.speculative.draft.adaptive);
+        assert((adaptive_params.speculative.draft.adaptive_load_caps == std::vector<int32_t>{7, 3, 2, 1, 0}));
+        assert(adaptive_params.speculative.draft.adaptive_ema_alpha == 0.25f);
+        assert(adaptive_params.speculative.draft.adaptive_ema_threshold == 0.60f);
+        assert(adaptive_params.speculative.draft.adaptive_ema_warmup == 12);
+
+        argv = {"binary_name", "--spec-draft-load-caps", "7,4,1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--spec-draft-load-caps", "7,,1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--spec-draft-load-caps", "7,x,1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--spec-draft-acceptance-ema", "0.5junk"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--spec-draft-acceptance-threshold", "nan"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), adaptive_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);

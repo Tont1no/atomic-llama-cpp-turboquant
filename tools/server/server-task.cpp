@@ -1610,6 +1610,26 @@ std::string server_task_result_metrics::to_metrics() {
         }
     }
 
+    if (!metrics.n_drafted_per_pos.empty()) {
+        prometheus << "# HELP llamacpp:spec_decode_num_draft_tokens_per_pos_total"
+                      " Offered tokens per draft position\n"
+                   << "# TYPE llamacpp:spec_decode_num_draft_tokens_per_pos_total counter\n";
+        for (size_t i = 0; i < metrics.n_drafted_per_pos.size(); i++) {
+            prometheus << "llamacpp:spec_decode_num_draft_tokens_per_pos_total{position=\""
+                       << i << "\"} " << metrics.n_drafted_per_pos[i] << "\n";
+        }
+    }
+
+    if (!metrics.n_adaptive_draft_choices.empty()) {
+        prometheus << "# HELP llamacpp:spec_decode_adaptive_draft_choices_total"
+                      " Adaptive speculative proposal-length selections\n"
+                   << "# TYPE llamacpp:spec_decode_adaptive_draft_choices_total counter\n";
+        for (size_t n = 0; n < metrics.n_adaptive_draft_choices.size(); n++) {
+            prometheus << "llamacpp:spec_decode_adaptive_draft_choices_total{draft_length=\""
+                       << n << "\"} " << metrics.n_adaptive_draft_choices[n] << "\n";
+        }
+    }
+
     return prometheus.str();
 }
 

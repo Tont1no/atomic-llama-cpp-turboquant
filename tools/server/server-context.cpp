@@ -253,6 +253,13 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
+        // A target-only adaptive request intentionally stops maintaining the
+        // DFlash/DSpark sequence.  Never persist that asymmetric state as a
+        // reusable target+draft prompt-cache entry.
+        if (spec_adaptive_disabled) {
+            return false;
+        }
+
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -313,7 +320,14 @@ struct server_slot {
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
+    std::vector<uint64_t> n_drafted_per_pos;
     std::vector<uint64_t> n_accepted_per_pos;
+
+    // Request-local adaptive scheduler state and selected-length telemetry.
+    std::vector<float>    spec_acceptance_ema;
+    std::vector<uint64_t> spec_adaptive_choices;
+    bool spec_adaptive_disabled = false;
+    bool spec_adaptive_replay_recorded = false;
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
@@ -327,6 +341,14 @@ struct server_slot {
 
         spec_is_replay = false;
 
+        // n=0 latches a DFlash/DSpark slot into target-only mode for the rest
+        // of the request.  Drop both live sequences before re-enabling it, so
+        // a later request cannot reuse a target prefix that the draft KV did
+        // not observe.
+        if (spec_adaptive_disabled) {
+            prompt_clear();
+        }
+
         last_nl_pos    = 0;
         generated_text = "";
         has_new_line   = false;
@@ -339,6 +361,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            common_speculative_set_enabled(spec, id, true);
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -349,7 +372,12 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        n_drafted_per_pos.clear();
         n_accepted_per_pos.clear();
+        spec_acceptance_ema.clear();
+        spec_adaptive_choices.clear();
+        spec_adaptive_disabled = false;
+        spec_adaptive_replay_recorded = false;
 
         n_predict_max = -1;
 
@@ -620,12 +648,14 @@ struct server_slot {
             const double mean_acc_len = n_draft_verif_steps > 0 ? 1.0 + (double) n_draft_accepted / (double) n_draft_verif_steps : 1.0;
 
             std::string acceptance_rates_per_pos;
-            if (n_draft_verif_steps > 0) {
-                for (size_t i = 0; i < n_accepted_per_pos.size(); ++i) {
+            if (!n_drafted_per_pos.empty()) {
+                for (size_t i = 0; i < n_drafted_per_pos.size(); ++i) {
                     if (i > 0) {
                         acceptance_rates_per_pos += ", ";
                     }
-                    acceptance_rates_per_pos += string_format("%.3f", (double) n_accepted_per_pos[i] / (double) n_draft_verif_steps);
+                    const uint64_t accepted = i < n_accepted_per_pos.size() ? n_accepted_per_pos[i] : 0;
+                    acceptance_rates_per_pos += string_format("%.3f", n_drafted_per_pos[i] > 0 ?
+                            (double) accepted / (double) n_drafted_per_pos[i] : 0.0);
                 }
             }
 
@@ -634,6 +664,20 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+
+            if (!spec_adaptive_choices.empty()) {
+                std::string choices;
+                for (size_t i = 0; i < spec_adaptive_choices.size(); ++i) {
+                    if (spec_adaptive_choices[i] == 0) {
+                        continue;
+                    }
+                    if (!choices.empty()) {
+                        choices += ", ";
+                    }
+                    choices += string_format("%zu:%" PRIu64, i, spec_adaptive_choices[i]);
+                }
+                SLT_INF(*this, "adaptive draft choices = {%s}\n", choices.c_str());
+            }
         }
 
         common_speculative_print_stats(spec);
@@ -1229,6 +1273,28 @@ private:
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
+            }
+        }
+
+        if (params_base.speculative.draft.adaptive) {
+            const bool pure_dflash_family = params_base.speculative.types.size() == 1 &&
+                    (params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                     params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+            if (!pure_dflash_family) {
+                SRV_WRN("%s\n", "adaptive draft length requires exactly one speculative type: draft-dflash or draft-dspark; disabling adaptation");
+            } else {
+                std::string caps;
+                for (int32_t cap : params_base.speculative.draft.adaptive_load_caps) {
+                    if (!caps.empty()) {
+                        caps += ",";
+                    }
+                    caps += std::to_string(cap);
+                }
+                SRV_INF("adaptive DFlash/DSpark enabled: load_caps=%s, acceptance_ema=%.3f, threshold=%.3f, warmup=%u\n",
+                        caps.c_str(),
+                        (double) params_base.speculative.draft.adaptive_ema_alpha,
+                        (double) params_base.speculative.draft.adaptive_ema_threshold,
+                        params_base.speculative.draft.adaptive_ema_warmup);
             }
         }
 
@@ -2886,7 +2952,9 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
-        // determine which slots are generating and drafting
+        // Determine the compatible generating set first. Adaptive proposal caps
+        // depend on the complete active-slot count, and must be selected before
+        // any potentially expensive speculative checkpoint is created.
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -2900,51 +2968,96 @@ private:
             }
 
             generating.push_back(&slot);
+        });
 
-            if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+        const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
+                params_base.speculative.types.size() == 1 &&
+                (params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                 params_base.speculative.types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+        const int32_t active_slots = (int32_t) generating.size();
 
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        for (server_slot * slot : generating) {
+            if (!spec) {
+                continue;
+            }
 
-                const int n_draft_max = slot.get_n_draft_max();
+            auto & dp = common_speculative_get_draft_params(spec.get(), slot->id);
+            dp.drafting = false;
 
-                if (n_draft_max > 0) {
-                    GGML_ASSERT(slot.can_speculate());
+            int n_draft_max = slot->get_n_draft_max();
+            if (n_draft_max <= 0) {
+                continue;
+            }
 
-                    if (!slot.spec_draft.empty()) {
-                        // we have a previous (partial) draft to reuse
-                        if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
-                        }
-                    } else {
-                        GGML_ASSERT(slot.spec_i_batch.empty());
+            GGML_ASSERT(slot->can_speculate());
 
-                        slot.spec_ckpt.update_pos(
-                                slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+            const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                        if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
+            if (!slot->spec_draft.empty()) {
+                // We have a previous (partial) draft to reuse. Its length was
+                // selected before it was generated and cannot be changed now.
+                if (use_ckpt_tgt) {
+                    GGML_ASSERT(!slot->spec_ckpt.empty());
+                }
+                continue;
+            }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+            if (adaptive_dflash) {
+                const int32_t hard_cap = n_draft_max;
+                n_draft_max = slot->spec_adaptive_disabled ? 0 :
+                        common_speculative_adaptive_n_max(
+                            params_base.speculative.draft,
+                            active_slots,
+                            hard_cap,
+                            slot->spec_acceptance_ema,
+                            slot->n_drafted_per_pos);
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
+                if (slot->spec_adaptive_choices.size() <= (size_t) n_draft_max) {
+                    slot->spec_adaptive_choices.resize((size_t) n_draft_max + 1, 0);
+                }
+                slot->spec_adaptive_choices[n_draft_max]++;
 
-                        drafting.push_back(&slot);
+                SLT_DBG(*slot, "adaptive draft length: active_slots=%d hard_cap=%d selected=%d\n",
+                        active_slots, hard_cap, n_draft_max);
+
+                if (n_draft_max == 0) {
+                    if (!slot->spec_adaptive_disabled) {
+                        SLT_INF(*slot, "%s\n", "adaptive draft length selected n=0; using target-only decoding for the rest of this request");
                     }
+                    slot->spec_adaptive_disabled = true;
+                    common_speculative_set_enabled(spec.get(), slot->id, false);
                 }
             }
-        });
+
+            if (n_draft_max <= 0) {
+                continue;
+            }
+
+            GGML_ASSERT(slot->spec_i_batch.empty());
+
+            slot->spec_ckpt.update_pos(
+                    slot->prompt.n_tokens(),
+                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id),
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id));
+
+            if (use_ckpt_dft) {
+                slot->spec_ckpt.update_dft(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+
+            slot->spec_prompt = slot->prompt.tokens.get_text_tokens();
+
+            dp = {
+                /* .drafting = */ true,
+                /* .n_max    = */ n_draft_max,
+                /* .n_past   = */ slot->prompt.n_tokens(),
+                /* .id_last  = */ slot->sampled,
+                /* .prompt   = */ &slot->spec_prompt,
+                /* .result   = */ &slot->spec_draft,
+            };
+
+            drafting.push_back(slot);
+        }
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
@@ -2959,6 +3072,12 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            if (slot.n_drafted_per_pos.size() < draft.size()) {
+                slot.n_drafted_per_pos.resize(draft.size(), 0);
+            }
+            for (size_t i = 0; i < draft.size(); ++i) {
+                slot.n_drafted_per_pos[i]++;
+            }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3687,6 +3806,12 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
+        const auto & types = params_base.speculative.types;
+        const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
+                types.size() == 1 &&
+                (types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                 types[0] == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -3830,8 +3955,9 @@ private:
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
                     if (use_ckpt_tgt) {
+                        const size_t n_accepted_original = accepted.size() - 1;
                         if (trace > 0) {
-                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", n_accepted_original, slot.spec_draft.size());
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
@@ -3852,6 +3978,15 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+
+                        if (adaptive_dflash && !slot.spec_adaptive_replay_recorded) {
+                            common_speculative_adaptive_acceptance_update(
+                                    slot.spec_acceptance_ema,
+                                    n_draft,
+                                    n_accepted_original,
+                                    params_base.speculative.draft.adaptive_ema_alpha);
+                            slot.spec_adaptive_replay_recorded = true;
+                        }
 
                         return;
                     }
@@ -3879,6 +4014,15 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            if (adaptive_dflash && !slot.spec_adaptive_replay_recorded) {
+                common_speculative_adaptive_acceptance_update(
+                        slot.spec_acceptance_ema,
+                        n_draft,
+                        n_accepted,
+                        params_base.speculative.draft.adaptive_ema_alpha);
+            }
+            slot.spec_adaptive_replay_recorded = false;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
@@ -4031,6 +4175,15 @@ private:
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
         metrics.n_draft_verif_steps += slot.stats.n_draft_verif_steps;
 
+        auto & offered_dst = metrics.n_drafted_per_pos;
+        const auto & offered_src = slot.n_drafted_per_pos;
+        if (offered_dst.size() < offered_src.size()) {
+            offered_dst.resize(offered_src.size(), 0);
+        }
+        for (size_t i = 0; i < offered_src.size(); i++) {
+            offered_dst[i] += offered_src[i];
+        }
+
         auto & dst = metrics.n_accepted_per_pos;
         const auto & src = slot.n_accepted_per_pos;
 
@@ -4039,6 +4192,15 @@ private:
         }
         for (size_t i = 0; i < src.size(); i++) {
             dst[i] += src[i];
+        }
+
+        auto & choices_dst = metrics.n_adaptive_draft_choices;
+        const auto & choices_src = slot.spec_adaptive_choices;
+        if (choices_dst.size() < choices_src.size()) {
+            choices_dst.resize(choices_src.size(), 0);
+        }
+        for (size_t i = 0; i < choices_src.size(); i++) {
+            choices_dst[i] += choices_src[i];
         }
     }
 };
