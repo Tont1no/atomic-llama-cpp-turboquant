@@ -1442,7 +1442,7 @@ struct ggml_backend_cuda_context {
     // Captured when the backend context is created so a deterministic test can
     // construct independent fallback and fused contexts in one process.  This
     // also avoids a getenv() in graph traversal.
-    bool dflash_k_fusion_enabled = true;
+    bool dflash_k_fusion_enabled = false;
     bool dflash_k_validate       = false;
 
 #ifdef USE_CUDA_GRAPH
@@ -1500,8 +1500,19 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        // Opt-in, deliberately fail-closed. The fused K-cache injection kernel
+        // used to default to on, so every build of this branch ran it silently -
+        // including all the SPS measurements, which never recorded that fact.
+        // Its throughput case is also unproven: the +40.55% figure came from a
+        // single slow control run (six matched N=8 runs: ON 265.13/273.90/273.43,
+        // OFF 188.64/260.20/288.44 - the fastest run of all is an OFF run), and
+        // it was measured on a revision later shown to be byte-wrong. The
+        // corrected kernel has never had a throughput A/B.
+        // Correctness is fine (deterministic harness PASS for Q4_0 and Q8_0);
+        // this is about not shipping unmeasured kernels by accident.
+        // Enable with GGML_CUDA_DFLASH_K_FUSION=1.
         const char * fusion_env = getenv("GGML_CUDA_DFLASH_K_FUSION");
-        dflash_k_fusion_enabled = fusion_env == nullptr || atoi(fusion_env) != 0;
+        dflash_k_fusion_enabled = fusion_env != nullptr && atoi(fusion_env) != 0;
 
         const char * validate_env = getenv("GGML_CUDA_DFLASH_K_VALIDATE");
         dflash_k_validate = validate_env != nullptr && atoi(validate_env) != 0;
