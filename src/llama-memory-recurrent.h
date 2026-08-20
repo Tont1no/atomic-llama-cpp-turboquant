@@ -12,6 +12,26 @@
 // llama_memory_recurrent
 //
 
+inline llama_memory_recurrent_resize_stats llama_recurrent_resize_metrics_snapshot(
+        bool dynamic,
+        uint32_t configured_depth,
+        uint32_t resident_depth,
+        uint32_t last_required_depth,
+        uint32_t pending_depth,
+        uint32_t stable_ticks,
+        uint64_t resize_count,
+        uint64_t resize_time_us) {
+    llama_memory_recurrent_resize_stats result;
+    result.count            = resize_count;
+    result.time_us          = resize_time_us;
+    result.resident_depth   = resident_depth;
+    result.configured_depth = configured_depth;
+    result.pending_depth    = pending_depth;
+    result.stable_ticks     = stable_ticks;
+    result.required_depth   = dynamic ? last_required_depth : configured_depth;
+    return result;
+}
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
@@ -104,6 +124,7 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
     void commit_rs_depth(const llama_ubatch & ubatch, uint32_t active_depth);
+    void invalidate_rs_depth(const llama_ubatch & ubatch);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -211,6 +232,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    void finalize(bool success) override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -259,3 +281,13 @@ uint32_t llama_recurrent_batch_active_rs_depth(
         uint32_t configured_max,
         uint32_t n_seq_max,
         bool * used_fallback = nullptr);
+
+// Pure fail-closed rollback guard shared by the cache implementation and
+// metadata tests. Dynamic contexts may address a snapshot only when both the
+// physical plane and the per-sequence last-written depth still cover it.
+bool llama_recurrent_rollback_is_valid(
+        bool dynamic,
+        uint32_t rollback,
+        uint32_t configured_max,
+        uint32_t resident_depth,
+        uint32_t valid_depth);

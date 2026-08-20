@@ -1,0 +1,40 @@
+{
+  "schema": "ai-loader-qwen38-parity-guard-receipt/v1",
+  "created_at": "2026-08-20T14:22:29.7074828+00:00",
+  "guard_status": "failed",
+  "diagnostic_validation": "not_run",
+  "error": "GPU task exited with code 2.",
+  "executable_sha256": "a9edb9d3e24e550cd84ecdffca233b4f029dd2bd90f122c3a17ea2ef4245b8c9",
+  "guard_sha256": "3120e9fe7c247250a440389d0450c71741718b391d435a270fd2f16d33dc1463",
+  "server_sha256": "3957122672ce2def719a58b321e70334ec048e0b4d9f435c11b1b5d2d61f5b9d",
+  "model_sha256": "46e0ec4bdab3907346fbb486b1e4f78b49a66b245374aa0d3d628a8d099c0336",
+  "reference_sha256": "1e5f7b997354cebfded587fdbfc6339737c63fc025760a7f75b224dbada5f348",
+  "manifest_sha256": "67da6391d2240a058562973def2949721fd9c336308d996f5e3b0de73f2405c0",
+  "trace_validation_sha256": "fe38d4bc2702e2a5129235927f550e0269e482c121df3aeda90fbc91c0fc0cbb",
+  "trace_guard_receipt_sha256": "667728f1bcd38da34830f3d416924c446ec72d9f607e6f9779b1e626b0e74492",
+  "command_sha256": "640418e80973413b3f7b95334a8ecf0aa639100e05339d27b5c4ec9ac0704284",
+  "qualification_receipt_sha256": "c9c1fd02566478c8eb53a75c72ba5ac671ccd1111057d8c6891c75503569a9b9",
+  "runtime_bundle_sha256": "9bc7fea87062881f34742d482c12b2f5aa44292a114db75d2bf1e1111a35f6f5",
+  "runtime_bundle_count": 10,
+  "diagnostic_candidate": "QWEN35_NVFP4_FFN_PLUS_BF16_RECURRENT_PLUS_FATTN_VEC_V3",
+  "qwen35_nvfp4_head_hint_compiled": true,
+  "qwen35_nvfp4_ffn_projections": true,
+  "qwen35_bf16_recurrent_projections": true,
+  "qwen35_fattn_d256_q8_gqa6_vec_qcols3_8": true,
+  "layer_boundary_bisection": false,
+  "recurrent_internal_refine": false,
+  "full_attention_internal_refine": false,
+  "guard": null,
+  "postflight": {
+    "relevant_processes": 0,
+    "port_18136_free": true,
+    "recursive_gpu_leases": 0,
+    "checked_lease_roots": [
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy",
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy"
+    ],
+    "remaining_lease_paths": []
+  },
+  "stdout_sha256": "bb2b0170daaada39c5aa492a98143774dbd8fd703a3b43d9c91beac92e0addf0",
+  "stderr_sha256": "627fddb02a129231eae8bb39c539ddba009c532639c58bb3ce2dc7a81a7958cd"
+}

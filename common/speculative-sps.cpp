@@ -1,6 +1,8 @@
 #include "speculative-sps.h"
+#include "speculative-sps-atomic.h"
 
 #include "common.h"
+#include "log.h"
 
 #include <nlohmann/json.hpp>
 
@@ -24,6 +26,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+static_assert(ERROR_ACCESS_DENIED == common_speculative_sps_detail::WIN_ERROR_ACCESS_DENIED);
+static_assert(ERROR_SHARING_VIOLATION == common_speculative_sps_detail::WIN_ERROR_SHARING_VIOLATION);
+static_assert(ERROR_LOCK_VIOLATION == common_speculative_sps_detail::WIN_ERROR_LOCK_VIOLATION);
+static_assert(ERROR_UNABLE_TO_REMOVE_REPLACED ==
+        common_speculative_sps_detail::WIN_ERROR_UNABLE_TO_REMOVE_REPLACED);
 #endif
 
 using json = nlohmann::ordered_json;
@@ -215,12 +223,49 @@ void atomic_replace_json(const std::string & destination, const json & document)
         }
 
 #ifdef _WIN32
-        if (!MoveFileExW(
-                    temporary_path.c_str(),
-                    destination_path.c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        // MoveFileExW cannot replace an open destination even when every
+        // reader opted into FILE_SHARE_DELETE. ReplaceFileW can, and preserves
+        // the recorder artifact's one-generation atomicity.
+        const auto replace_result = common_speculative_sps_detail::retry_windows_replace(
+                [&]() -> uint32_t {
+                    return ReplaceFileW(
+                            destination_path.c_str(),
+                            temporary_path.c_str(),
+                            nullptr,
+                            REPLACEFILE_WRITE_THROUGH,
+                            nullptr,
+                            nullptr) ? 0 : GetLastError();
+                },
+                []() -> uint64_t {
+                    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                },
+                [](uint32_t delay_ms) { Sleep(delay_ms); });
+        if (replace_result.success) {
+            if (replace_result.retries > 0) {
+                COM_WRN("SPS recorder atomic replace succeeded after %u retries: '%s'\n",
+                        replace_result.retries, destination.c_str());
+            }
+        } else if (replace_result.error == ERROR_FILE_NOT_FOUND) {
+            // Initial publication has no destination to replace. Keep this a
+            // single fail-closed move: retrying it could overwrite a file
+            // concurrently created by another writer.
+            if (!MoveFileExW(
+                        temporary_path.c_str(),
+                        destination_path.c_str(),
+                        MOVEFILE_WRITE_THROUGH)) {
+                const DWORD move_error = GetLastError();
+                COM_ERR("SPS recorder initial atomic move failed after 0 retries with Windows error %lu: '%s'\n",
+                        (unsigned long) move_error, destination.c_str());
+                throw std::runtime_error("failed to atomically replace SPS recorder output '" + destination +
+                        "' (Windows error " + std::to_string(move_error) + ", retries 0)");
+            }
+        } else {
+            COM_ERR("SPS recorder atomic replace failed after %u retries with Windows error %u: '%s'\n",
+                    replace_result.retries, replace_result.error, destination.c_str());
             throw std::runtime_error("failed to atomically replace SPS recorder output '" + destination +
-                    "' (Windows error " + std::to_string(GetLastError()) + ")");
+                    "' (Windows error " + std::to_string(replace_result.error) + ", retries " +
+                    std::to_string(replace_result.retries) + ")");
         }
 #else
         std::error_code ec;
@@ -1043,6 +1088,30 @@ size_t common_speculative_sps_profile_recorder::expected_coordinates() const {
 
 size_t common_speculative_sps_profile_recorder::ready_coordinates() const {
     return pimpl->ready_coordinates();
+}
+
+uint64_t common_speculative_sps_profile_recorder::retained_samples() const {
+    return pimpl->retained_total;
+}
+
+uint64_t common_speculative_sps_profile_recorder::skipped_warmup() const {
+    return pimpl->skipped_warmup_total;
+}
+
+uint64_t common_speculative_sps_profile_recorder::skipped_capture() const {
+    return pimpl->skipped_capture_total;
+}
+
+uint64_t common_speculative_sps_profile_recorder::skipped_ineligible() const {
+    return pimpl->skipped_ineligible_total;
+}
+
+uint64_t common_speculative_sps_profile_recorder::skipped_outside_grid() const {
+    return pimpl->skipped_outside_grid_total;
+}
+
+uint64_t common_speculative_sps_profile_recorder::skipped_full() const {
+    return pimpl->skipped_full_total;
 }
 
 common_speculative_sps_profile common_speculative_sps_profile_recorder::profile() const {

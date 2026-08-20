@@ -1,0 +1,2 @@
+{"type":"config","mode":"bf16-projections","cases":2,"replays":8,"order":"alternating","fixture":"deterministic_nonzero_shape_exact","comparison":"bitwise_f32"}
+{"type":"bf16_route_probe","id":"qwen35-bf16-beta-k5120-n48","m":2,"scalar_mmvf_delta":2,"scalar_cublas_delta":0,"batch_mmvf_delta":0,"batch_cublas_delta":1,"input_bf16_roundtrip_sensitive":true}

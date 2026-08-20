@@ -531,7 +531,11 @@ static __global__ void flash_attn_ext_vec(
 #endif // __clang__
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
-void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+#ifdef GGML_CUDA_DIAGNOSTIC_ROUTES
+        , const int forced_parallel_blocks = 0
+#endif
+) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
@@ -540,7 +544,12 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared,
+            D, need_f16_K, need_f16_V, false, WARP_SIZE
+#ifdef GGML_CUDA_DIAGNOSTIC_ROUTES
+            , forced_parallel_blocks
+#endif
+    );
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

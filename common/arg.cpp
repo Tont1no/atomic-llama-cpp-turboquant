@@ -804,14 +804,17 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
-static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
+static bool common_params_parse_ex(
+        int argc, char ** argv, common_params_context & ctx_arg, bool use_system_config) {
     common_params & params = ctx_arg.params;
 
     // setup log directly from params.verbosity: see tools/cli/cli.cpp
     common_log_set_verbosity_thold(params.verbosity);
 
     // config file applies first, so env variables and CLI arguments override it
-    common_params_apply_system_config(params, ctx_arg.ex);
+    if (use_system_config) {
+        common_params_apply_system_config(params, ctx_arg.ex);
+    }
 
     std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
     for (auto & opt : ctx_arg.options) {
@@ -1319,7 +1322,13 @@ static utf8_argv make_utf8_argv() {
 }
 #endif
 
-bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+static bool common_params_parse_impl(
+        int argc,
+        char ** argv,
+        common_params & params,
+        llama_example ex,
+        void(*print_usage)(int, char **),
+        bool use_system_config) {
 #ifdef _WIN32
     auto utf8 = make_utf8_argv();
     // repair argv only when it matches the process command line
@@ -1332,7 +1341,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
     const common_params params_org = ctx_arg.params; // the example can modify the default params
 
     try {
-        if (!common_params_parse_ex(argc, argv, ctx_arg)) {
+        if (!common_params_parse_ex(argc, argv, ctx_arg, use_system_config)) {
             ctx_arg.params = params_org;
             return false;
         }
@@ -1359,6 +1368,16 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
     }
 
     return true;
+}
+
+bool common_params_parse(
+        int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    return common_params_parse_impl(argc, argv, params, ex, print_usage, true);
+}
+
+bool common_params_parse_no_system_config(
+        int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    return common_params_parse_impl(argc, argv, params, ex, print_usage, false);
 }
 
 static std::string list_builtin_chat_templates() {
@@ -4147,6 +4166,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.adaptive = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-dynamic-rs"},
+        {"--no-spec-draft-dynamic-rs"},
+        string_format("resize pure-DSpark recurrent snapshot storage to the current depth; "
+                      "disabled allocates fixed configured depth at startup (default: %s)",
+                      params.speculative.draft.dynamic_rs ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.dynamic_rs = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS"));
     add_opt(common_arg(
         {"--spec-draft-load-caps"}, "N1,N2,...",
         "adaptive maximum proposal length for 1,2,... active generating slots; "

@@ -2,6 +2,12 @@
 #include "common.h"
 #include "llama.h"
 #include "llama-ext.h"
+#if defined(LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE)
+#include "llama-batch.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -40,6 +46,104 @@ static std::vector<uint32_t> tag_recurrent_depth(llama_batch & batch, size_t n_r
     batch.rs_depth = depths.data();
     return depths;
 }
+
+#if defined(LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE)
+static llama_memory_recurrent * get_recurrent_memory(llama_context * ctx) {
+    llama_memory_i * memory = llama_get_memory(ctx);
+    if (auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory)) {
+        return recurrent;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
+        return hybrid->get_mem_recr();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory)) {
+        return hybrid_iswa->get_mem_recr();
+    }
+    return nullptr;
+}
+
+static bool staged_growth_failure_fails_closed(
+        const common_params & params,
+        llama_model * model) {
+    llama_context * ctx = make_ctx(params, model, 1, true);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    llama_memory_recurrent * memory = get_recurrent_memory(ctx);
+    if (memory == nullptr) {
+        fprintf(stderr, "%s : missing recurrent memory\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    llama_batch planning = llama_batch_init(4, 0, 1);
+    auto planning_depths = tag_recurrent_depth(planning, 4, 3);
+    for (llama_pos p = 0; p < 4; ++p) {
+        common_batch_add(planning, 1, p, { 0 }, p == 3);
+    }
+    const bool prepared = memory->prepare_batch(ctx, planning, false);
+    llama_batch_free(planning);
+    if (!prepared || memory->n_rs_seq_alloc < 3) {
+        fprintf(stderr, "%s : failed to prepare resident growth\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    std::array<llama_pos, 4> pos = { 0, 1, 2, 3 };
+    std::array<int32_t, 4> n_seq_id = { 1, 1, 1, 1 };
+    std::array<llama_seq_id, 4> seq_id_data = { 0, 0, 0, 0 };
+    std::array<llama_seq_id *, 4> seq_id = {};
+    for (llama_pos p = 0; p < 4; ++p) {
+        seq_id[p] = &seq_id_data[p];
+    }
+
+    llama_ubatch ubatch = {};
+    ubatch.b_equal_seqs = 1;
+    ubatch.n_tokens = 4;
+    ubatch.n_seq_tokens = 4;
+    ubatch.n_seqs = 1;
+    ubatch.n_seqs_unq = 1;
+    ubatch.n_pos = 1;
+    ubatch.pos = pos.data();
+    ubatch.n_seq_id = n_seq_id.data();
+    ubatch.seq_id = seq_id.data();
+
+    // Seed a previously successful depth so failure invalidation proves it
+    // clears stale validity rather than merely preserving the initial zero.
+    memory->commit_rs_depth(ubatch, 3);
+    if (memory->rs_valid_depth.empty() || memory->rs_valid_depth[0] != 3) {
+        fprintf(stderr, "%s : failed to seed prior valid snapshot depth\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    // Exercise the exact apply -> graph failure transaction without the
+    // public decode wrapper's automatic seq_rm cleanup hiding validity state.
+    llama_memory_recurrent_context staged(memory, { ubatch }, 3);
+    if (!staged.apply()) {
+        fprintf(stderr, "%s : failed to stage recurrent metadata\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    staged.finalize(false);
+
+    if (memory->rs_valid_depth.empty() || memory->rs_valid_depth[0] != 0) {
+        fprintf(stderr, "%s : failed graph left planned snapshots valid\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    if (memory->seq_rm(0, 1, -1)) {
+        fprintf(stderr, "%s : rollback accepted a snapshot from an aborted graph\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    memory->clear(false);
+    llama_free(ctx);
+    return true;
+}
+#endif
 
 static bool decode_ragged_and_compare(
         const common_params & params,
@@ -90,6 +194,15 @@ static bool decode_ragged_and_compare(
     llama_batch_free(batch);
     const size_t bytes_depth_three = context_memory_bytes(ctx_batched);
     const bool uses_compact_storage = bytes_depth_three > bytes_depth_zero;
+    const llama_recurrent_resize_stats growth_stats = llama_get_recurrent_resize_stats(ctx_batched);
+    if (uses_compact_storage && (growth_stats.configured_depth != llama_n_rs_seq(ctx_batched) ||
+            growth_stats.resident_depth != 3 || growth_stats.required_depth != 3 ||
+            growth_stats.pending_depth != UINT32_MAX)) {
+        fprintf(stderr, "%s : depth-three metrics mismatch configured=%u resident=%u required=%u pending=%u\n",
+                __func__, growth_stats.configured_depth, growth_stats.resident_depth,
+                growth_stats.required_depth, growth_stats.pending_depth);
+        return false;
+    }
 
     constexpr float eps = 1e-5f;
     const auto compare_outputs = [&](
@@ -144,7 +257,8 @@ static bool decode_ragged_and_compare(
     }
     const llama_recurrent_resize_stats pending_first = llama_get_recurrent_resize_stats(ctx_batched);
     if (uses_compact_storage && (context_memory_bytes(ctx_batched) != bytes_depth_three ||
-            pending_first.resident_depth != 3 || pending_first.pending_depth != 0 ||
+            pending_first.configured_depth != llama_n_rs_seq(ctx_batched) ||
+            pending_first.resident_depth != 3 || pending_first.required_depth != 0 || pending_first.pending_depth != 0 ||
             pending_first.stable_ticks != 1)) {
         fprintf(stderr, "%s : first low-depth epoch did not defer shrink\n", __func__);
         return false;
@@ -205,7 +319,9 @@ static bool decode_ragged_and_compare(
 
     bool ok = compare_outputs("depth-zero-final", { 0, 1, 2 }, { 0, 0, 0 });
     const llama_recurrent_resize_stats final_stats = llama_get_recurrent_resize_stats(ctx_batched);
-    if (ok && uses_compact_storage && (final_stats.count != 2 || final_stats.resident_depth != 0 ||
+    if (ok && uses_compact_storage && (final_stats.count != 2 ||
+            final_stats.configured_depth != llama_n_rs_seq(ctx_batched) ||
+            final_stats.resident_depth != 0 || final_stats.required_depth != 0 ||
             final_stats.pending_depth != UINT32_MAX)) {
         fprintf(stderr, "%s : unexpected resize telemetry count=%llu resident=%u pending=%u\n",
                 __func__, (unsigned long long) final_stats.count,
@@ -515,6 +631,12 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
+#if defined(LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE)
+    if (!staged_growth_failure_fails_closed(params, model)) {
+        return 1;
+    }
+#endif
+
     if (!decode_ragged_and_compare(params, model, n_vocab)) {
         return 1;
     }
@@ -537,6 +659,17 @@ int main(int argc, char ** argv) {
         llama_free(ctx_src);
         llama_free(ctx_dst);
         return 0;
+    }
+    const llama_recurrent_resize_stats fixed_stats = llama_get_recurrent_resize_stats(ctx_src);
+    if (fixed_stats.configured_depth != llama_n_rs_seq(ctx_src) ||
+            fixed_stats.resident_depth != llama_n_rs_seq(ctx_src) ||
+            fixed_stats.required_depth != llama_n_rs_seq(ctx_src) ||
+            fixed_stats.pending_depth != UINT32_MAX || fixed_stats.count != 0) {
+        fprintf(stderr, "%s : fixed recurrent metrics mismatch configured=%u resident=%u required=%u pending=%u count=%llu\n",
+                __func__, fixed_stats.configured_depth, fixed_stats.resident_depth,
+                fixed_stats.required_depth, fixed_stats.pending_depth,
+                (unsigned long long) fixed_stats.count);
+        return 1;
     }
 
     std::vector<llama_token> tokens;

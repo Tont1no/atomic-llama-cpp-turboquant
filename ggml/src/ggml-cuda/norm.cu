@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "diagnostics.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -476,6 +477,7 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 }
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_RMS_NORM);
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
     float * dst_d = (float *) dst->data;
@@ -500,6 +502,7 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_RMS_NORM_MUL);
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -674,6 +677,7 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 }
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_L2_NORM);
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
     float * dst_d = (float *) dst->data;

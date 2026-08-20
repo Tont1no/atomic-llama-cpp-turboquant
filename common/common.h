@@ -331,6 +331,11 @@ struct common_params_speculative_draft {
     // for larger loads. Values are deliberately restricted to the low-risk arms
     // supported by the first scheduler implementation.
     bool adaptive = false;
+    // Dynamic recurrent-snapshot residency is an explicit pure-DSpark opt-in.
+    // The fixed default avoids transient old+new resize overlap on tiers that
+    // have not yet qualified growth headroom. Adaptive DFlash keeps its
+    // existing dynamic behavior independently.
+    bool dynamic_rs = false;
     std::vector<int32_t> adaptive_load_caps = { 7, 3, 2, 1, 1, 1, 1, 0 };
     float adaptive_ema_alpha     = 0.0f; // 0 disables acceptance-based adaptation
     float adaptive_ema_threshold = 0.55f;
@@ -961,6 +966,13 @@ private:
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// Apply model-provided sampling defaults exactly as common_init_result does.
+// Kept public so production-coupled diagnostics can construct the same
+// per-request sampler without creating a second context.
+void common_params_sampling_init_from_model(
+        const struct llama_model * model,
+        common_params_sampling & sampling);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);

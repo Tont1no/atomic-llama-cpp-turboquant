@@ -43,17 +43,7 @@ using json = nlohmann::ordered_json;
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static bool server_speculative_is_only_dspark(const std::vector<common_speculative_type> & types) {
-    int n_enabled = 0;
-    for (const auto type : types) {
-        if (type == COMMON_SPECULATIVE_TYPE_NONE) {
-            continue;
-        }
-        if (type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
-            return false;
-        }
-        ++n_enabled;
-    }
-    return n_enabled == 1;
+    return common_speculative_is_only_dspark(types);
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1185,6 +1175,17 @@ private:
             }
             metrics.n_sps_record_coordinates_ready = spec_sps_recorder->ready_coordinates();
             metrics.n_sps_record_coordinates_total = spec_sps_recorder->expected_coordinates();
+            // Prometheus counters must describe the complete persisted
+            // recorder state, including an incomplete sidecar loaded for
+            // resume. This lets the runner prove the exact final quota without
+            // opening the sidecar while the server may be replacing it.
+            metrics.n_sps_record_retained_samples = spec_sps_recorder->retained_samples();
+            metrics.n_sps_record_skipped_warmup   = spec_sps_recorder->skipped_warmup();
+            metrics.n_sps_record_skipped_capture  = spec_sps_recorder->skipped_capture();
+            metrics.n_sps_record_skipped_other    =
+                    spec_sps_recorder->skipped_ineligible() +
+                    spec_sps_recorder->skipped_outside_grid() +
+                    spec_sps_recorder->skipped_full();
         } else if (params_base.speculative.draft.sps_force_verify_rows >= 0) {
             SRV_ERR("%s\n", "--spec-draft-sps-force-verify-rows requires --spec-draft-sps-record");
             return false;
@@ -1343,6 +1344,11 @@ private:
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        // Seed recurrent gauges before the first decode. Later decode-boundary
+        // updates keep this cached snapshot current without racing a yielded
+        // metrics worker against prepare_batch()/finalize().
+        metrics_update_recurrent();
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -2076,6 +2082,17 @@ private:
         }
 
         if (incomplete) {
+            if (server_should_emit_native_token_only_partial(
+                        slot.task->params.res_type,
+                        slot.task->params.stream,
+                        slot.task->params.return_tokens,
+                        incomplete)) {
+                // The text bytes stay buffered in generated_text until they
+                // form valid UTF-8, but the native return_tokens contract is
+                // per generated token.  Emit this ID now with empty content;
+                // the later content-bearing partial only owns its own token.
+                send_partial_response(slot, result, false, false, true);
+            }
             slot.has_next_token = true;
         }
 
@@ -2240,7 +2257,12 @@ private:
         queue_results.send(std::move(res));
     }
 
-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
+    void send_partial_response(
+            server_slot & slot,
+            const completion_token_output & tkn,
+            bool is_progress,
+            bool is_begin = false,
+            bool suppress_content = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
@@ -2256,8 +2278,9 @@ private:
         if (is_begin) {
             res->is_begin = true;
         } else {
-            res->content = tkn.text_to_send;
-            res->tokens  = { tkn.tok };
+            auto payload = server_make_stream_partial_payload(tkn, suppress_content);
+            res->content = std::move(payload.content);
+            res->tokens  = std::move(payload.tokens);
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -2681,6 +2704,13 @@ private:
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
+                    // During queue yielding, llama_decode() may be mutating
+                    // recurrent resize fields on the main thread. Read the
+                    // cached decode-boundary snapshot instead of racing it.
+                    if (!is_yielding) {
+                        metrics_update_recurrent();
+                    }
+
                     json slots_data = json::array();
 
                     int n_idle_slots       = 0;
@@ -4094,7 +4124,10 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
-        const bool record_enabled = spec_sps_recorder != nullptr;
+        // Once the requested quota is committed there is nothing left to
+        // observe or publish. Keeping the recorder inactive also prevents
+        // normal tail tokens from being misclassified as skipped-full.
+        const bool record_enabled = spec_sps_recorder != nullptr && !spec_sps_recorder->ready();
         const llama_graph_execution_stats graph_stats_before = record_enabled ?
                 llama_get_graph_execution_stats(ctx_tgt) : llama_graph_execution_stats {};
         int64_t record_begin_us = 0;
@@ -4560,10 +4593,14 @@ private:
 
     // call before submitting a decode, so that the queued prompt stats can be timed
     void metrics_update_recurrent() {
+        if (ctx_tgt == nullptr) {
+            return;
+        }
         const llama_recurrent_resize_stats rs_stats = llama_get_recurrent_resize_stats(ctx_tgt);
         metrics.n_recurrent_resizes            = rs_stats.count;
         metrics.t_recurrent_resize_us          = rs_stats.time_us;
         metrics.recurrent_resident_depth       = rs_stats.resident_depth;
+        metrics.recurrent_configured_depth     = rs_stats.configured_depth;
         metrics.recurrent_required_depth       = rs_stats.required_depth;
         metrics.recurrent_pending_depth        = rs_stats.pending_depth;
         metrics.recurrent_shrink_stable_ticks  = rs_stats.stable_ticks;

@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-model-opt.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1313,7 +1314,8 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    GGML_ASSERT(max_nodes >= 0);
+    buf_compute_meta.resize(llm_graph_result_meta_size((size_t) max_nodes));
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1488,8 +1490,19 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s,
-          ggml_tensor * input_s) const {
+          ggml_tensor * input_s,
+     enum ggml_op_hint   hint) const {
     ggml_tensor * res;
+
+    bool has_lora = false;
+    if (hint != GGML_HINT_NONE) {
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(w) != nullptr) {
+                has_lora = true;
+                break;
+            }
+        }
+    }
 
     if (w->type == GGML_TYPE_F8_E4M3) {
         GGML_ASSERT(w_s && input_s && "F8_E4M3 weights require scalar weight and input scales");
@@ -1500,6 +1513,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul_mat_f8_e4m3(ctx0, w, cur, w_s, input_s);
     } else {
         res = ggml_mul_mat(ctx0, w, cur);
+    }
+
+    // A LoRA residual changes the semantic operation represented by this
+    // graph fragment. Leave it entirely on the established backend routes.
+    if (llama_model_opt_mul_mat_hint_allowed(hint, has_lora, res->op)) {
+        ggml_mul_mat_set_hint(res, hint);
     }
 
     if (w_s && w->type != GGML_TYPE_F8_E4M3) {
@@ -1692,7 +1711,10 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+   enum ggml_op_hint   up_hint,
+   enum ggml_op_hint   gate_hint,
+   enum ggml_op_hint   down_hint) const {
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1716,7 +1738,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur, nullptr, nullptr, up_hint) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1733,12 +1755,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp);
+                    cur = build_lora_mm(gate, tmp, nullptr, nullptr, gate_hint);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur);
+                    cur = build_lora_mm(gate, cur, nullptr, nullptr, gate_hint);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1859,7 +1881,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
+        cur = build_lora_mm(down, cur, nullptr, nullptr, down_hint);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -2535,7 +2557,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+   enum ggml_op_hint   fattn_hint) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2572,6 +2595,38 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        if (fattn_hint != GGML_HINT_NONE) {
+            const bool q_layout = q->nb[0] == sizeof(float) &&
+                    q->nb[2] == q->nb[0] * q->ne[0] &&
+                    q->nb[1] == q->nb[2] * q->ne[2] &&
+                    q->nb[3] == q->nb[1] * q->ne[1];
+            const bool k_layout = llama_model_opt_qwen35_fattn_kv_cache_layout_allowed(
+                    k->type, k->ne[0], k->ne[1], k->ne[2], k->ne[3],
+                    k->nb[0], k->nb[1], k->nb[2], k->nb[3]);
+            const bool v_layout = llama_model_opt_qwen35_fattn_kv_cache_layout_allowed(
+                    v->type, v->ne[0], v->ne[1], v->ne[2], v->ne[3],
+                    v->nb[0], v->nb[1], v->nb[2], v->nb[3]);
+            const bool exact_params = kq_scale == 0.0625f &&
+                    hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+                    ggml_flash_attn_ext_get_prec(cur) == GGML_PREC_F32;
+            const bool allowed = llama_model_opt_qwen35_fattn_vec_hint_allowed(
+                    fattn_hint, cur->op, q->type, k->type, v->type,
+                    kq_mask ? kq_mask->type : GGML_TYPE_COUNT, cur->type,
+                    q->ne[0], q->ne[1], q->ne[2],
+                    k->ne[0], k->ne[1], k->ne[2],
+                    v->ne[0], v->ne[1], v->ne[2],
+                    kq_mask ? kq_mask->ne[0] : 0, kq_mask ? kq_mask->ne[1] : 0,
+                    cur->ne[0], cur->ne[1], cur->ne[2],
+                    q_layout && k_layout && v_layout && kq_mask && ggml_is_contiguous(kq_mask) &&
+                        ggml_is_contiguous(cur),
+                    cparams.causal_attn && kq_mask != nullptr, sinks == nullptr, exact_params,
+                    q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+                        kq_mask != nullptr && kq_mask->ne[3] == 1 && cur->ne[3] == 1);
+            if (allowed) {
+                ggml_flash_attn_ext_set_hint(cur, fattn_hint);
+            }
+        }
 
         if (v_mla) {
 #if 0
@@ -2783,7 +2838,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+enum ggml_op_hint     fattn_hint) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -2819,7 +2875,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fattn_hint);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

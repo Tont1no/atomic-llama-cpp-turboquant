@@ -446,6 +446,28 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        // Request row-wise reproducibility for a narrowly supported matrix
+        // multiplication. Backends must ignore this hint when their guarded
+        // implementation cannot preserve the single-row reduction order.
+        GGML_HINT_MUL_MAT_ROW_INVARIANT = 2,
+        // Diagnostic-only Qwen3.5 ModelOpt projection roles. They use the
+        // same row-wise numerical contract while keeping route evidence
+        // specific to the fused FFN input lanes and the FFN down projection.
+        GGML_HINT_MUL_MAT_ROW_INVARIANT_FFN_UP   = 3,
+        GGML_HINT_MUL_MAT_ROW_INVARIANT_FFN_GATE = 4,
+        GGML_HINT_MUL_MAT_ROW_INVARIANT_FFN_DOWN = 5,
+        // Opt-in Qwen3.5 recurrent GDN coefficient projections.  The CUDA
+        // backend accepts these only for the exact BF16 K5120/N48 M2-M8
+        // contract and otherwise keeps the established dispatch.
+        GGML_HINT_MUL_MAT_ROW_INVARIANT_BF16_BETA  = 6,
+        GGML_HINT_MUL_MAT_ROW_INVARIANT_BF16_ALPHA = 7,
+        // Diagnostic-only Qwen3.5 full-attention role. CUDA accepts it only
+        // for D256, Q8_0 K/V, GQA6, and query columns 3..8.
+        GGML_HINT_FLASH_ATTN_QWEN35_D256_Q8_GQA6_VEC = 8,
+        // Operator-locator-only role. It is never emitted by a model graph;
+        // diagnostic CUDA builds use it to hold the existing cols2 VEC
+        // kernel to one KV-parallel block for M1 and M3..8.
+        GGML_HINT_FLASH_ATTN_QWEN35_D256_Q8_GQA6_VEC_PB1_DIAGNOSTIC = 9,
     };
 
     // model file types
@@ -2447,6 +2469,13 @@ extern "C" {
             enum ggml_prec       prec);
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
+            const struct ggml_tensor * a);
+
+    GGML_API void ggml_flash_attn_ext_set_hint(
+            struct ggml_tensor * a,
+            enum ggml_op_hint    hint);
+
+    GGML_API enum ggml_op_hint ggml_flash_attn_ext_get_hint(
             const struct ggml_tensor * a);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(

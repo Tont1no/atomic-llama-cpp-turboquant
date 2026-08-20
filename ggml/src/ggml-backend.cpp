@@ -1803,9 +1803,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
-    // initialize hash table
-    // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
-    sched->hash_set    = ggml_hash_set_new(graph_size);
+    // The graph capacity applies independently to nodes and leafs. In the
+    // worst case the scheduler therefore has to index 2*graph_size distinct
+    // tensors. This matches the visited hash table used by ggml_cgraph and is
+    // required even before graph_split(), since reserve validates and indexes
+    // the unsplit measurement graph.
+    GGML_ASSERT(graph_size <= SIZE_MAX/2);
+    sched->hash_set    = ggml_hash_set_new(graph_size * 2);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 

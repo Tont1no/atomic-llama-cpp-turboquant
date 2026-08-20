@@ -1,0 +1,44 @@
+{
+  "schema": "ai-loader-qwen38-parity-guard-receipt/v1",
+  "created_at": "2026-08-20T09:39:41.3072260+00:00",
+  "guard_status": "completed",
+  "diagnostic_validation": "passed",
+  "error": null,
+  "executable_sha256": "e552724a30ce0f2ffbd3e57ff466f7dee9789b467582225b641ff29d85e1002e",
+  "guard_sha256": "3120e9fe7c247250a440389d0450c71741718b391d435a270fd2f16d33dc1463",
+  "server_sha256": "12d5f8f3791208720dae9d16970f724a73b88fb2145c718b7d65c5f319776113",
+  "model_sha256": "46e0ec4bdab3907346fbb486b1e4f78b49a66b245374aa0d3d628a8d099c0336",
+  "reference_sha256": "1e5f7b997354cebfded587fdbfc6339737c63fc025760a7f75b224dbada5f348",
+  "manifest_sha256": "67da6391d2240a058562973def2949721fd9c336308d996f5e3b0de73f2405c0",
+  "trace_validation_sha256": "fe38d4bc2702e2a5129235927f550e0269e482c121df3aeda90fbc91c0fc0cbb",
+  "trace_guard_receipt_sha256": "667728f1bcd38da34830f3d416924c446ec72d9f607e6f9779b1e626b0e74492",
+  "command_sha256": "640418e80973413b3f7b95334a8ecf0aa639100e05339d27b5c4ec9ac0704284",
+  "qualification_receipt_sha256": "c9c1fd02566478c8eb53a75c72ba5ac671ccd1111057d8c6891c75503569a9b9",
+  "runtime_bundle_sha256": "8f64cdb9c8abccff79c589c0a83ffc5c8b8788b17faafe176dbae4654754c352",
+  "runtime_bundle_count": 10,
+  "diagnostic_candidate": "QWEN35_NVFP4_FFN_PROJECTIONS_V1",
+  "layer_boundary_bisection": true,
+  "guard": {
+    "Status": "completed",
+    "ExitCode": 0,
+    "PeakUsedVramMiB": 21463,
+    "MinimumFreeVramMiB": 10725,
+    "MinimumFreeRamMiB": 26421.0,
+    "GpuIndex": 0,
+    "GpuUuid": "GPU-ba3b2e01-c751-a1eb-bbc8-fbbef71a20f3",
+    "RuntimeSeconds": 48.3586351,
+    "Lease": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy\\gpu-exclusive.lock"
+  },
+  "postflight": {
+    "relevant_processes": 0,
+    "port_18136_free": true,
+    "recursive_gpu_leases": 0,
+    "checked_lease_roots": [
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy",
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy"
+    ],
+    "remaining_lease_paths": []
+  },
+  "stdout_sha256": "ff8057ec5ff23d085cb943821ec9466b8d677a800ff3751449ba22df15920083",
+  "stderr_sha256": "3434a031b45493e649276c4ee0b0282d4098f4c5a3f9cb6bd8c9567993bd73bb"
+}

@@ -2662,6 +2662,44 @@ bool common_speculative_is_only_dflash_family(const std::vector<common_speculati
            effective == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
 }
 
+bool common_speculative_is_only_dspark(const std::vector<common_speculative_type> & types) {
+    common_speculative_type effective = COMMON_SPECULATIVE_TYPE_NONE;
+    for (const auto type : types) {
+        if (type == COMMON_SPECULATIVE_TYPE_NONE) {
+            continue;
+        }
+        if (effective != COMMON_SPECULATIVE_TYPE_NONE) {
+            return false;
+        }
+        effective = type;
+    }
+
+    return effective == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+bool common_speculative_sps_conflicts_with_adaptive(const common_params_speculative & params) {
+    return params.draft.adaptive &&
+           (!params.draft.sps_profile.empty() ||
+            !params.draft.sps_record.empty() ||
+             params.draft.sps_shadow);
+}
+
+bool common_speculative_uses_dynamic_rs(const common_params_speculative & params) {
+    // Keep selection independent of the selected valid SPS mode once the
+    // explicit DSpark residency switch is enabled: every pure DSpark path uses
+    // packed source-order rows with an exact per-row rollback-depth tag. Mixed
+    // speculative chains fail closed to the fixed resident allocation.
+    if (common_speculative_sps_conflicts_with_adaptive(params)) {
+        return false;
+    }
+    if (common_speculative_is_only_dspark(params.types)) {
+        return params.draft.dynamic_rs;
+    }
+    // Preserve the pre-existing adaptive DFlash opt-in independently of the
+    // new pure-DSpark residency switch.
+    return params.draft.adaptive && common_speculative_is_only_dflash_family(params.types);
+}
+
 common_speculative_type common_speculative_type_from_name(const std::string & name) {
     const auto it = common_speculative_type_from_name_map.find(name);
     if (it == common_speculative_type_from_name_map.end()) {

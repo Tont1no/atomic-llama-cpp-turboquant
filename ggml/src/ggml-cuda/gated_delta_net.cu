@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "diagnostics.cuh"
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -318,10 +319,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_GATED_DELTA_NET);
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr);
 }
 
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_GATED_DELTA_NET_FUSED_CACHE);
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }

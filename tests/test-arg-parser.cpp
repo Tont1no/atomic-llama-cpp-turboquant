@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "speculative.h"
 
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -273,6 +274,45 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_params, LLAMA_EXAMPLE_SERVER));
     assert(sps_params.speculative.draft.sps_profile == "profile.json");
     assert(sps_params.speculative.draft.sps_shadow);
+
+    common_params default_rs_params;
+    assert(!default_rs_params.speculative.draft.dynamic_rs);
+    common_params dynamic_rs_params;
+    argv = {"binary_name", "--spec-type", "draft-dspark", "--spec-draft-dynamic-rs"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dynamic_rs_params, LLAMA_EXAMPLE_SERVER));
+    assert(dynamic_rs_params.speculative.draft.dynamic_rs);
+    argv = {"binary_name", "--spec-type", "draft-dspark", "--no-spec-draft-dynamic-rs"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dynamic_rs_params, LLAMA_EXAMPLE_SERVER));
+    assert(!dynamic_rs_params.speculative.draft.dynamic_rs);
+
+    auto set_dynamic_rs_env = [](const char * value) {
+#ifdef _WIN32
+        assert(_putenv_s("LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS", value) == 0);
+#else
+        assert(setenv("LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS", value, true) == 0);
+#endif
+    };
+    auto clear_dynamic_rs_env = []() {
+#ifdef _WIN32
+        assert(_putenv_s("LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS", "") == 0);
+        assert(_putenv_s("LLAMA_ARG_NO_SPEC_DRAFT_DYNAMIC_RS", "") == 0);
+#else
+        assert(unsetenv("LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS") == 0);
+        assert(unsetenv("LLAMA_ARG_NO_SPEC_DRAFT_DYNAMIC_RS") == 0);
+#endif
+    };
+    clear_dynamic_rs_env();
+    set_dynamic_rs_env("1");
+    common_params dynamic_rs_env_on;
+    argv = {"binary_name", "--spec-type", "draft-dspark"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dynamic_rs_env_on, LLAMA_EXAMPLE_SERVER));
+    assert(dynamic_rs_env_on.speculative.draft.dynamic_rs);
+    set_dynamic_rs_env("0");
+    common_params dynamic_rs_env_off;
+    dynamic_rs_env_off.speculative.draft.dynamic_rs = true;
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), dynamic_rs_env_off, LLAMA_EXAMPLE_SERVER));
+    assert(!dynamic_rs_env_off.speculative.draft.dynamic_rs);
+    clear_dynamic_rs_env();
 
     common_params sps_record_params;
     argv = {

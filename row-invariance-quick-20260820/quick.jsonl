@@ -1,0 +1,3 @@
+{"type":"config","mode":"quick","cases":6,"replays":8,"order":"alternating","fixture":"deterministic_cancellation_sensitive","comparison":"bitwise_f32"}
+{"type":"case","id":"fp8-k5120-n1024","status":"passed","replays":8,"order":"alternating","outputs":8192,"fnv1a64":"1ce58c98c6a49abc"}
+{"type":"routes","id":"fp8-k5120-n1024","fp8":4,"nvfp4_mmvq_m1":0,"nvfp4_mmvq_m8":0,"nvfp4_fused_ffn":0,"gdn":0,"gdn_fused_cache":0}

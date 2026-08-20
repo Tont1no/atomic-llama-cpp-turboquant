@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "diagnostics.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
@@ -162,6 +163,8 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
     const bool fuse_bias = bias_add_node != nullptr;
     const bool fuse_silu = silu_dst != nullptr;
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(fuse_silu ?
+            GGML_CUDA_DIAGNOSTIC_ROUTE_SSM_CONV_SILU : GGML_CUDA_DIAGNOSTIC_ROUTE_SSM_CONV);
 
     // bias always comes with silu.
     GGML_ASSERT(!fuse_bias || fuse_silu);

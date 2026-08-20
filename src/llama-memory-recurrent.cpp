@@ -69,6 +69,21 @@ uint32_t llama_recurrent_batch_active_rs_depth(
     return active_depth;
 }
 
+bool llama_recurrent_rollback_is_valid(
+        bool dynamic,
+        uint32_t rollback,
+        uint32_t configured_max,
+        uint32_t resident_depth,
+        uint32_t valid_depth) {
+    if (rollback == 0 || rollback > configured_max) {
+        return false;
+    }
+    if (!dynamic) {
+        return true;
+    }
+    return rollback <= resident_depth && rollback <= valid_depth;
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -538,8 +553,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
-                    if (rs_seq_dynamic && ((size_t) seq_id >= rs_valid_depth.size() ||
-                            rollback > (llama_pos) rs_valid_depth[seq_id])) {
+                    const uint32_t valid_depth = (size_t) seq_id < rs_valid_depth.size() ?
+                            rs_valid_depth[seq_id] : 0;
+                    if (!llama_recurrent_rollback_is_valid(
+                            rs_seq_dynamic, (uint32_t) rollback, n_rs_seq,
+                            n_rs_seq_alloc, valid_depth)) {
                         return false;
                     }
                     set_rs_idx(seq_id, (uint32_t) rollback);
@@ -803,6 +821,33 @@ void llama_memory_recurrent::commit_rs_depth(const llama_ubatch & ubatch, uint32
     }
 }
 
+void llama_memory_recurrent::invalidate_rs_depth(const llama_ubatch & ubatch) {
+    if (!rs_seq_dynamic) {
+        return;
+    }
+    if (!ubatch.equal_seqs() || ubatch.n_seq_tokens == 0 || ubatch.n_seqs == 0 ||
+            (uint64_t) ubatch.n_tokens != (uint64_t) ubatch.n_seq_tokens * ubatch.n_seqs) {
+        std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+        return;
+    }
+
+    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+        const uint32_t i = s * ubatch.n_seq_tokens;
+        if (ubatch.n_seq_id[i] <= 0 || ubatch.seq_id[i] == nullptr) {
+            std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+            return;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            if (seq_id < 0 || (size_t) seq_id >= rs_valid_depth.size()) {
+                std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+                return;
+            }
+            rs_valid_depth[seq_id] = 0;
+        }
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -812,18 +857,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
 }
 
 llama_memory_recurrent_resize_stats llama_memory_recurrent::recurrent_resize_stats() const {
-    llama_memory_recurrent_resize_stats result;
-    if (!rs_seq_compact) {
-        return result;
-    }
-    result.count            = rs_resize_count;
-    result.time_us          = rs_resize_time_us;
-    result.resident_depth   = n_rs_seq_alloc;
-    result.configured_depth = n_rs_seq;
-    result.pending_depth    = rs_shrink_pending_depth;
-    result.stable_ticks     = rs_shrink_stable_ticks;
-    result.required_depth   = rs_last_required_depth;
-    return result;
+    // Fixed recurrent storage is still real resident/configured capacity.
+    // Previously the non-compact early return made server gauges report zero
+    // even when n_rs_seq planes were allocated. Dynamic contexts additionally
+    // expose their last requested execution depth and resize lifecycle.
+    return llama_recurrent_resize_metrics_snapshot(
+            rs_seq_dynamic,
+            n_rs_seq,
+            n_rs_seq_alloc,
+            rs_last_required_depth,
+            rs_shrink_pending_depth,
+            rs_shrink_stable_ticks,
+            rs_resize_count,
+            rs_resize_time_us);
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -1639,9 +1685,23 @@ bool llama_memory_recurrent_context::apply() {
     if (!mem->find_slot(ubatches[i_next])) {
         return false;
     }
-    mem->commit_rs_depth(ubatches[i_next], get_active_n_rs_seq());
 
     return true;
+}
+
+void llama_memory_recurrent_context::finalize(bool success) {
+    if (ubatches.empty()) {
+        return;
+    }
+
+    if (success) {
+        mem->commit_rs_depth(ubatches[i_next], get_active_n_rs_seq());
+    } else {
+        // find_slot() already changed recurrent metadata, while no successful
+        // graph is known to have written this ubatch's snapshot planes. Never
+        // allow a later rollback to select those planned/stale planes.
+        mem->invalidate_rs_depth(ubatches[i_next]);
+    }
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {

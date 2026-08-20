@@ -1,0 +1,37 @@
+{
+  "schema": "ai-loader-qwen38-parity-guard-receipt/v1",
+  "created_at": "2026-08-20T05:43:15.4791927+00:00",
+  "guard_status": "completed",
+  "diagnostic_validation": "passed",
+  "error": null,
+  "executable_sha256": "fbd671336d3ff8eff6ff4e1d9aa53c1e74b2de07b5d05fd4d65559f05c24de06",
+  "guard_sha256": "912a133c4d93a6732abdbfda62158874023094db28283fe8f323c4f3c011f143",
+  "server_sha256": "e320e0aaaeae1fd4d450fc03a4a0610fdd6d0bc08036aa61b6ddcc1b5e142e88",
+  "model_sha256": "46e0ec4bdab3907346fbb486b1e4f78b49a66b245374aa0d3d628a8d099c0336",
+  "reference_sha256": "84d1ee1527f3dfb584feb7331fc73cdca49e048da7ede7d11e7715603cb59bc6",
+  "manifest_sha256": "b0adbabfaa7ccf96b617b8b5fc4464f790b2969b1086859d78a483cc66817e80",
+  "trace_validation_sha256": "c5aaea4d3b31432d5da3fcb58cdc0b50490c51d625aa3f4f88028c62657ac82e",
+  "trace_guard_receipt_sha256": "7a24d9f07401a3504b326ef83fbb7387ceb877993730bb08d6f9c7cb835e205c",
+  "command_sha256": "640418e80973413b3f7b95334a8ecf0aa639100e05339d27b5c4ec9ac0704284",
+  "qualification_receipt_sha256": "b93b6e53ee0f7828bddae4bc2050b428b6c2491744a2d5220c67450de73795ca",
+  "runtime_bundle_sha256": "ea017789b400c862667905ec9d73f6beaa3e3df5d7ad77ce8e5f071443e04526",
+  "runtime_bundle_count": 10,
+  "guard": {
+    "Status": "completed",
+    "ExitCode": 0,
+    "PeakUsedVramMiB": 21243,
+    "MinimumFreeVramMiB": 10945,
+    "MinimumFreeRamMiB": 22998.0,
+    "GpuIndex": 0,
+    "GpuUuid": "GPU-ba3b2e01-c751-a1eb-bbc8-fbbef71a20f3",
+    "RuntimeSeconds": 68.6023771,
+    "Lease": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy\\gpu-exclusive.lock"
+  },
+  "postflight": {
+    "relevant_processes": 0,
+    "port_18136_free": true,
+    "recursive_gpu_leases": 0
+  },
+  "stdout_sha256": "c89220155ea450509abad13b41ba0acf582bc9cfcaba1ee79ecec7421013984d",
+  "stderr_sha256": "66160032245b42a9d8c5299d93b3a161ae6dc19470bdb80dd08a731c6c59e375"
+}

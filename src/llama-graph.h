@@ -891,6 +891,19 @@ struct llm_graph_fused_node {
     int il;
 };
 
+static inline size_t llm_graph_result_meta_size(size_t max_nodes) {
+    const size_t tensor_overhead = ggml_tensor_overhead();
+    GGML_ASSERT(tensor_overhead > 0);
+    GGML_ASSERT(max_nodes <= (SIZE_MAX/tensor_overhead)/2);
+
+    // A cgraph can independently contain max_nodes operation tensors and
+    // max_nodes leaf tensors. Both sets can be owned by this metadata arena.
+    const size_t tensor_meta_size = 2*max_nodes*tensor_overhead;
+    const size_t graph_meta_size = ggml_graph_overhead_custom(max_nodes, false);
+    GGML_ASSERT(tensor_meta_size <= SIZE_MAX - graph_meta_size);
+    return tensor_meta_size + graph_meta_size;
+}
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -1053,10 +1066,11 @@ struct llm_graph_context {
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
-              ggml_tensor * w,
-              ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr,
-              ggml_tensor * input_s = nullptr) const;
+               ggml_tensor * w,
+               ggml_tensor * cur,
+               ggml_tensor * w_s = nullptr,
+               ggml_tensor * input_s = nullptr,
+          enum ggml_op_hint   hint = GGML_HINT_NONE) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
@@ -1097,7 +1111,10 @@ struct llm_graph_context {
              ggml_tensor * act_scales,
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
-                     int   il) const;
+                     int   il,
+       enum ggml_op_hint   up_hint = GGML_HINT_NONE,
+       enum ggml_op_hint   gate_hint = GGML_HINT_NONE,
+       enum ggml_op_hint   down_hint = GGML_HINT_NONE) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
@@ -1176,7 +1193,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+      enum ggml_op_hint   fattn_hint = GGML_HINT_NONE) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1208,7 +1226,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+      enum ggml_op_hint   fattn_hint = GGML_HINT_NONE) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

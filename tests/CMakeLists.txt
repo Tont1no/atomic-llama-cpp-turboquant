@@ -151,12 +151,24 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+llama_build_and_test(test-recurrent-resize-metrics.cpp)
+target_include_directories(test-recurrent-resize-metrics PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 llama_build(test-dspark-packed.cpp)
 target_include_directories(test-dspark-packed PRIVATE ${PROJECT_SOURCE_DIR}/common ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-dspark-packed)
 
+if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER)
+    llama_build_and_test(test-server-stream-token-output.cpp)
+    target_include_directories(test-server-stream-token-output PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-stream-token-output PRIVATE server-context)
+endif()
+
+llama_build_and_test(test-backend-sched-capacity.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    target_compile_definitions(test-recurrent-state-rollback PRIVATE LLAMA_TEST_INTERNAL_RECURRENT_LIFECYCLE=1)
     llama_build_and_test(test-sampling.cpp)
     llama_build_and_test(test-reasoning-budget.cpp)
     llama_build_and_test(test-grammar-parser.cpp)
@@ -246,10 +258,46 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build_and_test(test-qwen38-recurrent-parity-utils.cpp)
+llama_build_and_test(test-qwen38-parity-cli.cpp)
+llama_build_and_test(test-qwen38-row-invariance-matrix.cpp)
+if (WIN32)
+    find_program(PWSH_EXECUTABLE pwsh.exe)
+    if (PWSH_EXECUTABLE)
+        add_test(
+            NAME test-qwen38-parity-diagnostic-wrapper
+            COMMAND ${PWSH_EXECUTABLE} -NoLogo -NoProfile -File
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test_qwen38_parity_diagnostic_wrapper.ps1
+        )
+        set_tests_properties(test-qwen38-parity-diagnostic-wrapper PROPERTIES LABELS main)
+        add_test(
+            NAME test-qwen38-row-invariance-wrapper
+            COMMAND ${PWSH_EXECUTABLE} -NoLogo -NoProfile -File
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test_qwen38_row_invariance_wrapper.ps1
+        )
+        set_tests_properties(test-qwen38-row-invariance-wrapper PROPERTIES LABELS main)
+    endif()
+endif()
+# Guarded, model-specific diagnostic. It is intentionally not registered with
+# CTest: the wrapper requires an external Qwen3.8 GGUF and enforces one context
+# at a time so a developer cannot accidentally overlap it with llama-server.
+llama_build(test-qwen38-recurrent-parity.cpp)
+if (WIN32 AND PWSH_EXECUTABLE)
+    add_test(
+        NAME test-qwen38-parity-early-failure
+        COMMAND ${PWSH_EXECUTABLE} -NoLogo -NoProfile -File
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_qwen38_parity_early_failure.ps1
+                -DiagnosticExecutable $<TARGET_FILE:test-qwen38-recurrent-parity>
+    )
+    set_tests_properties(test-qwen38-parity-early-failure PROPERTIES LABELS main)
+endif()
 # Model-specific manual regression harness. It is built only with CUDA and is
 # not registered with ctest because it requires external target and DFlash GGUFs.
 if (GGML_CUDA)
     llama_build(test-dflash-fusion-determinism.cpp)
+    # Guarded operator-level diagnostic. It is not registered with CTest:
+    # CUDA execution must go through Invoke-ExclusiveGpuTask.ps1.
+    llama_build(test-qwen38-row-invariance.cpp)
 endif()
 llama_build_and_test(
     test-peg-parser.cpp

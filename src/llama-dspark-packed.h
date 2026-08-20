@@ -154,6 +154,146 @@ inline std::vector<std::vector<uint32_t>> llama_dspark_reserve_widths(
     return result;
 }
 
+// Output rows for a synthetic packed DSpark reserve graph. Backend-sampler
+// sequences are capped per sequence; raw-logit sequences may use every packed
+// row up to the global limit. Packed rows are contiguous rather than rectangular.
+inline std::vector<uint32_t> llama_dspark_reserve_output_rows(
+        const std::vector<uint32_t> & widths,
+        uint32_t                      n_outputs_max,
+        uint32_t                      n_outputs_max_per_seq,
+        const std::vector<bool>     & sampler_seqs) {
+    std::vector<uint32_t> result;
+    if (widths.empty() || sampler_seqs.size() != widths.size() ||
+            n_outputs_max == 0 || n_outputs_max_per_seq == 0) {
+        return result;
+    }
+
+    uint64_t n_rows = 0;
+    uint64_t n_outputs = 0;
+    std::vector<uint32_t> row_begin;
+    row_begin.reserve(widths.size());
+    for (size_t s = 0; s < widths.size(); ++s) {
+        const uint32_t width = widths[s];
+        if (width == 0 || n_rows + width > UINT32_MAX) {
+            return {};
+        }
+        row_begin.push_back((uint32_t) n_rows);
+        n_rows += width;
+        n_outputs += sampler_seqs[s] ?
+                std::min(width, n_outputs_max_per_seq) : width;
+    }
+
+    n_outputs = std::min<uint64_t>(n_outputs, n_outputs_max);
+    result.reserve((size_t) n_outputs);
+
+    // Match ubatch_prepare_reserve(): maximize active backend-sampler rows
+    // first, then use non-sampler sequences for any remaining output budget.
+    for (bool want_sampler : { true, false }) {
+        for (size_t s = 0; s < widths.size() && result.size() < n_outputs; ++s) {
+            if (sampler_seqs[s] != want_sampler) {
+                continue;
+            }
+            const uint32_t seq_limit = want_sampler ?
+                    std::min(widths[s], n_outputs_max_per_seq) : widths[s];
+            const uint32_t n_take = (uint32_t) std::min<uint64_t>(
+                    seq_limit, n_outputs - result.size());
+            for (uint32_t i = 0; i < n_take; ++i) {
+                result.push_back(row_begin[s] + i);
+            }
+        }
+    }
+
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// Synthetic sequence-id assignments for packed reserve graphs. Sparse backend
+// sampler IDs must appear in the ubatch or build_sampling() treats them as
+// inactive. Two assignments cover both extremes for unequal widths: samplers
+// on wide groups maximize sampler work, while samplers on low-loss groups
+// maximize the remaining raw-logit output count.
+inline std::vector<std::vector<llama_seq_id>> llama_dspark_reserve_seq_id_plans(
+        const std::vector<uint32_t>     & widths,
+        uint32_t                          n_seq_groups_max,
+        uint32_t                          n_seq_id_max,
+        uint32_t                          n_outputs_max_per_seq,
+        const std::vector<llama_seq_id> & sampler_ids) {
+    std::vector<std::vector<llama_seq_id>> result;
+    if (widths.empty() || widths.size() > n_seq_groups_max || widths.size() > n_seq_id_max ||
+            n_outputs_max_per_seq == 0) {
+        return result;
+    }
+    for (uint32_t width : widths) {
+        if (width == 0) {
+            return {};
+        }
+    }
+
+    std::vector<llama_seq_id> samplers;
+    std::vector<bool> is_sampler(n_seq_id_max, false);
+    for (llama_seq_id seq_id : sampler_ids) {
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_id_max || is_sampler[seq_id]) {
+            continue;
+        }
+        is_sampler[seq_id] = true;
+        samplers.push_back(seq_id);
+    }
+
+    std::vector<size_t> wide_order;
+    wide_order.reserve(widths.size());
+    for (size_t s = 0; s < widths.size(); ++s) {
+        wide_order.push_back(s);
+    }
+    std::stable_sort(wide_order.begin(), wide_order.end(), [&](size_t a, size_t b) {
+        return std::min(widths[a], n_outputs_max_per_seq) >
+               std::min(widths[b], n_outputs_max_per_seq);
+    });
+
+    auto make_plan = [&](const std::vector<size_t> & sampler_order) {
+        std::vector<llama_seq_id> plan(widths.size(), -1);
+        const size_t n_active = std::min(samplers.size(), widths.size());
+        for (size_t i = 0; i < n_active; ++i) {
+            plan[sampler_order[i]] = samplers[i];
+        }
+
+        llama_seq_id next = 0;
+        for (llama_seq_id & seq_id : plan) {
+            if (seq_id >= 0) {
+                continue;
+            }
+            while ((uint32_t) next < n_seq_id_max && is_sampler[next]) {
+                ++next;
+            }
+            if ((uint32_t) next >= n_seq_id_max) {
+                return std::vector<llama_seq_id>{};
+            }
+            seq_id = next++;
+        }
+        return plan;
+    };
+
+    auto wide = make_plan(wide_order);
+    if (wide.empty()) {
+        return {};
+    }
+    result.push_back(wide);
+
+    if (!samplers.empty() && samplers.size() < widths.size()) {
+        std::vector<size_t> low_loss_order = wide_order;
+        std::stable_sort(low_loss_order.begin(), low_loss_order.end(), [&](size_t a, size_t b) {
+            const uint32_t loss_a = widths[a] - std::min(widths[a], n_outputs_max_per_seq);
+            const uint32_t loss_b = widths[b] - std::min(widths[b], n_outputs_max_per_seq);
+            return loss_a < loss_b;
+        });
+        auto low_loss = make_plan(low_loss_order);
+        if (low_loss != wide) {
+            result.push_back(std::move(low_loss));
+        }
+    }
+
+    return result;
+}
+
 inline llama_dspark_packed_layout llama_dspark_packed_layout_from_rows(
         uint32_t              n_tokens,
         const int32_t       * n_seq_id,

@@ -1,4 +1,5 @@
 #include "unary.cuh"
+#include "diagnostics.cuh"
 #include "convert.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
@@ -183,6 +184,7 @@ void ggml_cuda_op_gelu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 }
 
 void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_SILU);
     ggml_cuda_op_unary<op_silu>(ctx, dst);
 }
 
@@ -195,6 +197,7 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_SIGMOID);
     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
 }
 
@@ -614,9 +617,11 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:
+            GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_SILU_MUL);
             ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
             break;
         case GGML_UNARY_OP_SIGMOID:
+            GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(GGML_CUDA_DIAGNOSTIC_ROUTE_SIGMOID_MUL);
             ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
             break;
         case GGML_UNARY_OP_SOFTPLUS:

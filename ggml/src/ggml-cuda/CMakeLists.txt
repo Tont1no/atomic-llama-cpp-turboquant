@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 find_package(CUDAToolkit)
+option(GGML_CUDA_DIAGNOSTIC_ROUTES "Enable internal CUDA route counters for guarded diagnostics" OFF)
 
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
@@ -128,6 +129,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_DIAGNOSTIC_ROUTES)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_DIAGNOSTIC_ROUTES)
+    endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 

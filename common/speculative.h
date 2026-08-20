@@ -18,6 +18,23 @@ std::vector<enum common_speculative_type> common_speculative_types_from_names(co
 // it is DFlash or DSpark. NONE is a configuration sentinel and is ignored.
 bool common_speculative_is_only_dflash_family(const std::vector<enum common_speculative_type> & types);
 
+// Return true when the effective chain contains exactly one non-NONE type and
+// it is DSpark. DSpark always submits source-order packed verification rows,
+// so its target recurrent cache can safely follow the explicit per-row depth
+// contract even when SPS, a recorder force-cap, or the fixed planner selects
+// the current prefix width.
+bool common_speculative_is_only_dspark(const std::vector<enum common_speculative_type> & types);
+
+// SPS planning, shadowing and recording are startup-mutually-exclusive with
+// adaptive drafting. Kept as a pure predicate so non-server callers also fail
+// closed instead of constructing an ambiguous recurrent layout.
+bool common_speculative_sps_conflicts_with_adaptive(const common_params_speculative & params);
+
+// Select compact/dynamic recurrent snapshots for supported speculative
+// configurations. DFlash keeps the existing adaptive-only opt-in; a pure
+// DSpark chain opts in because packed rows carry their exact verify depth.
+bool common_speculative_uses_dynamic_rs(const common_params_speculative & params);
+
 // infer the spec types from the GGUF metadata of a draft model; empty if unknown
 std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 

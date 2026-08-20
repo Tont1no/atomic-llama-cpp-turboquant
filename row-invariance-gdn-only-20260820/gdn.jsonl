@@ -1,0 +1,6 @@
+{"type":"config","mode":"gdn","cases":2,"replays":8,"order":"alternating","fixture":"deterministic_cancellation_sensitive","comparison":"bitwise_f32"}
+{"type":"case","id":"gdn-k1-vs-k8","status":"passed","replays":8,"slot":0,"finite":true,"comparison":"bitwise_f32","fnv1a64":"f5ac2afb87513057"}
+{"type":"routes","id":"gdn-k1-vs-k8","fp8":0,"fp8_batch":0,"nvfp4_mmvq_m1":0,"nvfp4_mmvq_m8":0,"nvfp4_fused_ffn":0,"nvfp4_row_invariant_head_scaled":0,"nvfp4_row_invariant_ffn_fused":0,"nvfp4_row_invariant_ffn_down_scaled":0,"gdn":0,"gdn_fused_cache":4}
+{"type":"case","id":"gdn-seq1-vs-batch8","status":"passed","replays":8,"snapshot_order":"newest_first","finite":true,"comparison":"bitwise_f32","fnv1a64":"a70e9367a911e665"}
+{"type":"routes","id":"gdn-seq1-vs-batch8","fp8":0,"fp8_batch":0,"nvfp4_mmvq_m1":0,"nvfp4_mmvq_m8":0,"nvfp4_fused_ffn":0,"nvfp4_row_invariant_head_scaled":0,"nvfp4_row_invariant_ffn_fused":0,"nvfp4_row_invariant_ffn_down_scaled":0,"gdn":0,"gdn_fused_cache":4}
+{"type":"complete","status":"passed","mode":"gdn","cases":2}

@@ -1,0 +1,48 @@
+{
+  "schema": "ai-loader-qwen38-parity-guard-receipt/v1",
+  "created_at": "2026-08-20T11:54:30.2489174+00:00",
+  "guard_status": "completed",
+  "diagnostic_validation": "passed",
+  "error": null,
+  "executable_sha256": "4254723368f6a2b6972bf4882f2ba68b9cffc5915f1b6ab5c976e9de4d00de5a",
+  "guard_sha256": "3120e9fe7c247250a440389d0450c71741718b391d435a270fd2f16d33dc1463",
+  "server_sha256": "790f9f04217ae2cf43e186d33c93dc44dfd0eacca679b659576baf85897a3968",
+  "model_sha256": "46e0ec4bdab3907346fbb486b1e4f78b49a66b245374aa0d3d628a8d099c0336",
+  "reference_sha256": "1e5f7b997354cebfded587fdbfc6339737c63fc025760a7f75b224dbada5f348",
+  "manifest_sha256": "67da6391d2240a058562973def2949721fd9c336308d996f5e3b0de73f2405c0",
+  "trace_validation_sha256": "fe38d4bc2702e2a5129235927f550e0269e482c121df3aeda90fbc91c0fc0cbb",
+  "trace_guard_receipt_sha256": "667728f1bcd38da34830f3d416924c446ec72d9f607e6f9779b1e626b0e74492",
+  "command_sha256": "640418e80973413b3f7b95334a8ecf0aa639100e05339d27b5c4ec9ac0704284",
+  "qualification_receipt_sha256": "c9c1fd02566478c8eb53a75c72ba5ac671ccd1111057d8c6891c75503569a9b9",
+  "runtime_bundle_sha256": "95f0848ce95d4098424e76997d84899e00ffe17661fafd7c64f21d9ec86f8572",
+  "runtime_bundle_count": 10,
+  "diagnostic_candidate": "QWEN35_BF16_RECURRENT_PROJECTIONS_V1",
+  "qwen35_nvfp4_head_hint_compiled": true,
+  "qwen35_nvfp4_ffn_projections": false,
+  "qwen35_bf16_recurrent_projections": true,
+  "layer_boundary_bisection": false,
+  "recurrent_internal_refine": false,
+  "guard": {
+    "Status": "completed",
+    "ExitCode": 0,
+    "PeakUsedVramMiB": 21250,
+    "MinimumFreeVramMiB": 10938,
+    "MinimumFreeRamMiB": 26479.0,
+    "GpuIndex": 0,
+    "GpuUuid": "GPU-ba3b2e01-c751-a1eb-bbc8-fbbef71a20f3",
+    "RuntimeSeconds": 65.5922796,
+    "Lease": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy\\gpu-exclusive.lock"
+  },
+  "postflight": {
+    "relevant_processes": 0,
+    "port_18136_free": true,
+    "recursive_gpu_leases": 0,
+    "checked_lease_roots": [
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy",
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy"
+    ],
+    "remaining_lease_paths": []
+  },
+  "stdout_sha256": "a90301b809ff594ecd2f56548b1e268381270c7032ceae149504a029872dc4c9",
+  "stderr_sha256": "725274d41f909e2d4ae9627e9a8fcaa52554a2f5ef9cbb213b6d4b94ca402498"
+}

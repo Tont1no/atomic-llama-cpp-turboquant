@@ -1,0 +1,2 @@
+{"type":"config","mode":"head-candidate","cases":1,"replays":8,"order":"alternating","fixture":"deterministic_cancellation_sensitive","comparison":"bitwise_f32"}
+{"type":"route_negative_control","id":"nvfp4-qwen35-lm-head-row-invariant","row_invariant_head":0}

@@ -72,6 +72,7 @@ def test_metrics_prometheus_format():
         "llamacpp:requests_deferred",
         "llamacpp:n_busy_slots_per_decode",
         "llamacpp:recurrent_snapshot_resident_depth",
+        "llamacpp:recurrent_snapshot_configured_depth",
         "llamacpp:recurrent_snapshot_required_depth",
         "llamacpp:recurrent_snapshot_pending_depth",
         "llamacpp:recurrent_snapshot_shrink_stable_ticks",

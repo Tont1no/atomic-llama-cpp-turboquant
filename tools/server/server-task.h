@@ -52,6 +52,18 @@ enum task_response_type {
     TASK_RESPONSE_TYPE_ANTHROPIC,
 };
 
+// Native streaming clients that explicitly request token IDs must receive one
+// ID for every generated token, even while its byte piece is being buffered
+// until a complete UTF-8 sequence can be emitted as content.  Keep this
+// native-only so OpenAI-compatible streaming chunk semantics remain unchanged.
+inline bool server_should_emit_native_token_only_partial(
+        task_response_type res_type,
+        bool stream,
+        bool return_tokens,
+        bool content_utf8_incomplete) {
+    return res_type == TASK_RESPONSE_TYPE_NONE && stream && return_tokens && content_utf8_incomplete;
+}
+
 enum stop_type {
     STOP_TYPE_NONE,
     STOP_TYPE_EOS,
@@ -328,6 +340,20 @@ struct completion_token_output {
     static std::vector<unsigned char> str_to_bytes(const std::string & str);
 
 };
+
+struct server_stream_partial_payload {
+    std::string  content;
+    llama_tokens tokens;
+};
+
+inline server_stream_partial_payload server_make_stream_partial_payload(
+        const completion_token_output & token,
+        bool suppress_content) {
+    return {
+        suppress_content ? "" : token.text_to_send,
+        { token.tok },
+    };
+}
 
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;

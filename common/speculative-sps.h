@@ -129,6 +129,12 @@ public:
     bool ready() const;
     size_t expected_coordinates() const;
     size_t ready_coordinates() const;
+    uint64_t retained_samples() const;
+    uint64_t skipped_warmup() const;
+    uint64_t skipped_capture() const;
+    uint64_t skipped_ineligible() const;
+    uint64_t skipped_outside_grid() const;
+    uint64_t skipped_full() const;
 
     // Throws until every configured coordinate has enough retained samples.
     common_speculative_sps_profile profile() const;

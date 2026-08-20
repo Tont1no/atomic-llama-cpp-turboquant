@@ -123,6 +123,15 @@ struct common_params_context {
 // if one argument has invalid value, it will automatically display usage of the specific argument (and not the full usage message)
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
 
+// Parse explicit arguments and environment without applying machine/user-wide
+// config.ini defaults. Intended for pinned, reproducible diagnostic commands.
+bool common_params_parse_no_system_config(
+        int argc,
+        char ** argv,
+        common_params & params,
+        llama_example ex,
+        void(*print_usage)(int, char **) = nullptr);
+
 // load all backends and print the list of available (non-CPU) devices to stdout
 void common_print_available_devices();
 

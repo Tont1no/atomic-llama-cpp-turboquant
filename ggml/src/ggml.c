@@ -5488,6 +5488,19 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_hint(
+        struct ggml_tensor * a,
+        enum ggml_op_hint    hint) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 4, (int32_t) hint);
+}
+
+enum ggml_op_hint ggml_flash_attn_ext_get_hint(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return (enum ggml_op_hint) ggml_get_op_params_i32(a, 4);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

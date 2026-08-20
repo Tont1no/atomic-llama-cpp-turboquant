@@ -1,4 +1,5 @@
 #include "speculative-sps.h"
+#include "speculative-sps-atomic.h"
 
 #include <nlohmann/json.hpp>
 
@@ -8,6 +9,15 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #undef NDEBUG
 #include <cassert>
@@ -199,6 +209,12 @@ static void test_atomic_sidecar_and_restart_resume() {
     common_speculative_sps_profile_recorder resumed(std::move(resumed_config));
     assert(resumed.ready_coordinates() == 1);
     assert(!resumed.ready());
+    assert(resumed.retained_samples() == 2);
+    assert(resumed.skipped_warmup() == 1);
+    assert(resumed.skipped_capture() == 0);
+    assert(resumed.skipped_ineligible() == 0);
+    assert(resumed.skipped_outside_grid() == 0);
+    assert(resumed.skipped_full() == 0);
 
     auto record_resumed_pair = [&](int32_t active, int32_t rows, double first, double second) {
         auto sample = fake_timed_sample(100, active, rows, 0, (int64_t) first);
@@ -215,6 +231,8 @@ static void test_atomic_sidecar_and_restart_resume() {
     record_resumed_pair(1, 2, 40.0, 50.0);
     record_resumed_pair(2, 2, 70.0, 80.0);
     assert(resumed.ready());
+    assert(resumed.retained_samples() == 6);
+    assert(resumed.skipped_warmup() == 3);
 
     resumed.write_atomic(profile_path.string(), sidecar_path.string());
     const auto profile = common_speculative_sps_profile_load(profile_path.string());
@@ -291,9 +309,170 @@ static void test_atomic_sidecar_and_restart_resume() {
     std::filesystem::remove_all(dir);
 }
 
+#ifdef _WIN32
+static void test_bounded_windows_replace_retry_contract() {
+    using namespace common_speculative_sps_detail;
+
+    assert(windows_replace_error_is_retryable(WIN_ERROR_ACCESS_DENIED));
+    assert(windows_replace_error_is_retryable(WIN_ERROR_SHARING_VIOLATION));
+    assert(windows_replace_error_is_retryable(WIN_ERROR_LOCK_VIOLATION));
+    assert(windows_replace_error_is_retryable(WIN_ERROR_UNABLE_TO_REMOVE_REPLACED));
+    assert(!windows_replace_error_is_retryable(ERROR_FILE_NOT_FOUND));
+    assert(!windows_replace_error_is_retryable(ERROR_INVALID_PARAMETER));
+
+    uint64_t now_ns = 0;
+    size_t attempt_index = 0;
+    const std::vector<uint32_t> transient_then_success = {
+        WIN_ERROR_ACCESS_DENIED,
+        WIN_ERROR_SHARING_VIOLATION,
+        WIN_ERROR_LOCK_VIOLATION,
+        WIN_ERROR_UNABLE_TO_REMOVE_REPLACED,
+        0,
+    };
+    const auto success = retry_windows_replace(
+            [&]() { return transient_then_success.at(attempt_index++); },
+            [&]() { return now_ns; },
+            [&](uint32_t delay_ms) { now_ns += (uint64_t) delay_ms * 1000ULL * 1000ULL; });
+    assert(success.success);
+    assert(success.error == 0);
+    assert(success.retries == 4);
+    assert(attempt_index == 5);
+    assert(now_ns == 20ULL * 1000ULL * 1000ULL);
+
+    now_ns = 0;
+    size_t permanent_attempts = 0;
+    const auto deadline_failure = retry_windows_replace(
+            [&]() {
+                permanent_attempts++;
+                return WIN_ERROR_UNABLE_TO_REMOVE_REPLACED;
+            },
+            [&]() { return now_ns; },
+            [&](uint32_t delay_ms) { now_ns += (uint64_t) delay_ms * 1000ULL * 1000ULL; },
+            12ULL * 1000ULL * 1000ULL,
+            5);
+    assert(!deadline_failure.success);
+    assert(deadline_failure.error == WIN_ERROR_UNABLE_TO_REMOVE_REPLACED);
+    assert(deadline_failure.retries == 2);
+    assert(permanent_attempts == 3);
+    assert(now_ns == 12ULL * 1000ULL * 1000ULL);
+
+    for (const uint32_t nonretryable : { (uint32_t) ERROR_FILE_NOT_FOUND, (uint32_t) ERROR_INVALID_PARAMETER }) {
+        now_ns = 0;
+        size_t calls = 0;
+        size_t sleeps = 0;
+        const auto immediate = retry_windows_replace(
+                [&]() { calls++; return nonretryable; },
+                [&]() { return now_ns; },
+                [&](uint32_t) { sleeps++; });
+        assert(!immediate.success);
+        assert(immediate.error == nonretryable);
+        assert(immediate.retries == 0);
+        assert(calls == 1);
+        assert(sleeps == 0);
+    }
+}
+
+static void test_atomic_replace_with_shared_delete_reader() {
+    const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    const auto dir = std::filesystem::temp_directory_path() /
+            ("llama-sps-recorder-shared-reader-" + std::to_string(nonce));
+    std::filesystem::create_directories(dir);
+    const auto profile_path = dir / "profile.json";
+    const auto sidecar_path = dir / "profile.samples.json";
+
+    common_speculative_sps_profile_recorder recorder(recorder_config());
+    auto sample = fake_timed_sample(100, 1, 1, 0, 100);
+    recorder.observe(sample);
+    recorder.observe(sample);
+    sample.cost_us = 120.0;
+    recorder.observe(sample);
+    recorder.write_atomic(profile_path.string(), sidecar_path.string());
+
+    const HANDLE reader = CreateFileW(
+            sidecar_path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+    assert(reader != INVALID_HANDLE_VALUE);
+    try {
+        for (int i = 0; i < 300; ++i) {
+            recorder.write_atomic(profile_path.string(), sidecar_path.string());
+        }
+    } catch (...) {
+        CloseHandle(reader);
+        std::filesystem::remove_all(dir);
+        throw;
+    }
+    assert(CloseHandle(reader));
+    assert(json::parse(read_file(sidecar_path)).at("ready_coordinates").get<size_t>() == 1);
+    std::filesystem::remove_all(dir);
+}
+
+static void test_permanent_sharing_failure_is_bounded_and_cleans_temp() {
+    const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    const auto dir = std::filesystem::temp_directory_path() /
+            ("llama-sps-recorder-locked-destination-" + std::to_string(nonce));
+    std::filesystem::create_directories(dir);
+    const auto profile_path = dir / "profile.json";
+    const auto sidecar_path = dir / "profile.samples.json";
+
+    common_speculative_sps_profile_recorder recorder(recorder_config());
+    auto sample = fake_timed_sample(100, 1, 1, 0, 100);
+    recorder.observe(sample);
+    recorder.observe(sample);
+    sample.cost_us = 120.0;
+    recorder.observe(sample);
+    recorder.write_atomic(profile_path.string(), sidecar_path.string());
+
+    // Deliberately omit FILE_SHARE_DELETE so ReplaceFileW sees a permanent,
+    // retryable sharing violation until the bounded deadline expires.
+    const HANDLE reader = CreateFileW(
+            sidecar_path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+    assert(reader != INVALID_HANDLE_VALUE);
+
+    bool threw = false;
+    std::string message;
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        recorder.write_atomic(profile_path.string(), sidecar_path.string());
+    } catch (const std::exception & error) {
+        threw = true;
+        message = error.what();
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    assert(threw);
+    assert(message.find("Windows error 32") != std::string::npos ||
+           message.find("Windows error 5") != std::string::npos);
+    assert(message.find("retries 0") == std::string::npos);
+    assert(elapsed >= std::chrono::milliseconds(450));
+    assert(elapsed < std::chrono::seconds(2));
+    assert(CloseHandle(reader));
+
+    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+        assert(entry.path().filename().string().find(".tmp.") == std::string::npos);
+    }
+    assert(json::parse(read_file(sidecar_path)).at("ready_coordinates").get<size_t>() == 1);
+    std::filesystem::remove_all(dir);
+}
+#endif
+
 int main() {
     test_validation_and_fake_timing();
     test_cap7_and_heterogeneous_prefixes();
     test_atomic_sidecar_and_restart_resume();
+#ifdef _WIN32
+    test_bounded_windows_replace_retry_contract();
+    test_atomic_replace_with_shared_delete_reader();
+    test_permanent_sharing_failure_is_bounded_and_cleans_temp();
+#endif
     return 0;
 }

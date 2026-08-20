@@ -1,0 +1,99 @@
+{
+  "schema": "ai-loader-qwen38-row-invariance-guard-receipt/v1",
+  "created_at": "2026-08-20T06:56:34.7011061+00:00",
+  "stage": "guard",
+  "mode": "head-candidate",
+  "guard_started": true,
+  "guard_status": "failed",
+  "diagnostic_validation": "not_run",
+  "error": "GPU task exited with code 1.",
+  "wrapper_sha256": "e7467127ad0d18102ea834fd1e9ea7faabd9e981558772e37eb21cf247c44a72",
+  "executable": {
+    "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\test-qwen38-row-invariance.exe",
+    "sha256": "ff901cfdba9c6c88881a3bd6295a71b90cd5ef2e550c9265d0075a33e0601415"
+  },
+  "guard_sha256": "3120e9fe7c247250a440389d0450c71741718b391d435a270fd2f16d33dc1463",
+  "runtime": {
+    "cublas64_13.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\cublas64_13.dll",
+      "sha256": "91200c2ff57b8477e94254a4501030d75e1bb35a2de3a476e7ab66df897cb046"
+    },
+    "cublasLt64_13.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\cublasLt64_13.dll",
+      "sha256": "8f54d7b3e5173bf2659f45bad6ae789ffef8218ab6254f10c0cc0cc5e3ec874c"
+    },
+    "ggml-base.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\ggml-base.dll",
+      "sha256": "db25939dc07139c88a4bc0f221cb08aacfe44b670d08388a018c2d7d5747a4cf"
+    },
+    "ggml-cpu.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\ggml-cpu.dll",
+      "sha256": "bb0a3f45210dc02cf6278f9a3c4f00dc29313916caeae19a04431847b64b8aaf"
+    },
+    "ggml-cuda.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\ggml-cuda.dll",
+      "sha256": "1cf6000e1ccde3dda72e35b3c56e3f707c429b30441b1cbc6111837f30d5af7b"
+    },
+    "ggml.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\ggml.dll",
+      "sha256": "aa6736bc71d5ce2853cb97473271954540676aff5b15cb781e78f4a50c29f4d2"
+    },
+    "llama-common.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\llama-common.dll",
+      "sha256": "ad5696c5f69153e35cd66662af07c107d4de6a71d59a853a58343f58c77f48b7"
+    },
+    "llama-server-impl.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\llama-server-impl.dll",
+      "sha256": "5887f456942da81cd5dc87b481b5379216ad8bd86d61facf481ac6efc6a5d4ab"
+    },
+    "llama.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\llama.dll",
+      "sha256": "db66f5209ac42a55b756ea19218aa2725527728fb0effdd82a5a8262ed3ddb71"
+    },
+    "mtmd.dll": {
+      "path": "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\build-final-cuda132-ninja\\bin\\mtmd.dll",
+      "sha256": "9f04448fbf63d798d16fbed8c34b06369a12e3bb7a6541bb5c06abb4d99ac25b"
+    },
+    "cudart64_13.dll": {
+      "path": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin\\x64\\cudart64_13.dll",
+      "sha256": "352ba4ebe61e9a3b171f357a3daf5dd15b6af4a9857673ff893bd6fd2964c075"
+    }
+  },
+  "environment": {
+    "scrubbed_prefixes": [
+      "LLAMA_",
+      "GGML_",
+      "CUDA_"
+    ],
+    "cleared_names": [
+      "CUDA_PATH",
+      "CUDA_PATH_V13_1"
+    ],
+    "wrapper_overrides": {
+      "LLAMACPP_QWEN38_ROW_INVARIANCE_GUARD": "EXCLUSIVE_GPU"
+    },
+    "guarded_child_overrides": {
+      "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+      "CUDA_VISIBLE_DEVICES": "guard-selected GPU UUID",
+      "AI_LOADER_EXCLUSIVE_GPU_GUARD": "1",
+      "AI_LOADER_EXCLUSIVE_GPU_UUID": "guard-selected GPU UUID",
+      "AI_LOADER_EXCLUSIVE_GPU_LEASE_PATH": "guard-owned lease path",
+      "AI_LOADER_EXCLUSIVE_GPU_LEASE_NONCE": "guard-generated nonce",
+      "AI_LOADER_EXCLUSIVE_GPU_OWNER_PID": "guard process PID",
+      "AI_LOADER_EXCLUSIVE_GPU_JOB_NAME": "guard-created job name"
+    }
+  },
+  "guard": null,
+  "postflight": {
+    "relevant_processes": 0,
+    "process_details": [],
+    "port_18136_free": true,
+    "checked_lease_paths": [
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\llama-performance-final\\.codex-deploy\\gpu-exclusive.lock",
+      "C:\\Users\\pasca\\Documents\\GitHub\\Ai-Loader\\.codex-deploy\\gpu-exclusive.lock"
+    ],
+    "remaining_gpu_leases": 0
+  },
+  "stdout_sha256": "9c096b6a8218aa0561304e403eca1df051ef501bc170eda32cbfd454c747e463",
+  "stderr_sha256": "833566baf09241eaf5ebc67bdfe453e294f0a86afb4116088b7fb8547934f371"
+}

@@ -256,6 +256,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
 | `--spec-draft-adaptive, --no-spec-draft-adaptive` | adapt DFlash/DSpark proposal length to active server load (default: disabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_ADAPTIVE) |
+| `--spec-draft-dynamic-rs, --no-spec-draft-dynamic-rs` | resize pure-DSpark recurrent snapshot storage to the current depth; disabled allocates fixed configured depth at startup (default: disabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS) |
 | `--spec-draft-load-caps N1,N2,...` | adaptive maximum proposal length for 1,2,... active generating slots; the last value covers larger loads and every value must be one of 0,1,2,3,7 (default: 7,3,2,1,1,1,1,0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_LOAD_CAPS) |
 | `--spec-draft-acceptance-ema ALPHA` | EMA weight for new per-position acceptance samples; 0 disables EMA adaptation (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_EMA) |
 | `--spec-draft-acceptance-threshold P` | minimum warmed-up per-position acceptance EMA (default: 0.55)<br/>(env: LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_THRESHOLD) |
@@ -1103,6 +1104,7 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:recurrent_snapshot_resizes_total` | Counter | Dynamic recurrent snapshot storage reallocations. |
 | `llamacpp:recurrent_snapshot_resize_seconds_total` | Counter | Time spent synchronizing and reallocating recurrent snapshot storage. |
 | `llamacpp:recurrent_snapshot_resident_depth` | Gauge | Currently resident recurrent rollback depth. |
+| `llamacpp:recurrent_snapshot_configured_depth` | Gauge | Configured maximum recurrent rollback depth. |
 | `llamacpp:recurrent_snapshot_required_depth` | Gauge | Latest correctness-required recurrent rollback depth. |
 | `llamacpp:recurrent_snapshot_pending_depth` | Gauge | Pending shrink depth, or -1 when no shrink is pending. |
 | `llamacpp:recurrent_snapshot_shrink_stable_ticks` | Gauge | Distinct stable scheduling epochs observed for the pending shrink. |

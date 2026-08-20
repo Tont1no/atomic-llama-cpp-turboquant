@@ -1267,7 +1267,7 @@ void ggml_compute_forward_mul_mat(
         GGML_ASSERT(weight_scale && input_scale);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
-        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
         GGML_ASSERT(ggml_is_scalar(weight_scale) && ggml_is_scalar(input_scale));
 
         const float ws = *(const float *) weight_scale->data;
@@ -1276,8 +1276,8 @@ void ggml_compute_forward_mul_mat(
 
         const int64_t k = src0->ne[0];
         const int64_t n = src0->ne[1];
-        const int64_t m = src1->ne[1];
-        GGML_ASSERT(src1->ne[0] == k && dst->ne[0] == n && dst->ne[1] == m);
+        const int64_t m = ggml_nrows(src1);
+        GGML_ASSERT(src1->ne[0] == k && dst->ne[0] == n && ggml_nrows(dst) == m);
 
         for (int64_t job = params->ith; job < n * m; job += params->nth) {
             const int64_t row = job % n;

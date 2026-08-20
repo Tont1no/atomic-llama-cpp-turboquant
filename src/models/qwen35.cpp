@@ -1,6 +1,31 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+#include <cstring>
+
+static bool qwen35_nvfp4_row_invariant_projections_enabled() {
+    const char * value = std::getenv("LLAMA_QWEN35_NVFP4_ROW_INVARIANT_PROJECTIONS");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+static bool qwen35_bf16_row_invariant_recurrent_projection_enabled(
+        const ggml_tensor * weight, const ggml_tensor * input) {
+    const char * value = std::getenv("LLAMA_QWEN35_BF16_ROW_INVARIANT_RECURRENT_PROJECTIONS");
+    return value && std::strcmp(value, "1") == 0 &&
+            weight && input && weight->type == GGML_TYPE_BF16 && input->type == GGML_TYPE_F32 &&
+            weight->ne[0] == 5120 && weight->ne[1] == 48 && weight->ne[2] == 1 && weight->ne[3] == 1 &&
+            input->ne[0] == 5120 && input->ne[1] >= 2 && input->ne[1] <= 8 &&
+            input->ne[2] == 1 && input->ne[3] == 1 &&
+            ggml_is_contiguous(weight) && ggml_is_contiguous(input);
+}
+
+static bool qwen35_fattn_d256_q8_gqa6_vec_enabled(int il, int64_t q_cols, uint32_t n_layer) {
+    const char * value = std::getenv("LLAMA_QWEN35_FATTN_D256_Q8_GQA6_VEC_QCOLS3_8");
+    return value && std::strcmp(value, "1") == 0 &&
+            il >= 0 && (uint32_t) il < n_layer && q_cols >= 3 && q_cols <= 8;
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -220,7 +245,9 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     res->t_embd = cur;
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
+    cur = build_lora_mm(
+            model.output, cur, model.output_s, model.output_in_s,
+            model.output->type == GGML_TYPE_NVFP4 ? GGML_HINT_MUL_MAT_ROW_INVARIANT : GGML_HINT_NONE);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -280,10 +307,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur_normed", il);
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s, model.layers[il].wk_in_s);
-    cb(Kcur, "Kcur", il);
+    // Keep the pre-normalization projection distinct from the post-RoPE Kcur
+    // callback below. Diagnostic callbacks must never guess between two nodes
+    // that previously shared the same layer-qualified name.
+    cb(Kcur, "Kcur_projection", il);
 
     ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s, model.layers[il].wv_in_s);
-    cb(Vcur, "Vcur", il);
+    // Likewise distinguish the raw V projection from its reshaped attention
+    // input. This is a name-only graph annotation; tensor operations are
+    // unchanged when the callback is disabled.
+    cb(Vcur, "Vcur_projection", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -319,9 +352,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
+    const ggml_op_hint fattn_hint = qwen35_fattn_d256_q8_gqa6_vec_enabled(
+            il, n_tokens, hparams.n_layer()) ?
+            GGML_HINT_FLASH_ATTN_QWEN35_D256_Q8_GQA6_VEC : GGML_HINT_NONE;
     cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, fattn_hint);
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
@@ -359,14 +395,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s, model.layers[il].ssm_beta_in_s);
+    const bool beta_row_invariant = qwen35_bf16_row_invariant_recurrent_projection_enabled(
+            model.layers[il].ssm_beta, cur);
+    ggml_tensor * beta = build_lora_mm(
+            model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s, model.layers[il].ssm_beta_in_s,
+            beta_row_invariant ? GGML_HINT_MUL_MAT_ROW_INVARIANT_BF16_BETA : GGML_HINT_NONE);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s, model.layers[il].ssm_alpha_in_s);
+    const bool alpha_row_invariant = qwen35_bf16_row_invariant_recurrent_projection_enabled(
+            model.layers[il].ssm_alpha, cur);
+    ggml_tensor * alpha = build_lora_mm(
+            model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s, model.layers[il].ssm_alpha_in_s,
+            alpha_row_invariant ? GGML_HINT_MUL_MAT_ROW_INVARIANT_BF16_ALPHA : GGML_HINT_NONE);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -474,12 +518,20 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
 
+    const bool row_invariant = qwen35_nvfp4_row_invariant_projections_enabled() &&
+            model.layers[il].ffn_up->type == GGML_TYPE_NVFP4 &&
+            model.layers[il].ffn_gate->type == GGML_TYPE_NVFP4 &&
+            model.layers[il].ffn_down->type == GGML_TYPE_NVFP4;
+
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
         model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
         model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
         NULL,
-        LLM_FFN_SILU, LLM_FFN_PAR, il);
+        LLM_FFN_SILU, LLM_FFN_PAR, il,
+        row_invariant ? GGML_HINT_MUL_MAT_ROW_INVARIANT_FFN_UP : GGML_HINT_NONE,
+        row_invariant ? GGML_HINT_MUL_MAT_ROW_INVARIANT_FFN_GATE : GGML_HINT_NONE,
+        row_invariant ? GGML_HINT_MUL_MAT_ROW_INVARIANT_FFN_DOWN : GGML_HINT_NONE);
     cb(cur, "ffn_out", il);
 
     return cur;

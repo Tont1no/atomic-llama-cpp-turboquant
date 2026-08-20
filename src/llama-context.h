@@ -281,7 +281,7 @@ public:
 
 private:
     ggml_cgraph * graph_reserve_dspark(
-        const std::vector<uint32_t> & widths, uint32_t n_outputs,
+        const std::vector<uint32_t> & widths, const std::vector<llama_seq_id> & seq_ids,
         const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     llm_graph_params graph_params(

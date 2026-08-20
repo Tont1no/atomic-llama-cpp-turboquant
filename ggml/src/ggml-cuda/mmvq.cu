@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "diagnostics.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1152,10 +1153,40 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, bool row_invariant) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    if (src0->type == GGML_TYPE_NVFP4) {
+        // A non-null fusion can also mean a plain bias/scale epilogue. Only a
+        // gate-bearing fusion proves that the Qwen FFN GLU route was selected.
+        if (!row_invariant) {
+            const auto route = fusion && fusion->gate != nullptr ?
+                GGML_CUDA_DIAGNOSTIC_ROUTE_NVFP4_M1_FUSED_FFN :
+                (src1->ne[1] == 1 ? GGML_CUDA_DIAGNOSTIC_ROUTE_NVFP4_MMVQ_M1 :
+                                    GGML_CUDA_DIAGNOSTIC_ROUTE_NVFP4_MMVQ_M8);
+            GGML_CUDA_DIAGNOSTIC_ROUTE_HIT(route);
+        }
+    }
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+
+    if (row_invariant) {
+        // This route deliberately models concurrent tokens as independent
+        // channels of the established ncols_dst=1 kernel. That preserves the
+        // exact M1 Q8_1 quantization and four-warp reduction order per token.
+        GGML_ASSERT(src0->type == GGML_TYPE_NVFP4 && ids == nullptr);
+        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+        GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+        GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
+        GGML_ASSERT(src1->ne[1] >= 2 && src1->ne[1] <= 16);
+        GGML_ASSERT(src0->ne[0] == src1->ne[0] && src0->ne[1] == dst->ne[0]);
+        GGML_ASSERT(src1->ne[1] == dst->ne[1]);
+        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+        GGML_ASSERT(!fusion || (fusion->x_scale != nullptr && fusion->x_bias == nullptr &&
+                fusion->gate_bias == nullptr &&
+                ((fusion->gate == nullptr && fusion->gate_scale == nullptr) ||
+                 (fusion->gate != nullptr && fusion->gate_scale != nullptr &&
+                  fusion->glu_op == GGML_GLU_OP_SWIGLU))));
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -1180,7 +1211,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || row_invariant || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1257,6 +1288,20 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (row_invariant) {
+        // Reinterpret token columns as independent channels. Each channel is
+        // launched with the exact ncols_dst=1 specialization used by M1:
+        // four warps, one output row per block, identical accumulation and
+        // warp/shared-memory reduction order. Tokens remain concurrent in the
+        // grid and the optional scalar NVFP4 output scale stays in the epilogue.
+        mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>(
+            src0->data, src1_q8_1.get(), nullptr, fusion_local, dst_d,
+            ne00, ne01, 1, s01, s11, s1,
+            1, ne11, ne11, s02, s11, s1,
+            1, 1, s03, s13, s3, 0, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,

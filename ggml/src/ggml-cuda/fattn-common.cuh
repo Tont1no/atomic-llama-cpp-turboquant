@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "diagnostics.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -973,6 +974,9 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+#ifdef GGML_CUDA_DIAGNOSTIC_ROUTES
+    , const int forced_parallel_blocks = 0
+#endif
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1152,27 +1156,51 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        int nwaves_best = 0;
-        int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+#ifdef GGML_CUDA_DIAGNOSTIC_ROUTES
+        if (forced_parallel_blocks > 0) {
+            GGML_ASSERT(forced_parallel_blocks <= ntiles_KV);
+            parallel_blocks = forced_parallel_blocks;
+        } else
+#endif
+        {
+            // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+            // Test whether parallel_blocks can be set to a higher value for better efficiency.
+            const int blocks_per_wave = nsm * max_blocks_per_sm;
+            int nwaves_best = 0;
+            int efficiency_percent_best = 0;
+            for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+                const int nblocks_total = ntiles_dst * parallel_blocks_test;
+                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                break;
-            }
+                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                    break;
+                }
 
-            if (efficiency_percent > efficiency_percent_best) {
-                nwaves_best = nwaves;
-                efficiency_percent_best = efficiency_percent;
-                parallel_blocks = parallel_blocks_test;
+                if (efficiency_percent > efficiency_percent_best) {
+                    nwaves_best = nwaves;
+                    efficiency_percent_best = efficiency_percent;
+                    parallel_blocks = parallel_blocks_test;
+                }
             }
         }
+
+#ifdef GGML_CUDA_DIAGNOSTIC_ROUTES
+        if (forced_parallel_blocks > 0) {
+            ggml_cuda_diagnostic_fattn_vec_launch_observation observation{};
+            observation.abi_version = 1;
+            observation.struct_size = sizeof(observation);
+            observation.evaluated = 1;
+            observation.forced_parallel_blocks = forced_parallel_blocks;
+            observation.q_cols = Q->ne[1];
+            observation.ncols = ncols;
+            observation.ntiles_x = ntiles_x;
+            observation.ntiles_kv = ntiles_KV;
+            observation.parallel_blocks = parallel_blocks;
+            GGML_CUDA_DIAGNOSTIC_FATTN_VEC_LAUNCH_OBSERVE(observation);
+        }
+#endif
 
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;

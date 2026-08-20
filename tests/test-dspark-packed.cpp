@@ -200,6 +200,60 @@ static void test_reserve_shapes_cover_rows_and_groups() {
     assert(llama_dspark_reserve_widths(9, 8, 8).empty());
 }
 
+static void test_reserve_outputs_follow_packed_sequence_limits() {
+    // P8's worst-transition reserve topology has 52 packed rows, but the
+    // sampling graph contract permits only two output rows for each of the
+    // eight logical sequences. The old reserve selected all 52 rows, although
+    // graph_max_nodes() used n_sampling_outputs_max=16 (plus its conservative
+    // per-sampler baseline), exhausting graph capacity during sched_reserve().
+    const auto p8_shapes = llama_dspark_reserve_widths(7, 128, 8);
+    assert(p8_shapes.size() == 2);
+    const auto & p8_widths = p8_shapes[1];
+    assert(p8_widths == std::vector<uint32_t>({ 7, 6, 7, 6, 7, 6, 7, 6 }));
+    assert(std::accumulate(p8_widths.begin(), p8_widths.end(), 0u) == 52);
+    const std::vector<bool> all_p8_samplers(8, true);
+    assert(llama_dspark_reserve_output_rows(p8_widths, 2048, 2, all_p8_samplers) == std::vector<uint32_t>({
+            0, 1, 7, 8, 13, 14, 20, 21, 26, 27, 33, 34, 39, 40, 46, 47 }));
+
+    assert(llama_dspark_reserve_output_rows(std::vector<uint32_t>(8, 1), 2048, 2, all_p8_samplers) ==
+            std::vector<uint32_t>({ 0, 1, 2, 3, 4, 5, 6, 7 }));
+    assert(llama_dspark_reserve_output_rows(p8_widths, 5, 2, all_p8_samplers) ==
+            std::vector<uint32_t>({ 0, 1, 7, 8, 13 }));
+
+    const std::vector<bool> partial_samplers = { false, true, false, true, false, false, false, false };
+    assert(llama_dspark_reserve_output_rows(p8_widths, 5, 2, partial_samplers) ==
+            std::vector<uint32_t>({ 0, 7, 8, 20, 21 }));
+    const auto partial_outputs = llama_dspark_reserve_output_rows(
+            p8_widths, 2048, 2, partial_samplers);
+    assert(partial_outputs.size() == 44);
+    assert(llama_dspark_reserve_output_rows(p8_widths, 2048, 2, std::vector<bool>(8, false)).size() == 52);
+
+    const auto sparse_plans = llama_dspark_reserve_seq_id_plans(p8_widths, 8, 128, 2, { 100, 3 });
+    assert(sparse_plans.size() == 2);
+    std::vector<size_t> sparse_output_sizes;
+    for (const auto & plan : sparse_plans) {
+        assert(plan.size() == 8);
+        assert(std::find(plan.begin(), plan.end(), 100) != plan.end());
+        assert(std::find(plan.begin(), plan.end(), 3) != plan.end());
+        std::vector<bool> sparse_mask;
+        for (llama_seq_id seq_id : plan) {
+            sparse_mask.push_back(seq_id == 100 || seq_id == 3);
+        }
+        sparse_output_sizes.push_back(
+                llama_dspark_reserve_output_rows(p8_widths, 2048, 2, sparse_mask).size());
+    }
+    std::sort(sparse_output_sizes.begin(), sparse_output_sizes.end());
+    assert(sparse_output_sizes == std::vector<size_t>({ 43, 44 }));
+
+    assert(llama_dspark_reserve_output_rows({}, 2048, 2, {}).empty());
+    assert(llama_dspark_reserve_output_rows(p8_widths, 0, 2, all_p8_samplers).empty());
+    assert(llama_dspark_reserve_output_rows(p8_widths, 2048, 0, all_p8_samplers).empty());
+    assert(llama_dspark_reserve_output_rows({ 7, 0, 6 }, 2048, 2, { true, true, true }).empty());
+    assert(llama_dspark_reserve_output_rows(p8_widths, 2048, 2, { true }).empty());
+    assert(llama_dspark_reserve_seq_id_plans(p8_widths, 7, 128, 2, { 3 }).empty());
+    assert(llama_dspark_reserve_seq_id_plans(p8_widths, 8, 7, 2, { 3 }).empty());
+}
+
 int main() {
     test_caps_and_indptr();
     test_n1_n4_n8_mixed_plans();
@@ -207,5 +261,6 @@ int main() {
     test_malformed_fails_closed();
     test_graph_reuse_is_layout_exact();
     test_reserve_shapes_cover_rows_and_groups();
+    test_reserve_outputs_follow_packed_sequence_limits();
     return 0;
 }

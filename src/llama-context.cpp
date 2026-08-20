@@ -703,20 +703,43 @@ void llama_context::sched_reserve() {
             const auto reserve_widths = llama_dspark_reserve_widths(
                     gamma, cparams.n_ubatch, cparams.n_seq_max);
 
+            const uint32_t n_seq_id_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+
+            std::vector<std::pair<uint32_t, llama_seq_id>> sampler_costs;
+            sampler_costs.reserve(sampling.samplers.size());
+            for (const auto & [seq_id, sampler] : sampling.samplers) {
+                if (seq_id >= 0 && (uint32_t) seq_id < n_seq_id_max) {
+                    sampler_costs.emplace_back(llama_sampler_backend_n_nodes(sampler), seq_id);
+                }
+            }
+            std::stable_sort(sampler_costs.begin(), sampler_costs.end(),
+                    [](const auto & a, const auto & b) { return a.first > b.first; });
+
+            std::vector<llama_seq_id> sampler_ids;
+            sampler_ids.reserve(sampler_costs.size());
+            for (const auto & [cost, seq_id] : sampler_costs) {
+                GGML_UNUSED(cost);
+                sampler_ids.push_back(seq_id);
+            }
+
             std::vector<size_t> dspark_sizes(backend_ptrs.size());
             for (const auto & widths : reserve_widths) {
-                std::fill(dspark_sizes.begin(), dspark_sizes.end(), 0);
-                const uint32_t rows = std::accumulate(widths.begin(), widths.end(), 0u);
-                const uint32_t outputs = std::max(1u, std::min(rows, cparams.n_outputs_max));
-                auto * gf = graph_reserve_dspark(widths, outputs, mctx.get(),
-                        model.hparams.no_alloc,
-                        model.hparams.no_alloc ? dspark_sizes.data() : nullptr);
-                if (!gf) {
-                    throw std::runtime_error("failed to allocate DSpark reserve buffers");
-                }
-                if (model.hparams.no_alloc) {
-                    for (size_t i = 0; i < dspark_sizes.size(); ++i) {
-                        backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], dspark_sizes[i]);
+                const auto seq_id_plans = llama_dspark_reserve_seq_id_plans(
+                        widths, cparams.n_seq_max, n_seq_id_max,
+                        cparams.n_outputs_max_per_seq, sampler_ids);
+                GGML_ASSERT(!seq_id_plans.empty());
+                for (const auto & seq_ids : seq_id_plans) {
+                    std::fill(dspark_sizes.begin(), dspark_sizes.end(), 0);
+                    auto * gf = graph_reserve_dspark(widths, seq_ids, mctx.get(),
+                            model.hparams.no_alloc,
+                            model.hparams.no_alloc ? dspark_sizes.data() : nullptr);
+                    if (!gf) {
+                        throw std::runtime_error("failed to allocate DSpark reserve buffers");
+                    }
+                    if (model.hparams.no_alloc) {
+                        for (size_t i = 0; i < dspark_sizes.size(); ++i) {
+                            backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], dspark_sizes[i]);
+                        }
                     }
                 }
             }
@@ -881,7 +904,9 @@ bool llama_context::memory_update(bool optimize) {
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
 
-        if (!mctx->apply()) {
+        const bool applied = mctx->apply();
+        mctx->finalize(applied);
+        if (!applied) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
         }
     }
@@ -1410,6 +1435,7 @@ bool llama_context::set_adapter_cvec(
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
+        mctx->finalize(false);
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1450,6 +1476,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
+            if (mctx) {
+                mctx->finalize(false);
+            }
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
@@ -1518,6 +1547,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             const bool all_imported = n_imported == (int) imported.size();
             if (source_reachable || !all_imported) {
+                if (mctx) {
+                    mctx->finalize(false);
+                }
                 LLAMA_LOG_ERROR("%s: unsafe DFlash external graph (nodes=%d, leafs=%d, imported=%d/%d, source_reachable=%d)\n",
                         __func__, n_nodes, n_leafs_reachable, n_imported,
                         (int) imported.size(), (int) source_reachable);
@@ -1533,6 +1565,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            if (mctx) {
+                mctx->finalize(false);
+            }
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1551,12 +1586,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
+        if (mctx) {
+            mctx->finalize(false);
+        }
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (mctx) {
+        mctx->finalize(true);
+    }
 
     return res;
 }
@@ -3279,6 +3321,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    if (!sampling.samplers.empty()) {
+        // build_sampling() creates one padded-logits tensor shared by all
+        // sampler applications; sampler probe counts cover only per-call ops.
+        GGML_ASSERT(res < UINT32_MAX);
+        ++res;
+    }
     return res;
 }
 
@@ -3397,24 +3445,37 @@ ggml_cgraph * llama_context::graph_reserve(
 
 ggml_cgraph * llama_context::graph_reserve_dspark(
         const std::vector<uint32_t> & widths,
-        uint32_t n_outputs,
+        const std::vector<llama_seq_id> & seq_ids,
         const llama_memory_context_i * mctx,
         bool split_only,
         size_t * sizes) {
-    GGML_ASSERT(!widths.empty());
+    GGML_ASSERT(!widths.empty() && seq_ids.size() == widths.size());
 
     uint32_t n_tokens = 0;
-    for (uint32_t width : widths) {
+    std::vector<bool> sampler_seqs(widths.size(), false);
+    const uint32_t n_seq_id_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    std::vector<bool> seen_seq(n_seq_id_max, false);
+    for (size_t s = 0; s < widths.size(); ++s) {
+        const uint32_t width = widths[s];
         GGML_ASSERT(width > 0 && width <= cparams.n_ubatch - n_tokens);
+        GGML_ASSERT(seq_ids[s] >= 0 && (uint32_t) seq_ids[s] < n_seq_id_max);
+        GGML_ASSERT(!seen_seq[seq_ids[s]]);
+        seen_seq[seq_ids[s]] = true;
+        sampler_seqs[s] = sampling.samplers.count(seq_ids[s]) != 0;
         n_tokens += width;
     }
-    GGML_ASSERT(n_outputs >= 1 && n_outputs <= n_tokens);
+    const auto output_rows = llama_dspark_reserve_output_rows(
+            widths, cparams.n_outputs_max, cparams.n_outputs_max_per_seq, sampler_seqs);
+    GGML_ASSERT(!output_rows.empty() && output_rows.size() <= n_tokens);
+    GGML_ASSERT(std::is_sorted(output_rows.begin(), output_rows.end()));
+    GGML_ASSERT(std::adjacent_find(output_rows.begin(), output_rows.end()) == output_rows.end());
+    GGML_ASSERT(output_rows.back() < n_tokens);
 
     ggml_backend_sched_reset(sched.get());
     gf_res_prev->reset();
 
     const auto save_n_outputs = this->n_outputs;
-    this->n_outputs = n_outputs;
+    this->n_outputs = (uint32_t) output_rows.size();
 
     auto data = std::make_shared<llama_ubatch::data_t>();
     data->token.resize(n_tokens, 0);
@@ -3428,17 +3489,17 @@ ggml_cgraph * llama_context::graph_reserve_dspark(
 
     uint32_t row = 0;
     for (uint32_t s = 0; s < widths.size(); ++s) {
-        data->seq_id_unq[s] = (llama_seq_id) s;
-        data->seq_idx[s] = (int32_t) s;
+        data->seq_id_unq[s] = seq_ids[s];
+        data->seq_idx[seq_ids[s]] = (int32_t) s;
         for (uint32_t t = 0; t < widths[s]; ++t, ++row) {
-            data->seq_id_data[row] = (llama_seq_id) s;
+            data->seq_id_data[row] = seq_ids[s];
             for (uint32_t p = 0; p < model.hparams.n_pos_per_embd(); ++p) {
                 data->pos[(size_t) p * n_tokens + row] = (llama_pos) t;
             }
         }
     }
-    for (uint32_t i = 0; i < n_outputs; ++i) {
-        data->output[i] = 1;
+    for (uint32_t output_row : output_rows) {
+        data->output[output_row] = 1;
     }
     for (uint32_t i = 0; i < n_tokens; ++i) {
         data->seq_id[i] = &data->seq_id_data[i];
@@ -4535,6 +4596,7 @@ void llama_context::opt_epoch_iter(
             n_outputs = ubatch.n_tokens;
 
             if (!mctx->apply()) {
+                mctx->finalize(false);
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
                 break;
             }
@@ -4574,6 +4636,7 @@ void llama_context::opt_epoch_iter(
                 }
             }
             ggml_opt_eval(opt_ctx, result);
+            mctx->finalize(true);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }

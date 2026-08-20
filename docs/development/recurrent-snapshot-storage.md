@@ -2,7 +2,7 @@
 
 ## Shipped bounded layout
 
-The adaptive Qwen hybrid path keeps the configured rollback limit separate
+The adaptive Qwen hybrid and pure DSpark packed paths keep the configured rollback limit separate
 from the physically resident rollback depth. The recurrent tensors retain the
 existing plane-major addressing:
 
@@ -29,7 +29,13 @@ not wait. Storage changes only at the start of a logical decode batch:
 Snapshots for sequences absent from a batch keep the allocation from
 shrinking below their last valid depth. Malformed metadata fails closed to the
 configured maximum. Non-Qwen and non-dynamic contexts retain the original
-fixed allocation.
+fixed allocation. A pure DSpark chain enables the dynamic layout for fixed
+packed proposals, SPS planning, SPS shadow planning, and SPS recorder
+force-caps when explicitly enabled with `--spec-draft-dynamic-rs`. SPS and
+adaptive planning remain mutually exclusive at server
+startup. DFlash retains its adaptive-only opt-in, and mixed speculative chains
+retain fixed storage. Pure DSpark defaults to a fixed startup allocation until
+resize headroom is qualified.
 
 The server's adaptive load estimate includes every assigned non-idle slot and
 the inference-slot demand still queued for admission. Prompt, waiting-child,
@@ -47,14 +53,30 @@ fail-closed request for the configured maximum for external callers.
 Because the experimental pointer extends the public by-value batch structure,
 the fork's library and all callers must be rebuilt together.
 
-Resize count, cumulative synchronized resize time, resident/required/pending
-depth, and stable-epoch count are available through
+Resize count, cumulative synchronized resize time,
+resident/configured/required/pending depth, and stable-epoch count are available through
 `llama_get_recurrent_resize_stats()` and the `/metrics` recurrent snapshot
 series.
 
 This layout exactly serves the homogeneous server shapes used by DFlash
 (all active slots at cap 0, 1, 2, or 3). A mixed-depth batch still allocates
 `n_seq_max * (1 + max(depth_i))` rows.
+It does **not** allocate `sum_i(1 + depth_i)` rows: inactive configured slots
+are part of every resident plane. Size production tiers accordingly. For
+example, a wider P8 tier should use a lower configured
+`--spec-draft-n-max` than a P4 tier when both must fit the same recurrent-state
+budget. The metric pair `recurrent_snapshot_resident_depth` and
+`recurrent_snapshot_configured_depth` makes that distinction observable.
+For the measured Qwen layout whose recurrent state costs 149.625 MiB per
+configured sequence and resident plane, `P4/nmax=3` and `P8/nmax=1` each cap
+the rectangular allocation at about 2394 MiB.
+
+Growth currently allocates and clears the complete new buffer before copying
+and releasing the old buffer. Qualification must therefore reserve transient
+headroom for `old buffer + new buffer`; a cap-zero P8 process growing to cap
+one temporarily retains its 1197 MiB base while allocating the 2394 MiB depth-
+one buffer. If that headroom is not proven, keep the default fixed allocation
+(or pass `--no-spec-draft-dynamic-rs`).
 
 ## Exact ragged layout follow-up
 
