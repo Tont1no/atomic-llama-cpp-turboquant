@@ -1,8 +1,9 @@
 # DSpark SPS profiler orchestration
 
-This directory contains the CPU-only planning layer and the implemented
-server-side DSpark SPS recorder. The planning and validation commands do not
-execute a model. The Python GPU runner remains intentionally disabled.
+This directory contains the CPU-only planning layer, the server-side DSpark
+SPS recorder, and a guarded profiling runner. Planning and validation never
+execute a model. GPU execution is accepted only through the PowerShell wrapper
+and is not part of the CPU test suite.
 
 ## Plan contract
 
@@ -101,10 +102,10 @@ sub-batches, retries, direct warmup, CUDA graph capture, and the configured
 number of otherwise eligible stable executions are excluded. Prometheus and
 the audit sidecar retain exclusion counters.
 
-The intended guarded runner will execute one plan cell per server arm. It will
-pass one context ceiling, one active count, one prefix cap, and the derived
-forced row count to that arm. The arm can emit a complete one-coordinate v2
-partial; the future runner must merge partials only after every scheduled cell
+The guarded runner executes one plan cell per server arm. It passes one
+context ceiling, one active count, one prefix cap, and the derived
+forced row count to that arm. The arm emits a complete one-coordinate v2
+partial; the runner merges partials only after every scheduled cell
 has completed. This is intentionally slower than mutating a live server and
 avoids adding a runtime control endpoint to the production HTTP surface.
 
@@ -140,12 +141,20 @@ llama-server ... --spec-type draft-dspark --spec-draft-n-max 7 \
   --spec-draft-sps-record-warmup 3
 ```
 
-## Future guarded execution
+## Guarded execution
 
-`Invoke-DsparkSpsProfile.ps1` is the only intended execution entry point. It
+`Invoke-DsparkSpsProfile.ps1` is the only execution entry point. It
 validates the plan on CPU and then launches the whole matrix as one child of
-`Invoke-ExclusiveGpuTask.ps1`. All server arms must stay sequential inside
-that one child.
+`Invoke-ExclusiveGpuTask.ps1`. The guard holds a readable but write-denied v2
+lease containing a cryptographic nonce, owner PID, nonce-named Windows Job
+Object, and selected GPU UUID.
+Python requires the exact workspace lease path, matching child environment,
+its direct parent as owner, matching `CUDA_VISIBLE_DEVICES`, a sharing-violation
+write lock, and membership in that exact Job Object. The runner repeats the
+proof before each arm and during each request wave. Copied, read-only,
+sibling-locked, or unlocked lease JSON is rejected. All server arms stay
+sequential inside that one child because the
+exact forced-row cap is a startup-only option.
 
 ```powershell
 .\scripts\Invoke-DsparkSpsProfile.ps1 `
@@ -154,31 +163,56 @@ that one child.
   -ModelPath C:\models\target.gguf `
   -DraftModelPath C:\models\draft.gguf `
   -OutputDir .\benchmarks\dspark-sps-profile\run `
+  -RuntimeLabel 'CUDA 13.0 / SM120 optimized llama.cpp' `
   -GpuIndex 0 `
   -MinFreeRamGiB 16 `
   -MinFreeVramMiB 4096 `
-  -MaxUsedVramMiB 28672
+  -MaxUsedVramMiB 28672 `
+  -ContextSize 65536 `
+  -Parallel 8 `
+  -JobTimeoutSeconds 18000 `
+  -MaxRuntimeSeconds 21600
 ```
 
-The Python `run` command currently exits before inspecting runtime paths or
-starting a process. Remove that stop only with reviewed server-process,
-request-barrier, artifact-validation, and cleanup lifecycle tests. The wrapper
-already ensures the future full matrix is one guarded child, not one lease per
-arm.
+`MaxRuntimeSeconds` is the outer hard kill limit and must be zero or greater
+than `JobTimeoutSeconds`. The inner job, arm, readiness, HTTP,
+recorder-progress, and process-stop timeouts are independently configurable.
+A server is started in its own process group for every arm and its full tree
+is stopped in a `finally` path. The next arm cannot start until the previous
+port is closed.
 
-Expected future output layout:
+The numeric prompt length is
+`context_ceiling - output_tokens - prompt_safety_tokens`. The configured
+per-slot context (`ContextSize / Parallel`) must cover the largest ceiling;
+the safety tokens leave headroom below that ceiling. Requests in one wave
+share a barrier and use numeric token arrays, deterministic seeds, temperature
+zero, and ignored EOS. A completion is accepted only when it stops at the
+requested limit, reports exactly the requested token count, and is not
+truncated. `/health`, `/props`, the sidecar, and recorder metrics are polled
+and validated before an arm can complete. Completion HTTP calls are bounded by
+the nearest request, arm, and recorder-progress deadline. A peer or progress
+failure immediately closes registered completion connections and the server
+endpoint. Request workers are daemonized and joined only up to the bounded
+process-stop timeout, so cleanup never waits for the longer HTTP timeout.
+
+Do not call `python scripts/dspark_sps_profile.py run` directly. It fails
+before runtime-path inspection unless the outer guard proof is present.
+
+Output layout:
 
 ```text
-plan.json
 manifest.json
+run-state.json
 runs/<ordinal>/command.json
 runs/<ordinal>/server.stdout.log
 runs/<ordinal>/server.stderr.log
 runs/<ordinal>/client.json
+runs/<ordinal>/props.json
 runs/<ordinal>/metrics-before.txt
 runs/<ordinal>/metrics-after.txt
 runs/<ordinal>/record.json
 runs/<ordinal>/record.samples.json
+runs/<ordinal>/receipt.json
 profile.json
 profile.samples.json
 validation.json
@@ -187,14 +221,34 @@ guard.stdout.log
 guard.stderr.log
 ```
 
-The manifest must record the llama.cpp commit, server and model hashes, exact
-non-secret arguments, CUDA and driver identity, GPU UUID, slot and context
-configuration, output token contract, throughput statistics, and all errors.
+The manifest records the llama.cpp commit, server and model hashes, sorted
+hashes of adjacent `llama*.dll` and `ggml*.dll` runtime libraries, exact
+immutable non-secret arguments, explicit runtime label, driver identity, GPU
+UUID, slot/context configuration, and output-token contract. Each completed
+arm receipt binds the command, `/props`, metrics, client, recorder profile,
+and raw sidecar by SHA-256. Run status and errors live in `run-state.json`;
+throughput and final hashes live in `summary.json` and `validation.json`.
+
+Resume is enabled by default. A changed plan, executable/model hash,
+GPU/runtime identity, or immutable argument is rejected. A completed ordinal
+is skipped only after all bound artifacts are loaded, strictly validated, and
+rehashed. An incomplete ordinal may reuse its atomic recorder sidecar, but its
+server command must be equivalent to the original command artifact.
+
+After every scheduled repetition has produced its own sidecar, all raw samples
+are combined per coordinate. The runner calculates deterministic nearest-rank
+p95, applies a conservative monotone upper envelope over comparable physical
+coordinates, and atomically writes the strict Loader-v2 `profile.json`. Raw
+samples and aggregation evidence remain separate in `profile.samples.json`;
+unreachable Cartesian cells are never invented.
 
 ## CPU tests
 
 ```powershell
 python .\tests\test_dspark_sps_profile.py
+pwsh -NoLogo -NoProfile -File .\tests\test_dspark_sps_profile_wrapper.ps1
+pwsh -NoLogo -NoProfile -File .\tests\test_exclusive_gpu_guard.ps1
 ```
 
-These tests do not call `nvidia-smi`, load a model, or start a server.
+These tests use subprocess, HTTP, `nvidia-smi`, guard, timeout, and cleanup
+mocks/fakes. They do not access a real GPU, load a model, or start llama-server.

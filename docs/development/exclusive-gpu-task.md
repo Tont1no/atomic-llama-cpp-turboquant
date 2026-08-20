@@ -6,7 +6,8 @@ backend test, or model validation that can allocate substantial VRAM.
 The wrapper provides one workspace-wide lease, refuses to start while a known
 llama/test process is running, binds the child to one selected CUDA adapter,
 monitors RAM and VRAM, terminates the child tree on a limit violation, and
-checks for known descendants before releasing the lease.
+owns the child tree through a nonce-named Windows Job Object. Cleanup never
+selects a process by name, PID reuse, or start-time similarity.
 
 Example for the RTX 5090:
 
@@ -18,9 +19,20 @@ Example for the RTX 5090:
   -MinFreeRamGiB 16 `
   -MinFreeVramMiB 4096 `
   -MaxUsedVramMiB 28672 `
+  -MaxRuntimeSeconds 21600 `
   -StdoutPath .\benchmarks\run\stdout.log `
   -StderrPath .\benchmarks\run\stderr.log
 ```
+
+`MaxRuntimeSeconds` defaults to `0` for backward compatibility (disabled).
+When positive, it is a hard wall-clock limit: the guard kills the entire child
+tree and still removes the GPU lease. The lease is v2 JSON containing a random
+256-bit nonce, owner PID, owner lifetime, Job Object name, and GPU UUID. It
+stays open with read sharing but write denial. Guarded children receive the
+exact lease path, nonce, owner PID, Job Object name, UUID, and matching
+`CUDA_VISIBLE_DEVICES`. A nested runner requires an active sharing-violation
+lock and proves that it is a member of that exact Job Object. A copied,
+read-only, sibling-locked, or unlocked lease cannot authorize execution.
 
 `GpuIndex` is the physical `nvidia-smi` index. The wrapper resolves that
 adapter's UUID, then gives the child `CUDA_DEVICE_ORDER=PCI_BUS_ID` and
