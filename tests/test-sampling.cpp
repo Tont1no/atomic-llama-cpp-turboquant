@@ -296,6 +296,60 @@ static void test_sampler_queue(const size_t n_vocab, const std::string & sampler
            samplers_sequence.c_str(), n_vocab, top_k, top_p, min_p);
 }
 
+// the draft loops in common/speculative.cpp build their sampler as
+// { top_k = 10, samplers = { COMMON_SAMPLER_TYPE_TOP_K } }, which becomes the chain
+// [ top_k(10), dist(seed) ], and then read the winner as a plain argmax:
+//
+//     common_sampler_sample(smpl, ctx_dft, idx, true);
+//     cur_p = common_sampler_get_candidates(smpl, true);  // do_sort = true
+//     id    = cur_p->data[0].id;
+//
+// this pins the invariant that makes do_sort = true free there: top_k already leaves
+// cur_p sorted and truncated to k, so the std::sort in common_sampler_get_candidates
+// is skipped and never runs over the full vocab. it also pins that data[0] is the
+// full-vocab argmax and that data[0].p is the softmax over the k survivors, which is
+// the value the draft loops compare against p_min.
+static void test_draft_chain_argmax() {
+    const size_t      n_vocab     = 151936;
+    const int32_t     top_k       = 10;
+    const llama_token id_expected = 98765;
+
+    std::vector<llama_token_data> data;
+    data.reserve(n_vocab);
+    for (llama_token token_id = 0; token_id < (llama_token) n_vocab; token_id++) {
+        // deterministic and deliberately not in descending order
+        data.emplace_back(llama_token_data{token_id, sinf((float) token_id), 0.0f});
+    }
+    data[id_expected].logit = 100.0f; // unique maximum, sinf stays within [-1, 1]
+
+    llama_token_data_array cur_p = { data.data(), data.size(), -1, false };
+
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(0xC0FFEE));
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.size == (size_t) top_k);
+    GGML_ASSERT(cur_p.sorted);
+    GGML_ASSERT(cur_p.data[0].id == id_expected);
+
+    float sum = 0.0f;
+    for (size_t i = 0; i < cur_p.size; i++) {
+        GGML_ASSERT(cur_p.data[i].p >= 0.0f);
+        if (i > 0) {
+            GGML_ASSERT(cur_p.data[i - 1].p >= cur_p.data[i].p);
+        }
+        sum += cur_p.data[i].p;
+    }
+    GGML_ASSERT(fabs(sum - 1.0f) < 1e-4);
+    GGML_ASSERT(cur_p.data[0].p > 0.99f);
+
+    llama_sampler_free(chain);
+
+    printf("Draft chain argmax OK with n_vocab=%05zu top_k=%5d\n", n_vocab, top_k);
+}
+
 static void bench(llama_sampler * cnstr, const char * cnstr_name, const std::vector<llama_token_data> & data, int n_iter) {
     std::vector<llama_token_data> cur(data.size());
     std::copy(data.begin(), data.end(), cur.begin());
@@ -327,6 +381,7 @@ static void test_perf() {
         data.emplace_back(llama_token_data{i, logit, 0.0f});
     }
 
+    BENCH(llama_sampler_init_top_k  (10),                     data, 32); // as used by the draft samplers
     BENCH(llama_sampler_init_top_k  (40),                     data, 32);
     BENCH(llama_sampler_init_top_p  (0.8f, 1),                data, 32);
     BENCH(llama_sampler_init_min_p  (0.2f, 1),                data, 32);
@@ -422,6 +477,8 @@ int main(void) {
     test_sampler_queue(10000, "pmk", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mkp", 100, 0.8f, 0.1f);
     test_sampler_queue(10000, "mpk", 100, 0.8f, 0.1f);
+
+    test_draft_chain_argmax();
 
     printf("OK\n");
 
