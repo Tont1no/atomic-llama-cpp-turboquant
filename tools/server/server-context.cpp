@@ -8,11 +8,14 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+#include "cache-runtime-policy.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
+#include "speculative-runtime-policy.h"
 #include "speculative-sps.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -21,6 +24,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -42,8 +47,140 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+namespace {
+
+constexpr uint32_t SERVER_SLOT_SCOPE_MAGIC = 0x504f4353; // "SCOP" in little endian
+constexpr size_t SERVER_SLOT_SCOPE_SIZE = 67;
+constexpr size_t SERVER_SLOT_SCOPE_PAD = 1;
+constexpr size_t SERVER_SLOT_SCOPE_TRAILER_SIZE =
+        SERVER_SLOT_SCOPE_SIZE + SERVER_SLOT_SCOPE_PAD + sizeof(SERVER_SLOT_SCOPE_MAGIC);
+
+void server_slot_append_cache_scope(std::vector<char> & packed, const std::string & cache_key) {
+    if (!server_cache_key_is_valid(cache_key)) {
+        return;
+    }
+
+    const size_t offset = packed.size();
+    packed.resize(offset + SERVER_SLOT_SCOPE_TRAILER_SIZE, 0);
+    std::memcpy(packed.data() + offset, cache_key.data(), SERVER_SLOT_SCOPE_SIZE);
+    std::memcpy(packed.data() + packed.size() - sizeof(SERVER_SLOT_SCOPE_MAGIC),
+            &SERVER_SLOT_SCOPE_MAGIC, sizeof(SERVER_SLOT_SCOPE_MAGIC));
+}
+
+std::string server_slot_take_cache_scope(llama_tokens & packed) {
+    const size_t packed_size = packed.size() * sizeof(llama_token);
+    if (packed_size < SERVER_SLOT_SCOPE_TRAILER_SIZE) {
+        return {};
+    }
+
+    const char * data = reinterpret_cast<const char *>(packed.data());
+    uint32_t magic = 0;
+    std::memcpy(&magic, data + packed_size - sizeof(magic), sizeof(magic));
+    if (magic != SERVER_SLOT_SCOPE_MAGIC) {
+        return {};
+    }
+
+    const size_t scope_offset = packed_size - SERVER_SLOT_SCOPE_TRAILER_SIZE;
+    std::string cache_key(data + scope_offset, SERVER_SLOT_SCOPE_SIZE);
+    if (!server_cache_key_is_valid(cache_key)) {
+        return {};
+    }
+
+    packed.resize(scope_offset / sizeof(llama_token));
+    return cache_key;
+}
+
+} // namespace
+
 static bool server_speculative_is_only_dspark(const std::vector<common_speculative_type> & types) {
     return common_speculative_is_only_dspark(types);
+}
+
+static bool server_speculative_type_is_runtime_model(common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+           type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+           type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+static bool server_speculative_type_is_lookup(common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE ||
+           type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+           type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V ||
+           type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+           type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+}
+
+static common_spec_runtime::model_drafter server_runtime_model_drafter(
+        common_speculative_type type, const llama_model * model_dft) {
+    switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            return common_spec_runtime::model_drafter::mtp;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            return model_dft != nullptr && llama_model_dflash_selector_top_k(model_dft) > 0
+                    ? common_spec_runtime::model_drafter::dflash2
+                    : common_spec_runtime::model_drafter::dflash;
+        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+            return common_spec_runtime::model_drafter::dspark;
+        default:
+            return common_spec_runtime::model_drafter::none;
+    }
+}
+
+static common_spec_runtime::config server_runtime_policy_config(
+        const common_params_speculative & params, const llama_model * model_dft) {
+    common_spec_runtime::config cfg;
+
+    common_speculative_type trained_type = COMMON_SPECULATIVE_TYPE_NONE;
+    int32_t n_trained = 0;
+    for (common_speculative_type type : params.types) {
+        if (server_speculative_type_is_runtime_model(type)) {
+            trained_type = type;
+            n_trained++;
+        }
+        cfg.lookup_enabled = cfg.lookup_enabled || server_speculative_type_is_lookup(type);
+    }
+
+    if (n_trained != 1 || params.draft.n_max <= 0) {
+        return cfg;
+    }
+
+    cfg.drafter = server_runtime_model_drafter(trained_type, model_dft);
+    cfg.bootstrap_target_baseline = true;
+    cfg.lookup_depth = cfg.lookup_enabled ? std::max<int32_t>(1, params.draft.n_min) : 0;
+
+    // Arms are derived from the configured load caps, plus the safe C1 probe
+    // and the trained maximum. This includes the DFlash2 depth-5 lane without
+    // teaching the server model-specific magic numbers.
+    cfg.depth_arms = { 0, 1 };
+    for (int32_t cap : params.draft.adaptive_load_caps) {
+        if (cap > 0) {
+            cfg.depth_arms.push_back(std::min(cap, params.draft.n_max));
+        }
+    }
+    cfg.depth_arms.push_back(params.draft.n_max);
+    std::sort(cfg.depth_arms.begin(), cfg.depth_arms.end());
+    cfg.depth_arms.erase(std::unique(cfg.depth_arms.begin(), cfg.depth_arms.end()), cfg.depth_arms.end());
+
+    // config has a fail-closed { 0 } default.  Replace it; appending would
+    // shift every configured concurrency cap by one (C1=0, C2=C1, ...).
+    cfg.load_depth_caps.clear();
+    cfg.load_depth_caps.reserve(params.draft.adaptive_load_caps.size());
+    for (int32_t cap : params.draft.adaptive_load_caps) {
+        cfg.load_depth_caps.push_back(std::clamp(cap, 0, params.draft.n_max));
+    }
+    if (cfg.load_depth_caps.empty()) {
+        cfg.load_depth_caps.push_back(params.draft.n_max);
+    }
+
+    cfg.probe_depth = 1;
+    cfg.promote_samples = std::max<int32_t>(2, (int32_t) params.draft.adaptive_ema_warmup);
+    cfg.demote_samples = 2;
+    constexpr uint64_t bytes_per_mib = 1024ULL * 1024ULL;
+    cfg.hard_vram_free_bytes = uint64_t(params.draft.runtime_vram_hard_free_mib) * bytes_per_mib;
+    cfg.soft_vram_free_bytes = uint64_t(params.draft.runtime_vram_soft_free_mib) * bytes_per_mib;
+    cfg.soft_vram_max_depth = params.draft.runtime_vram_soft_max_depth;
+    cfg.max_vram_sample_age_us = 2 * 1000 * 1000;
+    return cfg;
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -275,6 +412,8 @@ struct server_slot {
 
     server_prompt prompt;
 
+    bool prompt_purge_on_release = false;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         // A target-only adaptive request intentionally stops maintaining the
         // DFlash/DSpark sequence.  Never persist that asymmetric state as a
@@ -283,19 +422,26 @@ struct server_slot {
             return false;
         }
 
-        if (prompt.tokens.size() == 0) {
+        if (prompt.tokens.size() == 0 || !server_cache_key_is_valid(prompt.cache_key)) {
             return false;
         }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
+        if (ctx_dft && cur_size_dft == 0) {
+            SLT_WRN(*this, "%s", "refusing to cache target-only state while a draft context is active\n");
+            return false;
+        }
+
         const size_t cur_size = cur_size_tgt + cur_size_dft;
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        // Moving resident KV into RAM is not a cache hit. Preserve the last
+        // real use so another scope cannot extend this entry's TTL by evicting it.
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, t_last_used / 1000);
         if (cur == nullptr) {
             return false;
         }
@@ -308,8 +454,8 @@ struct server_slot {
         return true;
     }
 
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::string & cache_key) {
+        bool res = prompt_cache.load(prompt, tokens, cache_key, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -321,6 +467,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_reset_scope(spec, id);
 
         prompt.clear();
     }
@@ -352,6 +499,19 @@ struct server_slot {
     bool spec_adaptive_disabled = false;
     bool spec_adaptive_replay_recorded = false;
 
+    // Request-local latch for the server-wide runtime-policy decision.
+    common_spec_runtime::decision spec_runtime_decision;
+    common_speculative_type spec_runtime_last_type = COMMON_SPECULATIVE_TYPE_NONE;
+    uint64_t spec_runtime_request_epoch = 0;
+    uint64_t spec_runtime_round_epoch = 0;
+    int64_t spec_runtime_tick_start_us = 0;
+    int64_t spec_runtime_elapsed_us = 0;
+    int32_t spec_runtime_actual_depth = 0;
+    bool spec_runtime_pending = false;
+    bool spec_runtime_clean_sample = false;
+    int32_t spec_runtime_sample_load = 0;
+    bool spec_runtime_observed = false;
+
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
 
@@ -362,13 +522,24 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        spec_runtime_decision = {};
+        spec_runtime_last_type = COMMON_SPECULATIVE_TYPE_NONE;
+        spec_runtime_round_epoch = 0;
+        spec_runtime_tick_start_us = 0;
+        spec_runtime_elapsed_us = 0;
+        spec_runtime_actual_depth = 0;
+        spec_runtime_pending = false;
+        spec_runtime_clean_sample = false;
+        spec_runtime_sample_load = 0;
+        spec_runtime_observed = false;
+
         spec_is_replay = false;
 
         // n=0 latches a DFlash/DSpark slot into target-only mode for the rest
         // of the request.  Drop both live sequences before re-enabling it, so
         // a later request cannot reuse a target prefix that the draft KV did
         // not observe.
-        if (spec_adaptive_disabled) {
+        if (spec_adaptive_disabled && !prompt.tokens.empty()) {
             prompt_clear();
         }
         spec_draft_survival.clear();
@@ -386,6 +557,7 @@ struct server_slot {
             spec_i_batch.clear();
             spec_ckpt.clear();
             common_speculative_set_enabled(spec, id, true);
+            common_speculative_set_route(spec, id, COMMON_SPECULATIVE_ROUTE_TARGET);
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -403,6 +575,7 @@ struct server_slot {
         spec_adaptive_disabled = false;
         spec_adaptive_replay_recorded = false;
         spec_sps_prefix_choices.clear();
+        prompt_purge_on_release = false;
 
         n_predict_max = -1;
 
@@ -562,8 +735,10 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // do not keep context of child or unscoped tasks
+            if (task->is_child() || !task->params.cache_prompt ||
+                    !server_cache_key_is_valid(task->params.cache_key) || prompt_purge_on_release ||
+                    spec_adaptive_disabled) {
                 prompt_clear();
             }
 
@@ -925,6 +1100,26 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    bool spec_runtime_policy_enabled = false;
+    std::unique_ptr<common_spec_runtime::policy> spec_runtime_policy;
+    common_spec_runtime::decision spec_runtime_group_decision;
+    std::vector<int32_t> spec_runtime_group_slots;
+    uint64_t spec_runtime_group_epoch = 0;
+    int64_t spec_runtime_group_tick_start_us = 0;
+    int64_t spec_runtime_group_elapsed_us = 0;
+    int64_t spec_runtime_group_useful_tokens = 0;
+    int32_t spec_runtime_group_observed_slots = 0;
+    bool spec_runtime_group_pending = false;
+
+    struct runtime_vram_sample {
+        uint64_t free_bytes = 0;
+        uint64_t total_bytes = 0;
+        int64_t sampled_at_us = 0;
+        bool valid = false;
+    } spec_runtime_vram;
+    int64_t spec_runtime_vram_last_attempt_us = 0;
+    int64_t spec_runtime_vram_last_warning_us = 0;
+    bool spec_runtime_vram_has_devices = false;
 
     std::optional<common_speculative_sps_profile> spec_sps_profile;
     std::unique_ptr<common_speculative_sps_profile_recorder> spec_sps_recorder;
@@ -955,6 +1150,17 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    int64_t prompt_cache_ttl_ms = server_prompt_cache::DEFAULT_TTL_MS;
+    bool prompt_cache_ram_mtp_unsafe = false;
+    bool cache_runtime_enabled = false;
+    common_cache_runtime_config cache_runtime_config;
+    common_cache_runtime_state cache_runtime_state;
+    uint64_t cache_runtime_tick = 0;
+    int64_t cache_runtime_last_tick_us = 0;
+    uint64_t cache_runtime_last_prompt_cached = 0;
+    uint64_t cache_runtime_initial_quota_bytes = 0;
+    size_t cache_runtime_initial_limit_tokens = 0;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -976,8 +1182,394 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    void spec_runtime_refresh_vram(int64_t now_us) {
+        static constexpr int64_t min_sample_interval_us = 250 * 1000;
+        static constexpr int64_t warning_interval_us = 10 * 1000 * 1000;
+
+        if (spec_runtime_vram_last_attempt_us > 0 &&
+                now_us - spec_runtime_vram_last_attempt_us < min_sample_interval_us) {
+            return;
+        }
+        spec_runtime_vram_last_attempt_us = now_us;
+
+        std::vector<ggml_backend_dev_t> devices;
+        auto append_model_devices = [&](const llama_model * model) {
+            if (model == nullptr) {
+                return;
+            }
+            const int32_t n_devices = llama_model_n_devices(model);
+            for (int32_t i = 0; i < n_devices; ++i) {
+                ggml_backend_dev_t dev = llama_model_get_device(model, i);
+                if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                        std::find(devices.begin(), devices.end(), dev) != devices.end()) {
+                    continue;
+                }
+                devices.push_back(dev);
+            }
+        };
+        append_model_devices(model_tgt);
+        append_model_devices(model_dft);
+        spec_runtime_vram_has_devices = !devices.empty();
+
+        uint64_t min_free = std::numeric_limits<uint64_t>::max();
+        uint64_t min_total = std::numeric_limits<uint64_t>::max();
+        bool all_valid = !devices.empty();
+        for (ggml_backend_dev_t dev : devices) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (free == 0 || total == 0 || free > total) {
+                all_valid = false;
+                break;
+            }
+            min_free = std::min<uint64_t>(min_free, free);
+            min_total = std::min<uint64_t>(min_total, total);
+        }
+
+        if (all_valid) {
+            spec_runtime_vram.free_bytes = min_free;
+            spec_runtime_vram.total_bytes = min_total;
+            spec_runtime_vram.sampled_at_us = now_us;
+            spec_runtime_vram.valid = true;
+            return;
+        }
+
+        // Keep the previous valid value only until its normal stale deadline.
+        // The policy sees absent/stale telemetry as target-only; target model
+        // inference itself is never rejected.
+        if (spec_runtime_vram_has_devices && (spec_runtime_vram_last_warning_us == 0 ||
+                now_us - spec_runtime_vram_last_warning_us >= warning_interval_us)) {
+            SRV_WRN("%s\n", "runtime speculative VRAM telemetry unavailable; routing target-only until a valid sample arrives");
+            spec_runtime_vram_last_warning_us = now_us;
+        }
+    }
+
+    bool cache_runtime_ram_headroom(uint64_t & available_bytes) const {
+#if defined(_WIN32)
+        MEMORYSTATUSEX status = {};
+        status.dwLength = sizeof(status);
+        if (!GlobalMemoryStatusEx(&status)) {
+            return false;
+        }
+        // ullAvailPageFile is Windows' remaining commit capacity, not the page
+        // file size. Both physical and commit headroom must remain safe.
+        available_bytes = std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile);
+        return true;
+#else
+        (void) available_bytes;
+        return false;
+#endif
+    }
+
+    void cache_runtime_update(int64_t now_us) {
+        static constexpr int64_t update_interval_us = 5 * 1000 * 1000;
+        if (!cache_runtime_enabled || !prompt_cache ||
+                (cache_runtime_last_tick_us > 0 && now_us - cache_runtime_last_tick_us < update_interval_us)) {
+            return;
+        }
+        cache_runtime_last_tick_us = now_us;
+        if (cache_runtime_tick == std::numeric_limits<uint64_t>::max()) {
+            cache_runtime_tick = 1;
+            cache_runtime_state = {};
+        } else {
+            cache_runtime_tick++;
+        }
+
+        spec_runtime_refresh_vram(now_us);
+
+        uint64_t ram_headroom = 0;
+        const bool ram_valid = cache_runtime_ram_headroom(ram_headroom);
+        const int64_t vram_age_us = spec_runtime_vram.valid
+                ? std::max<int64_t>(0, now_us - spec_runtime_vram.sampled_at_us)
+                : std::numeric_limits<int64_t>::max();
+        const bool vram_valid = !spec_runtime_vram_has_devices ||
+                (spec_runtime_vram.valid && vram_age_us <=
+                        static_cast<int64_t>(cache_runtime_config.telemetry_max_age_ms) * 1000);
+        if (!ram_valid || !vram_valid) {
+            // Preserve the last valid geometry so the next healthy sample can
+            // recover. Close admission immediately and keep existing entries
+            // subject to their current TTL.
+            prompt_cache->set_allow_new_retention(false);
+            prompt_cache->set_runtime_admission_bytes(0);
+            return;
+        }
+
+        const auto telemetry = prompt_cache->snapshot_and_reset_delta();
+
+        uint32_t active_requests = 0;
+        for (const auto & slot : slots) {
+            active_requests += slot.is_processing() ? 1U : 0U;
+        }
+        const uint32_t queued_requests = static_cast<uint32_t>(std::min<size_t>(
+                queue_tasks.queue_inference_slot_demand(), std::numeric_limits<uint32_t>::max()));
+
+        const uint64_t cached_total = metrics.n_prompt_cached;
+        const uint64_t all_reused_tokens = cached_total >= cache_runtime_last_prompt_cached
+                ? cached_total - cache_runtime_last_prompt_cached : 0;
+        cache_runtime_last_prompt_cached = cached_total;
+        const uint64_t resident_reused_tokens = all_reused_tokens > telemetry.delta.reused_tokens
+                ? all_reused_tokens - telemetry.delta.reused_tokens : 0;
+        const uint64_t reused_tokens = all_reused_tokens;
+
+        common_cache_runtime_input input;
+        input.tick = cache_runtime_tick;
+        input.telemetry_valid = ram_valid && vram_valid;
+        input.telemetry_age_ms = vram_valid ? static_cast<uint64_t>(
+                spec_runtime_vram_has_devices ? vram_age_us / 1000 : 0) :
+                std::numeric_limits<uint64_t>::max();
+        input.scope_isolated = true;
+
+        if (telemetry.delta.lookup_attempts > 0 || resident_reused_tokens > 0) {
+            const uint64_t attempts = telemetry.delta.lookup_attempts == std::numeric_limits<uint64_t>::max()
+                    ? telemetry.delta.lookup_attempts
+                    : telemetry.delta.lookup_attempts + (resident_reused_tokens > 0 ? 1 : 0);
+            const uint64_t hits = std::min<uint64_t>(attempts,
+                    telemetry.delta.lookup_hits == std::numeric_limits<uint64_t>::max()
+                            ? telemetry.delta.lookup_hits
+                            : telemetry.delta.lookup_hits + (resident_reused_tokens > 0 ? 1 : 0));
+            input.reuse_ratio = static_cast<double>(hits) / static_cast<double>(attempts);
+            input.hit_ratio = input.reuse_ratio;
+        } else {
+            // No observations is neutral, not evidence that retention has no value.
+            input.reuse_ratio = 0.10;
+            input.hit_ratio = 0.10;
+        }
+
+        if (reused_tokens > 0) {
+            const double prompt_us_per_token = metrics.prompt.count > 0
+                    ? static_cast<double>(metrics.prompt.time) / static_cast<double>(metrics.prompt.count)
+                    : 200.0;
+            input.saved_prefill_us = prompt_us_per_token * static_cast<double>(reused_tokens);
+            input.lookup_winner_benefit_us = input.saved_prefill_us;
+        } else {
+            input.saved_prefill_us = 500.0;
+            input.lookup_winner_benefit_us = 100.0;
+        }
+
+        input.occupancy_ratio = telemetry.limit_size_bytes > 0
+                ? std::min(1.0, static_cast<double>(telemetry.size_bytes) /
+                        static_cast<double>(telemetry.limit_size_bytes))
+                : 1.0;
+        input.decode_pressure = slots.empty() ? 0.0 : std::min(1.0,
+                static_cast<double>(active_requests) / static_cast<double>(slots.size()));
+        input.active_requests = active_requests;
+        input.queued_requests = queued_requests;
+        input.idle = active_requests == 0 && queued_requests == 0;
+        input.speculative_active = active_requests > 0 && spec != nullptr;
+        input.ram_headroom_bytes = ram_headroom;
+        input.vram_headroom_bytes = spec_runtime_vram_has_devices
+                ? spec_runtime_vram.free_bytes : std::numeric_limits<uint64_t>::max();
+        input.current_quota_bytes = telemetry.limit_size_bytes;
+        input.current_ttl_seconds = static_cast<uint32_t>(telemetry.ttl_ms / 1000);
+
+        const auto decision = common_cache_runtime_decide(
+                cache_runtime_config, cache_runtime_state, input);
+        cache_runtime_state = decision.state;
+
+        static constexpr uint64_t host_reserve_bytes = 16ULL * 1024 * 1024 * 1024;
+        const uint64_t safe_admission_bytes = ram_headroom > host_reserve_bytes
+                ? ram_headroom - host_reserve_bytes : 0;
+        prompt_cache->set_runtime_admission_bytes(
+                safe_admission_bytes > std::numeric_limits<size_t>::max()
+                        ? std::numeric_limits<size_t>::max()
+                        : static_cast<size_t>(safe_admission_bytes));
+
+        const uint64_t safe_quota_bytes = telemetry.size_bytes >
+                std::numeric_limits<uint64_t>::max() - safe_admission_bytes
+                ? std::numeric_limits<uint64_t>::max()
+                : static_cast<uint64_t>(telemetry.size_bytes) + safe_admission_bytes;
+        const uint64_t bounded_quota_bytes = std::max(
+                cache_runtime_config.quota_min_bytes,
+                std::min(decision.output.quota_bytes, safe_quota_bytes));
+        const size_t quota = bounded_quota_bytes > std::numeric_limits<size_t>::max()
+                ? std::numeric_limits<size_t>::max()
+                : static_cast<size_t>(bounded_quota_bytes);
+        if (decision.output.allow_geometry_rebuild) {
+            prompt_cache->set_runtime_limit_size(quota);
+        }
+        if (decision.output.allow_geometry_rebuild &&
+                cache_runtime_initial_quota_bytes > 0 && cache_runtime_initial_limit_tokens > 0) {
+            const long double scaled = static_cast<long double>(cache_runtime_initial_limit_tokens) *
+                    static_cast<long double>(bounded_quota_bytes) /
+                    static_cast<long double>(cache_runtime_initial_quota_bytes);
+            const size_t tokens = static_cast<size_t>(std::max<long double>(1.0L,
+                    std::min<long double>(scaled, std::numeric_limits<size_t>::max())));
+            prompt_cache->set_runtime_limit_tokens(tokens);
+        }
+        if (decision.output.allow_geometry_rebuild) {
+            prompt_cache_ttl_ms = static_cast<int64_t>(decision.output.ttl_seconds) * 1000;
+            if (!prompt_cache->set_runtime_ttl_ms(prompt_cache_ttl_ms)) {
+                prompt_cache_ttl_ms = cache_runtime_config.ttl_min_seconds * 1000;
+            }
+        }
+        prompt_cache->set_allow_new_retention(decision.output.allow_new_retention && !prompt_cache_ram_mtp_unsafe);
+    }
+
+    void spec_runtime_clear_slot_latch(server_slot & slot) {
+        slot.spec_runtime_decision = {};
+        slot.spec_runtime_last_type = COMMON_SPECULATIVE_TYPE_NONE;
+        slot.spec_runtime_tick_start_us = 0;
+        slot.spec_runtime_elapsed_us = 0;
+        slot.spec_runtime_actual_depth = 0;
+        slot.spec_runtime_pending = false;
+        slot.spec_runtime_clean_sample = false;
+        slot.spec_runtime_sample_load = 0;
+        slot.spec_runtime_observed = false;
+    }
+
+    void spec_runtime_discard_group(const char * why) {
+        if (!spec_runtime_group_pending) {
+            return;
+        }
+        if (spec_runtime_policy) {
+            spec_runtime_policy->discard(
+                    spec_runtime_group_decision.decision_id,
+                    spec_runtime_group_epoch);
+        }
+        SRV_DBG("runtime speculative group sample discarded: %s (decision=%" PRIu64 ", bucket=%s, slots=%zu)\n",
+                why, spec_runtime_group_decision.decision_id,
+                common_spec_runtime::to_string(spec_runtime_group_decision.load_class),
+                spec_runtime_group_slots.size());
+        for (int32_t id_slot : spec_runtime_group_slots) {
+            if (id_slot >= 0 && (size_t) id_slot < slots.size()) {
+                spec_runtime_clear_slot_latch(slots[(size_t) id_slot]);
+            }
+        }
+        spec_runtime_group_decision = {};
+        spec_runtime_group_slots.clear();
+        spec_runtime_group_tick_start_us = 0;
+        spec_runtime_group_elapsed_us = 0;
+        spec_runtime_group_useful_tokens = 0;
+        spec_runtime_group_observed_slots = 0;
+        spec_runtime_group_pending = false;
+    }
+
+    void spec_runtime_discard(server_slot & slot, const char * why) {
+        if (spec_runtime_group_pending && slot.spec_runtime_pending &&
+                slot.spec_runtime_decision.decision_id == spec_runtime_group_decision.decision_id) {
+            spec_runtime_discard_group(why);
+            return;
+        }
+        if (slot.spec_runtime_pending) {
+            SLT_DBG(slot, "runtime speculative orphan latch discarded: %s (decision=%" PRIu64 ")\n",
+                    why, slot.spec_runtime_decision.decision_id);
+            spec_runtime_clear_slot_latch(slot);
+        }
+    }
+
+    void spec_runtime_observe(server_slot & slot, int32_t useful_tokens) {
+        if (!spec_runtime_policy || !spec_runtime_group_pending || !slot.spec_runtime_pending) {
+            return;
+        }
+        const auto & decision = slot.spec_runtime_decision;
+        if (decision.decision_id != spec_runtime_group_decision.decision_id || slot.spec_runtime_observed) {
+            spec_runtime_discard_group("duplicate or mismatched group participant observation");
+            return;
+        }
+        if (!slot.spec_runtime_clean_sample || slot.spec_runtime_elapsed_us <= 0 || useful_tokens <= 0) {
+            spec_runtime_discard_group("overlapping, mixed, or incomplete load-bucket timing");
+            return;
+        }
+        if (decision.selected_action == common_spec_runtime::action::model) {
+            if (!common_spec_runtime::policy::valid_produced_depth(
+                        decision.selected_action, slot.spec_runtime_actual_depth, decision.depth) ||
+                    !server_speculative_type_is_runtime_model(slot.spec_runtime_last_type)) {
+                spec_runtime_discard_group("trained drafter produced zero or exceeded the offered group depth");
+                return;
+            }
+        } else if (decision.selected_action == common_spec_runtime::action::lookup) {
+            if (!common_spec_runtime::policy::valid_produced_depth(
+                        decision.selected_action, slot.spec_runtime_actual_depth, decision.depth) ||
+                    !server_speculative_type_is_lookup(slot.spec_runtime_last_type)) {
+                spec_runtime_discard_group("lookup drafter produced zero or exceeded the offered group depth");
+                return;
+            }
+        } else if (!common_spec_runtime::policy::valid_produced_depth(
+                           decision.selected_action, slot.spec_runtime_actual_depth, decision.depth) ||
+                slot.spec_runtime_last_type != COMMON_SPECULATIVE_TYPE_NONE) {
+            spec_runtime_discard_group("target-only group decision produced a draft");
+            return;
+        }
+
+        slot.spec_runtime_observed = true;
+        spec_runtime_group_observed_slots++;
+        spec_runtime_group_useful_tokens += useful_tokens;
+        if (spec_runtime_group_observed_slots < (int32_t) spec_runtime_group_slots.size()) {
+            return;
+        }
+        if (spec_runtime_group_observed_slots != (int32_t) spec_runtime_group_slots.size() ||
+                spec_runtime_group_useful_tokens <= 0 ||
+                spec_runtime_group_useful_tokens > std::numeric_limits<int32_t>::max()) {
+            spec_runtime_discard_group("invalid aggregate useful-token count");
+            return;
+        }
+
+        common_spec_runtime::observation obs;
+        obs.decision_id = spec_runtime_group_decision.decision_id;
+        obs.request_epoch = spec_runtime_group_epoch;
+        obs.round_epoch = spec_runtime_group_epoch;
+        obs.observed_action = spec_runtime_group_decision.selected_action;
+        obs.observed_drafter = spec_runtime_group_decision.drafter;
+        obs.observed_depth = spec_runtime_group_decision.depth;
+        obs.elapsed_us = spec_runtime_group_elapsed_us;
+        obs.useful_tokens = (int32_t) spec_runtime_group_useful_tokens;
+        obs.target_tokens_per_us = spec_runtime_policy->get_target_tokens_per_us(
+                spec_runtime_group_decision.load_class);
+        obs.synchronized = true;
+        obs.complete = true;
+
+        if (!spec_runtime_policy->observe(obs)) {
+            SRV_WRN("runtime speculative aggregate observation rejected (decision=%" PRIu64 ")\n",
+                    spec_runtime_group_decision.decision_id);
+        }
+        for (int32_t id_slot : spec_runtime_group_slots) {
+            if (id_slot >= 0 && (size_t) id_slot < slots.size()) {
+                spec_runtime_clear_slot_latch(slots[(size_t) id_slot]);
+            }
+        }
+        spec_runtime_group_decision = {};
+        spec_runtime_group_slots.clear();
+        spec_runtime_group_tick_start_us = 0;
+        spec_runtime_group_elapsed_us = 0;
+        spec_runtime_group_useful_tokens = 0;
+        spec_runtime_group_observed_slots = 0;
+        spec_runtime_group_pending = false;
+    }
+
     void destroy() {
+        // Sleep/reload can bypass the periodic idle tick. Drop all scoped
+        // resident and RAM state while the contexts still exist so retention
+        // never outlives the server's active model lifetime.
+        if (ctx_tgt != nullptr) {
+            for (auto & slot : slots) {
+                slot.prompt_clear();
+            }
+        }
+        slots.clear();
+        prompt_cache.reset();
+
         spec.reset();
+        spec_runtime_policy_enabled = false;
+        spec_runtime_policy.reset();
+        spec_runtime_group_decision = {};
+        spec_runtime_group_slots.clear();
+        spec_runtime_group_epoch = 0;
+        spec_runtime_group_tick_start_us = 0;
+        spec_runtime_group_elapsed_us = 0;
+        spec_runtime_group_useful_tokens = 0;
+        spec_runtime_group_observed_slots = 0;
+        spec_runtime_group_pending = false;
+        spec_runtime_vram = {};
+        spec_runtime_vram_last_attempt_us = 0;
+        spec_runtime_vram_last_warning_us = 0;
+        spec_runtime_vram_has_devices = false;
+        cache_runtime_enabled = false;
+        cache_runtime_state = {};
+        cache_runtime_tick = 0;
+        cache_runtime_last_tick_us = 0;
+        cache_runtime_last_prompt_cached = 0;
+        cache_runtime_initial_quota_bytes = 0;
+        cache_runtime_initial_limit_tokens = 0;
         spec_init.reset();
         spec_sps_profile.reset();
         spec_sps_recorder.reset();
@@ -1477,25 +2069,37 @@ private:
             }
         }
 
-        if (params_base.speculative.draft.adaptive) {
-            const bool pure_dflash_family = common_speculative_is_only_dflash_family(params_base.speculative.types);
-            if (!pure_dflash_family) {
-                SRV_WRN("%s\n", "adaptive draft length requires exactly one speculative type: draft-dflash or draft-dspark; disabling adaptation");
+        common_spec_runtime::config runtime_policy_cfg;
+        spec_runtime_policy_enabled = false;
+        spec_runtime_policy.reset();
+        if (params_base.speculative.draft.adaptive && spec) {
+            runtime_policy_cfg = server_runtime_policy_config(params_base.speculative, model_dft);
+            spec_runtime_policy_enabled = common_spec_runtime::policy::valid_config(runtime_policy_cfg);
+            if (!spec_runtime_policy_enabled) {
+                SRV_WRN("%s\n", "runtime speculative policy requires exactly one supported trained drafter; preserving fixed-depth routing");
             } else {
-                std::string caps;
-                for (int32_t cap : params_base.speculative.draft.adaptive_load_caps) {
-                    if (!caps.empty()) {
-                        caps += ",";
+                std::string arms;
+                for (int32_t arm : runtime_policy_cfg.depth_arms) {
+                    if (!arms.empty()) {
+                        arms += ",";
                     }
-                    caps += std::to_string(cap);
+                    arms += std::to_string(arm);
                 }
-                SRV_INF("adaptive DFlash/DSpark enabled: load_caps=%s, acceptance_ema=%.3f, threshold=%.3f, warmup=%u\n",
-                        caps.c_str(),
-                        (double) params_base.speculative.draft.adaptive_ema_alpha,
-                        (double) params_base.speculative.draft.adaptive_ema_threshold,
-                        params_base.speculative.draft.adaptive_ema_warmup);
+                SRV_INF("runtime speculative policy enabled: drafter=%s, arms=%s, isolated C1/C2/C4/C8+ learning\n",
+                        common_spec_runtime::to_string(runtime_policy_cfg.drafter), arms.c_str());
             }
         }
+        spec_runtime_policy = spec_runtime_policy_enabled
+                ? std::make_unique<common_spec_runtime::policy>(runtime_policy_cfg)
+                : nullptr;
+        spec_runtime_group_decision = {};
+        spec_runtime_group_slots.clear();
+        spec_runtime_group_epoch = 0;
+        spec_runtime_group_tick_start_us = 0;
+        spec_runtime_group_elapsed_us = 0;
+        spec_runtime_group_useful_tokens = 0;
+        spec_runtime_group_observed_slots = 0;
+        spec_runtime_group_pending = false;
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
@@ -1523,7 +2127,6 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
-
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
@@ -1569,6 +2172,25 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        prompt_cache_ttl_ms = server_prompt_cache::DEFAULT_TTL_MS;
+        prompt_cache_ram_mtp_unsafe = std::find(
+                params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        if (const char * ttl_env = std::getenv("LLAMA_SERVER_PROMPT_CACHE_TTL_MS")) {
+            try {
+                const std::string ttl_value(ttl_env);
+                size_t parsed = 0;
+                const int64_t ttl_ms = std::stoll(ttl_value, &parsed);
+                if (parsed == ttl_value.size() && ttl_ms > 0) {
+                    prompt_cache_ttl_ms = ttl_ms;
+                } else {
+                    SRV_WRN("%s\n", "ignoring invalid LLAMA_SERVER_PROMPT_CACHE_TTL_MS");
+                }
+            } catch (const std::exception &) {
+                SRV_WRN("%s\n", "ignoring invalid LLAMA_SERVER_PROMPT_CACHE_TTL_MS");
+            }
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1577,7 +2199,41 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, prompt_cache_ttl_ms);
+            if (prompt_cache_ram_mtp_unsafe) {
+                SRV_WRN("%s\n", "MTP side-state is not serializable; RAM prompt-cache migration is disabled, resident scoped reuse remains enabled");
+            }
+
+#if defined(_WIN32)
+            const uint64_t configured_quota = params_base.cache_ram_mib < 0
+                    ? 8ULL * 1024 * 1024 * 1024
+                    : static_cast<uint64_t>(params_base.cache_ram_mib) * 1024 * 1024;
+            const bool ttl_is_whole_seconds = prompt_cache_ttl_ms % 1000 == 0;
+            const uint32_t configured_ttl_seconds = ttl_is_whole_seconds
+                    ? static_cast<uint32_t>(prompt_cache_ttl_ms / 1000) : 0;
+            if (configured_quota > cache_runtime_config.quota_min_bytes &&
+                    configured_ttl_seconds >= cache_runtime_config.ttl_min_seconds &&
+                    configured_ttl_seconds <= server_prompt_cache::MAX_RUNTIME_TTL_MS / 1000) {
+                cache_runtime_config.quota_max_bytes = configured_quota;
+                cache_runtime_config.quota_step_bytes = std::min<uint64_t>(
+                        cache_runtime_config.quota_step_bytes,
+                        cache_runtime_config.quota_max_bytes - cache_runtime_config.quota_min_bytes);
+                cache_runtime_config.ttl_default_seconds = configured_ttl_seconds;
+                cache_runtime_config.ttl_max_seconds = std::max<uint32_t>(
+                        cache_runtime_config.ttl_max_seconds, configured_ttl_seconds);
+                cache_runtime_config.ram_headroom_demote_bytes = 16ULL * 1024 * 1024 * 1024;
+                cache_runtime_config.ram_headroom_promote_bytes = 24ULL * 1024 * 1024 * 1024;
+                cache_runtime_initial_quota_bytes = configured_quota;
+                cache_runtime_initial_limit_tokens = n_ctx;
+                cache_runtime_last_prompt_cached = metrics.n_prompt_cached;
+                cache_runtime_enabled = true;
+                prompt_cache->set_runtime_limit_size(static_cast<size_t>(configured_quota));
+                prompt_cache->set_runtime_limit_tokens(n_ctx);
+                prompt_cache->set_allow_new_retention(!prompt_cache_ram_mtp_unsafe);
+                SRV_INF("dynamic scoped prompt cache enabled: quota = %.1f MiB, ttl = %u s\n",
+                        configured_quota / (1024.0 * 1024.0), configured_ttl_seconds);
+            }
+#endif
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1631,6 +2287,10 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+        });
+        queue_tasks.on_idle_tick([this]() {
+            purge_expired_prompt_cache();
+            cache_runtime_update(ggml_time_us());
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -1754,7 +2414,27 @@ private:
         return nullptr;
     }
 
+    void purge_expired_prompt_cache() {
+        const int64_t now_ms = ggml_time_ms();
+
+        if (prompt_cache) {
+            prompt_cache->purge_expired(now_ms);
+        }
+
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.tokens.empty() || slot.t_last_used < 0) {
+                continue;
+            }
+
+            if (now_ms - slot.t_last_used / 1000 >= prompt_cache_ttl_ms) {
+                slot.prompt_clear();
+            }
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
+        purge_expired_prompt_cache();
+
         server_slot * ret = nullptr;
 
         bool update_cache = false;
@@ -1768,7 +2448,10 @@ private:
         }
 
         // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        const bool can_reuse_task = task.params.cache_prompt &&
+                server_cache_key_is_valid(task.params.cache_key) && !task.tokens.empty();
+
+        if (can_reuse_task && slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -1779,6 +2462,10 @@ private:
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                    continue;
+                }
+
+                if (slot.prompt.cache_key != task.params.cache_key) {
                     continue;
                 }
 
@@ -1844,25 +2531,39 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            const bool is_completion = task.type == SERVER_TASK_TYPE_COMPLETION;
+            const bool scope_changed = ret->prompt.cache_key != task.params.cache_key;
+            const bool can_store_existing = prompt_cache && !prompt_cache_ram_mtp_unsafe && is_completion &&
+                    server_cache_key_is_valid(ret->prompt.cache_key);
+            const bool can_load_incoming = prompt_cache && !prompt_cache_ram_mtp_unsafe && is_completion && can_reuse_task;
+            const bool use_prompt_cache = update_cache || scope_changed;
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-            if (update_cache) {
+            if (use_prompt_cache && can_store_existing) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                SRV_TRC("prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            if (!can_reuse_task) {
+                ret->prompt_clear();
+            } else {
+                if (scope_changed) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                if (use_prompt_cache && can_load_incoming && !ret->prompt_load(*prompt_cache, task.tokens, task.params.cache_key)) {
+                    ret->prompt_clear();
+                }
 
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                ret->prompt.cache_key = task.params.cache_key;
+            }
+
+            if (prompt_cache && (use_prompt_cache || !can_reuse_task)) {
+                prompt_cache->update();
             }
         }
 
@@ -1915,6 +2616,14 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        const bool can_reuse_task = task.params.cache_prompt && server_cache_key_is_valid(task.params.cache_key);
+        if (!can_reuse_task) {
+            slot.prompt_clear();
+        } else if (slot.prompt.cache_key != task.params.cache_key) {
+            slot.prompt_clear();
+            slot.prompt.cache_key = task.params.cache_key;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2020,6 +2729,22 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        if (spec_runtime_policy_enabled) {
+            if (slot.spec_runtime_pending) {
+                spec_runtime_discard(slot, "new request boundary");
+            }
+            slot.spec_runtime_request_epoch = slot.spec_runtime_request_epoch == std::numeric_limits<uint64_t>::max()
+                    ? 1 : slot.spec_runtime_request_epoch + 1;
+            slot.spec_runtime_round_epoch = 0;
+            slot.spec_adaptive_disabled = false;
+            common_speculative_set_model_maintenance(spec.get(), slot.id, true);
+            common_speculative_set_route(spec.get(), slot.id, COMMON_SPECULATIVE_ROUTE_TARGET);
+        }
+
+        if (can_reuse_task) {
+            slot.prompt.cache_key = task.params.cache_key;
+        }
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -2082,7 +2807,7 @@ private:
         }
 
         if (incomplete) {
-            if (server_should_emit_native_token_only_partial(
+            if (server_should_emit_token_only_partial(
                         slot.task->params.res_type,
                         slot.task->params.stream,
                         slot.task->params.return_tokens,
@@ -2287,6 +3012,7 @@ private:
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+        res->return_tokens         = slot.task->params.return_tokens;
 
         res->verbose           = slot.task->params.verbose;
         res->res_type          = slot.task->params.res_type;
@@ -2637,7 +3363,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && !prompt_cache_ram_mtp_unsafe) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -2669,6 +3395,36 @@ private:
                 {
                     auto res = std::make_unique<server_task_result_control>();
                     res->id = task.id;
+
+                    if (task.params.control_action == "cache_purge") {
+                        if (prompt_cache) {
+                            prompt_cache->purge_scope(task.params.control_cache_key);
+                        }
+
+                        bool pending = false;
+                        for (auto & slot : slots) {
+                            if (slot.prompt.cache_key != task.params.control_cache_key) {
+                                continue;
+                            }
+
+                            if (slot.is_processing()) {
+                                slot.prompt_purge_on_release = true;
+                                pending = true;
+                            } else {
+                                slot.prompt_clear();
+                            }
+                        }
+
+                        // An active sequence cannot be erased underneath decode.
+                        // Report the deferred state honestly; release() completes it.
+                        res->success = !pending;
+                        res->pending = pending;
+                        if (pending) {
+                            res->message = "cache purge deferred until active completions finish";
+                        }
+                        queue_results.send(std::move(res));
+                        break;
+                    }
 
                     server_slot * slot = get_slot_by_cmpl_id(task.params.control_cmpl_id);
                     if (slot == nullptr) {
@@ -2756,6 +3512,11 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (ctx_dft) {
+                        send_error(task, "Slot save is unavailable while a draft context is active",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -2765,6 +3526,7 @@ private:
                     std::vector<char> packed;
                     try {
                         packed = slot->prompt.tokens.serialize();
+                        server_slot_append_cache_scope(packed, slot->prompt.cache_key);
                     } catch (const std::exception & err) {
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
@@ -2806,6 +3568,11 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (ctx_dft) {
+                        send_error(task, "Slot restore is unavailable while a draft context is active",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
 
                     const int64_t t_start = ggml_time_us();
 
@@ -2826,6 +3593,11 @@ private:
                         }
                         packed.resize(n_packed);
 
+                        const std::string saved_cache_key = server_slot_take_cache_scope(packed);
+                        if (!saved_cache_key.empty() && saved_cache_key != task.slot_action.cache_key) {
+                            throw std::runtime_error("Slot save belongs to a different cache scope");
+                        }
+
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
 
                         if (restored.size() > (size_t) slot->n_ctx) {
@@ -2838,6 +3610,10 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        // Pre-scope slot files remain loadable, but fail closed:
+                        // neither scoped nor unscoped completions may reuse them.
+                        slot->prompt.cache_key = saved_cache_key;
+                        slot->t_last_used = ggml_time_us();
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3003,6 +3779,9 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        purge_expired_prompt_cache();
+        cache_runtime_update(ggml_time_us());
 
         // check if all slots are idle
         {
@@ -3199,8 +3978,9 @@ private:
             generating.push_back(&slot);
         });
 
+        const bool runtime_adaptive = spec_runtime_policy_enabled;
         const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
-                common_speculative_is_only_dflash_family(params_base.speculative.types);
+                !runtime_adaptive && common_speculative_is_only_dflash_family(params_base.speculative.types);
         int32_t assigned_slots = 0;
         iterate(slots, [&](server_slot & slot) {
             assigned_slots += slot.is_processing() ? 1 : 0;
@@ -3210,8 +3990,76 @@ private:
                 (int32_t) generating.size(),
                 std::min<int32_t>((int32_t) slots.size(),
                         assigned_slots + (int32_t) std::min<size_t>(queued_slot_demand, slots.size())));
+        const int64_t runtime_vram_now_us = runtime_adaptive ? ggml_time_us() : 0;
+        if (runtime_adaptive) {
+            spec_runtime_refresh_vram(runtime_vram_now_us);
+        }
         if (adaptive_dflash) {
             llama_set_recurrent_load_hint(ctx_tgt, (uint32_t) estimated_load);
+        }
+
+        common_spec_runtime::decision runtime_group_decision;
+        bool runtime_group_clean = false;
+        bool runtime_group_model_state_synchronized = false;
+        if (runtime_adaptive && spec_runtime_policy && !generating.empty()) {
+            if (spec_runtime_group_pending) {
+                spec_runtime_discard_group("previous server tick did not complete");
+            }
+
+            runtime_group_clean = queued_slot_demand == 0 &&
+                    assigned_slots == (int32_t) generating.size();
+            bool runtime_group_at_request_boundary = true;
+            int32_t group_context_tokens = 0;
+            int32_t group_max_model_depth = std::numeric_limits<int32_t>::max();
+            runtime_group_model_state_synchronized = true;
+            for (const server_slot * slot : generating) {
+                // A carried partial draft was selected on a previous tick and
+                // will skip the new latch below.  Such a group cannot produce
+                // one complete aggregate observation.
+                runtime_group_clean = runtime_group_clean && !slot->spec_is_replay &&
+                        slot->spec_draft.empty();
+                runtime_group_at_request_boundary = runtime_group_at_request_boundary &&
+                        slot->stats.n_gen == 0;
+                runtime_group_model_state_synchronized = runtime_group_model_state_synchronized &&
+                        !slot->spec_adaptive_disabled;
+                group_context_tokens = std::max(group_context_tokens, slot->prompt.n_tokens());
+                group_max_model_depth = std::min(group_max_model_depth, slot->get_n_draft_max());
+            }
+
+            spec_runtime_group_epoch = spec_runtime_group_epoch == std::numeric_limits<uint64_t>::max()
+                    ? 1 : spec_runtime_group_epoch + 1;
+            common_spec_runtime::runtime_context runtime_ctx;
+            runtime_ctx.request_epoch = spec_runtime_group_epoch;
+            runtime_ctx.active_slots = assigned_slots;
+            runtime_ctx.queued_slots = (int32_t) std::min<size_t>(queued_slot_demand, slots.size());
+            runtime_ctx.context_tokens = group_context_tokens;
+            runtime_ctx.max_model_depth = std::max(0, group_max_model_depth);
+            runtime_ctx.allow_target_remeasure = runtime_group_clean &&
+                    runtime_group_at_request_boundary;
+            runtime_ctx.model_state_synchronized = runtime_group_model_state_synchronized;
+            if (spec_runtime_vram.valid) {
+                runtime_ctx.vram_free_bytes = spec_runtime_vram.free_bytes;
+                runtime_ctx.vram_total_bytes = spec_runtime_vram.total_bytes;
+                runtime_ctx.vram_sample_age_us = std::max<int64_t>(
+                        0, runtime_vram_now_us - spec_runtime_vram.sampled_at_us);
+            }
+
+            runtime_group_decision = spec_runtime_policy->decide(runtime_ctx);
+            if (runtime_group_clean) {
+                spec_runtime_group_decision = runtime_group_decision;
+                spec_runtime_group_slots.clear();
+                spec_runtime_group_slots.reserve(generating.size());
+                for (const server_slot * slot : generating) {
+                    spec_runtime_group_slots.push_back(slot->id);
+                }
+                spec_runtime_group_tick_start_us = ggml_time_us();
+                spec_runtime_group_elapsed_us = 0;
+                spec_runtime_group_useful_tokens = 0;
+                spec_runtime_group_observed_slots = 0;
+                spec_runtime_group_pending = true;
+            } else {
+                spec_runtime_policy->discard(runtime_group_decision.decision_id, spec_runtime_group_epoch);
+            }
         }
 
         for (server_slot * slot : generating) {
@@ -3223,9 +4071,6 @@ private:
             dp.drafting = false;
 
             int n_draft_max = slot->get_n_draft_max();
-            if (n_draft_max <= 0) {
-                continue;
-            }
 
             GGML_ASSERT(slot->can_speculate());
 
@@ -3242,6 +4087,59 @@ private:
             }
 
             slot->spec_draft_survival.clear();
+
+            if (runtime_adaptive && spec_runtime_policy) {
+                slot->spec_runtime_round_epoch = slot->spec_runtime_round_epoch == std::numeric_limits<uint64_t>::max()
+                        ? 1 : slot->spec_runtime_round_epoch + 1;
+                slot->spec_runtime_decision = runtime_group_decision;
+                slot->spec_runtime_pending = spec_runtime_group_pending;
+                slot->spec_runtime_clean_sample = runtime_group_clean;
+                slot->spec_runtime_sample_load = runtime_group_clean ? assigned_slots : 0;
+                slot->spec_runtime_tick_start_us = runtime_group_clean ? spec_runtime_group_tick_start_us : 0;
+                slot->spec_runtime_elapsed_us = 0;
+                slot->spec_runtime_actual_depth = 0;
+                slot->spec_runtime_last_type = COMMON_SPECULATIVE_TYPE_NONE;
+                slot->spec_runtime_observed = false;
+
+                const auto & decision = slot->spec_runtime_decision;
+                switch (decision.selected_action) {
+                    case common_spec_runtime::action::target:
+                        common_speculative_set_route(spec.get(), slot->id, COMMON_SPECULATIVE_ROUTE_TARGET);
+                        break;
+                    case common_spec_runtime::action::lookup:
+                        common_speculative_set_route(spec.get(), slot->id, COMMON_SPECULATIVE_ROUTE_LOOKUP_ONLY);
+                        break;
+                    case common_spec_runtime::action::model:
+                        common_speculative_set_route(spec.get(), slot->id, COMMON_SPECULATIVE_ROUTE_MODEL_ONLY);
+                        break;
+                }
+                common_speculative_set_model_maintenance(
+                        spec.get(), slot->id, decision.keep_model_state_synchronized);
+                if (!decision.keep_model_state_synchronized) {
+                    // reset() clears asymmetric target/draft state before this
+                    // slot can be cached or reused by another request.
+                    slot->spec_adaptive_disabled = true;
+                }
+
+                n_draft_max = std::min(n_draft_max, decision.depth);
+                if (slot->spec_adaptive_choices.size() <= (size_t) n_draft_max) {
+                    slot->spec_adaptive_choices.resize((size_t) n_draft_max + 1, 0);
+                }
+                slot->spec_adaptive_choices[(size_t) n_draft_max]++;
+
+                const int32_t runtime_load_cap = spec_runtime_policy->get_bucket_load_cap(decision.load_class);
+                SLT_DBG(*slot,
+                        "runtime speculative decision: id=%" PRIu64 " request=%" PRIu64 " round=%" PRIu64
+                        " action=%s decision_depth=%d effective_depth=%d reason=%s state=%s active=%d queued=%zu"
+                        " load_cap=%d model_sync=%d bucket=%s clean_sample=%d\n",
+                        decision.decision_id, spec_runtime_group_epoch, slot->spec_runtime_round_epoch,
+                        common_spec_runtime::to_string(decision.selected_action), decision.depth, n_draft_max,
+                        common_spec_runtime::to_string(decision.why), common_spec_runtime::to_string(decision.state),
+                        assigned_slots, queued_slot_demand, runtime_load_cap,
+                        runtime_group_model_state_synchronized ? 1 : 0,
+                        common_spec_runtime::to_string(decision.load_class),
+                        slot->spec_runtime_clean_sample ? 1 : 0);
+            }
 
             if (adaptive_dflash) {
                 const int32_t hard_cap = n_draft_max;
@@ -3305,6 +4203,15 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            if (runtime_adaptive) {
+                for (server_slot * slot : drafting) {
+                    if (!slot->spec_runtime_pending) {
+                        continue;
+                    }
+                    slot->spec_runtime_actual_depth = (int32_t) slot->spec_draft.size();
+                    slot->spec_runtime_last_type = common_speculative_get_last_type(spec.get(), slot->id);
+                }
+            }
         }
 
         // Record-mode profiling arms may force a precise whole-batch verify-row
@@ -4124,6 +5031,62 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        std::vector<server_slot *> runtime_sample_slots;
+        int32_t runtime_sample_load = 0;
+        if (spec_runtime_policy_enabled) {
+            for (auto & slot : slots) {
+                if (!slot.spec_runtime_pending || !slot.spec_runtime_clean_sample) {
+                    continue;
+                }
+                if (runtime_sample_load == 0) {
+                    runtime_sample_load = slot.spec_runtime_sample_load;
+                }
+                if (slot.spec_runtime_sample_load != runtime_sample_load ||
+                        slot.spec_runtime_decision.load_class !=
+                                common_spec_runtime::policy::classify_load(runtime_sample_load) ||
+                        (!runtime_sample_slots.empty() &&
+                         (slot.spec_runtime_decision.selected_action !=
+                                  runtime_sample_slots.front()->spec_runtime_decision.selected_action ||
+                          slot.spec_runtime_decision.depth !=
+                                  runtime_sample_slots.front()->spec_runtime_decision.depth ||
+                          slot.spec_runtime_decision.drafter !=
+                                  runtime_sample_slots.front()->spec_runtime_decision.drafter))) {
+                    for (server_slot * candidate : runtime_sample_slots) {
+                        spec_runtime_discard(*candidate, "load bucket or policy arm diverged before target batch");
+                    }
+                    spec_runtime_discard(slot, "load bucket or policy arm diverged before target batch");
+                    runtime_sample_slots.clear();
+                    runtime_sample_load = 0;
+                    break;
+                }
+                runtime_sample_slots.push_back(&slot);
+            }
+        }
+
+        bool runtime_batch_is_clean = !runtime_sample_slots.empty() &&
+                runtime_sample_slots.size() == (size_t) runtime_sample_load &&
+                off == 0 && batch_view.n_tokens == batch.size() && has_output;
+        std::vector<bool> runtime_slot_seen(runtime_sample_slots.size(), false);
+        if (runtime_batch_is_clean) {
+            for (int32_t i = 0; i < batch.size(); ++i) {
+                if (batch.tokens[(size_t) i].is_prompt) {
+                    runtime_batch_is_clean = false;
+                    break;
+                }
+                const int32_t id_slot = batch.tokens[(size_t) i].id_slot;
+                const auto candidate = std::find_if(
+                        runtime_sample_slots.begin(), runtime_sample_slots.end(),
+                        [id_slot](const server_slot * value) { return value->id == id_slot; });
+                if (candidate == runtime_sample_slots.end()) {
+                    runtime_batch_is_clean = false;
+                    break;
+                }
+                runtime_slot_seen[(size_t) std::distance(runtime_sample_slots.begin(), candidate)] = true;
+            }
+            runtime_batch_is_clean = runtime_batch_is_clean &&
+                    std::all_of(runtime_slot_seen.begin(), runtime_slot_seen.end(), [](bool seen) { return seen; });
+        }
+
         // Once the requested quota is committed there is nothing left to
         // observe or publish. Keeping the recorder inactive also prevents
         // normal tail tokens from being misclassified as skipped-full.
@@ -4148,6 +5111,31 @@ private:
                 record_end_us = ggml_time_us();
             }
         });
+
+        if (!runtime_sample_slots.empty()) {
+            int64_t runtime_sample_start_us = std::numeric_limits<int64_t>::max();
+            for (const server_slot * candidate : runtime_sample_slots) {
+                if (candidate->spec_runtime_tick_start_us <= 0) {
+                    runtime_batch_is_clean = false;
+                    break;
+                }
+                runtime_sample_start_us = std::min(runtime_sample_start_us, candidate->spec_runtime_tick_start_us);
+            }
+            if (ret == 0 && runtime_batch_is_clean) {
+                // has_output forced llama_synchronize() above.  Every policy
+                // receives the same whole-batch wall clock, so no overlapping
+                // sub-batch can independently qualify a load bucket.
+                const int64_t elapsed_us = std::max<int64_t>(1, ggml_time_us() - runtime_sample_start_us);
+                spec_runtime_group_elapsed_us = elapsed_us;
+                for (server_slot * candidate : runtime_sample_slots) {
+                    candidate->spec_runtime_elapsed_us = elapsed_us;
+                }
+            } else {
+                for (server_slot * candidate : runtime_sample_slots) {
+                    spec_runtime_discard(*candidate, "partial, mixed, unsynchronized, or failed load-bucket batch");
+                }
+            }
+        }
 
         if (record_enabled) {
             const llama_graph_execution_stats graph_stats_after = llama_get_graph_execution_stats(ctx_tgt);
@@ -4322,7 +5310,7 @@ private:
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         const bool adaptive_dflash = params_base.speculative.draft.adaptive &&
-                common_speculative_is_only_dflash_family(params_base.speculative.types);
+                !spec_runtime_policy_enabled && common_speculative_is_only_dflash_family(params_base.speculative.types);
 
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -4415,6 +5403,10 @@ private:
 
             slot.stats.update_gen_last();
 
+            if (slot.spec_runtime_pending) {
+                spec_runtime_observe(slot, 1);
+            }
+
             completion_token_output result;
             result.tok          = id;
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
@@ -4500,6 +5492,10 @@ private:
                             slot.spec_adaptive_replay_recorded = true;
                         }
 
+                        if (slot.spec_runtime_pending) {
+                            spec_runtime_discard(slot, "checkpoint replay");
+                        }
+
                         return;
                     }
                 }
@@ -4520,6 +5516,10 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+
+            if (slot.spec_runtime_pending) {
+                spec_runtime_observe(slot, (int32_t) ids.size());
+            }
 
             slot.stats.update_gen_last();
 
@@ -5445,11 +6445,16 @@ void server_routes::init_routes() {
 
         const std::string cmpl_id = json_value(body, "id", std::string());
         const std::string action  = json_value(body, "action", std::string());
-        if (cmpl_id.empty()) {
+        const std::string cache_key = json_value(body, "cache_key", std::string());
+        if (action == "cache_purge" && !server_cache_key_is_valid(cache_key)) {
+            res->error(format_error_response("invalid cache key", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (action != "cache_purge" && cmpl_id.empty()) {
             res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (action != "reasoning_end") {
+        if (action != "reasoning_end" && action != "cache_purge") {
             res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -5460,6 +6465,7 @@ void server_routes::init_routes() {
             task.id              = rd.get_new_id();
             task.params.control_cmpl_id = cmpl_id;
             task.params.control_action  = action;
+            task.params.control_cache_key = cache_key;
             rd.post_task(std::move(task));
         }
 
@@ -5481,7 +6487,9 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        json body_log = body;
+        body_log.erase("cache_key");
+        SRV_DBG("converted request: %s\n", body_log.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -5513,7 +6521,9 @@ void server_routes::init_routes() {
             req.files,
             files);
         SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        json body_log = body;
+        body_log.erase("cache_key");
+        SRV_DBG("converted request: %s\n", body_log.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -5529,9 +6539,15 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
+        const json body_anthropic = json::parse(req.body);
+        json body = server_chat_convert_anthropic_to_oai(body_anthropic);
+        if (body_anthropic.contains("cache_key")) {
+            body["cache_key"] = body_anthropic.at("cache_key");
+        }
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        json body_log = body;
+        body_log.erase("cache_key");
+        SRV_DBG("converted request: %s\n", body_log.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -5874,6 +6890,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         return res;
     }
     std::string filepath = params.slot_save_path + filename;
+    const std::string cache_key = json_value(request_data, "cache_key", std::string());
+    if (!server_cache_key_is_valid(cache_key)) {
+        res->error(format_error_response("invalid cache key", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
 
     auto & rd = res->rd;
     {
@@ -5882,6 +6903,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.cache_key = cache_key;
         rd.post_task(std::move(task));
     }
 

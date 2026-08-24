@@ -44,6 +44,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle_tick;
     std::function<void(bool)>                 callback_sleeping_state;
 
 public:
@@ -129,6 +130,13 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register lightweight maintenance that runs on the main queue thread while
+    // no task is pending. Unlike posting an internal task, this does not refresh
+    // time_last_task or prevent idle sleep.
+    void on_idle_tick(std::function<void(void)> callback) {
+        callback_idle_tick = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

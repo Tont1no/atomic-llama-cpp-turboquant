@@ -341,6 +341,13 @@ struct common_params_speculative_draft {
     float adaptive_ema_threshold = 0.55f;
     uint32_t adaptive_ema_warmup = 8;
 
+    // Runtime VRAM guard for adaptive model drafting. Values are MiB so the
+    // command-line representation stays exact and conversion to bytes happens
+    // once when the server constructs its runtime policy.
+    uint32_t runtime_vram_hard_free_mib = 4096;
+    uint32_t runtime_vram_soft_free_mib = 6144;
+    int32_t runtime_vram_soft_max_depth = 1;
+
     // Internal draft sampler seed. The default preserves existing random-seed
     // behavior; deterministic in-process regressions set an explicit value.
     uint32_t seed = LLAMA_DEFAULT_SEED;

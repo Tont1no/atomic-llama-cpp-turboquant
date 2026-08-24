@@ -3303,6 +3303,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        const uint32_t selector_tokens = (uint32_t) std::min<uint64_t>(
+                n_tokens, (uint64_t) model.hparams.dflash_block_size * cparams.n_seq_max);
+        res += 32 * selector_tokens;
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {

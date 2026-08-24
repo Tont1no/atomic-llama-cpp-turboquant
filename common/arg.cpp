@@ -101,6 +101,25 @@ static std::vector<int32_t> parse_sps_positive_list(const std::string & value, c
     return result;
 }
 
+static uint32_t parse_bounded_uint32_exact(
+        const std::string & value, uint32_t minimum, uint32_t maximum, const char * name) {
+    if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        throw std::invalid_argument(string_format("%s must be an integer between %u and %u", name, minimum, maximum));
+    }
+
+    size_t consumed = 0;
+    unsigned long long parsed;
+    try {
+        parsed = std::stoull(value, &consumed);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(string_format("%s must be an integer between %u and %u", name, minimum, maximum));
+    }
+    if (consumed != value.size() || parsed < minimum || parsed > maximum) {
+        throw std::invalid_argument(string_format("%s must be between %u and %u", name, minimum, maximum));
+    }
+    return (uint32_t) parsed;
+}
+
 static const std::vector<common_arg> & get_common_arg_defs() {
     static const std::vector<common_arg> options = [] {
         common_params params;
@@ -941,6 +960,13 @@ static bool common_params_parse_ex(
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    if (params.speculative.draft.runtime_vram_hard_free_mib >
+            params.speculative.draft.runtime_vram_soft_free_mib) {
+        throw std::invalid_argument(
+                "error: --spec-draft-runtime-vram-hard-free-mib must be less than or equal to "
+                "--spec-draft-runtime-vram-soft-free-mib\n");
+    }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -4254,6 +4280,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.adaptive_ema_warmup = (uint32_t) value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_ACCEPTANCE_WARMUP"));
+
+    add_opt(common_arg(
+        {"--spec-draft-runtime-vram-hard-free-mib"}, "MIB",
+        string_format("minimum free VRAM before adaptive model drafting is disabled; "
+                      "range 256..1048576 MiB (default: %u)",
+                      params.speculative.draft.runtime_vram_hard_free_mib),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.runtime_vram_hard_free_mib =
+                    parse_bounded_uint32_exact(value, 256, 1048576, "hard free VRAM MiB");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_RUNTIME_VRAM_HARD_FREE_MIB"));
+    add_opt(common_arg(
+        {"--spec-draft-runtime-vram-soft-free-mib"}, "MIB",
+        string_format("free VRAM threshold below which adaptive model drafting is capped; "
+                      "range 256..1048576 MiB (default: %u)",
+                      params.speculative.draft.runtime_vram_soft_free_mib),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.runtime_vram_soft_free_mib =
+                    parse_bounded_uint32_exact(value, 256, 1048576, "soft free VRAM MiB");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_RUNTIME_VRAM_SOFT_FREE_MIB"));
+    add_opt(common_arg(
+        {"--spec-draft-runtime-vram-soft-max-depth"}, "N",
+        string_format("maximum model-draft depth below the soft free-VRAM threshold; "
+                      "range 0..1024 (default: %d)",
+                      params.speculative.draft.runtime_vram_soft_max_depth),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.runtime_vram_soft_max_depth = (int32_t)
+                    parse_bounded_uint32_exact(value, 0, 1024, "soft VRAM maximum draft depth");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_RUNTIME_VRAM_SOFT_MAX_DEPTH"));
 
     add_opt(common_arg(
         {"--spec-draft-sps-profile"}, "FILE",

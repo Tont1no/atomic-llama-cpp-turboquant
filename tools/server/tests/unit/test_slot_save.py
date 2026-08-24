@@ -3,9 +3,15 @@ from utils import *
 import base64
 import requests
 import struct
+import time
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
+CACHE_SCOPE_A = "v1_" + "a" * 64
+CACHE_SCOPE_B = "v1_" + "b" * 64
+CACHE_SCOPE_PURGE = "v1_" + "c" * 64
+CACHE_SCOPE_TTL = "v1_" + "d" * 64
+DRAFT_MODEL_URL = "https://huggingface.co/ggml-org/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
 
 server = ServerPreset.tinyllama2()
 
@@ -26,6 +32,7 @@ def test_slot_save_restore():
         "prompt": "What is the capital of France?",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
@@ -43,6 +50,7 @@ def test_slot_save_restore():
         "prompt": "What is the capital of Germany?",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
@@ -51,6 +59,7 @@ def test_slot_save_restore():
     # Loading the saved cache into slot 0
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "slot1.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == 84
@@ -60,6 +69,7 @@ def test_slot_save_restore():
         "prompt": "What is the capital of Germany?",
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
@@ -70,6 +80,7 @@ def test_slot_save_restore():
         "prompt": "What is the capital of Germany?",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
@@ -84,6 +95,7 @@ def test_slot_restore_legacy_token_list():
         "prompt": "What is the capital of France?",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
 
@@ -113,9 +125,11 @@ def test_slot_restore_legacy_token_list():
     with open(path, "wb") as f:
         f.write(data)
 
-    # the plain token list must restore, and the restored KV must be reusable
+    # Legacy files have no scope metadata. They still restore for compatibility,
+    # but fail closed and cannot seed a scoped completion.
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "slot_legacy.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == 84
@@ -124,9 +138,67 @@ def test_slot_restore_legacy_token_list():
         "prompt": "What is the capital of Germany?",
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
-    assert res.body["timings"]["prompt_n"] == 6  # only the different part is processed
+    assert res.body["timings"]["prompt_n"] == 21
+
+
+def test_slot_restore_rejects_different_scope():
+    global server
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "slot_scope_bound.bin",
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "slot_scope_bound.bin",
+        "cache_key": CACHE_SCOPE_B,
+    })
+    assert res.status_code == 400
+    assert CACHE_SCOPE_A not in str(res.body)
+    assert CACHE_SCOPE_B not in str(res.body)
+
+
+def test_slot_files_fail_closed_with_draft_context():
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.slot_save_path = "./tmp"
+    server.model_draft = download_file(DRAFT_MODEL_URL)
+    server.spec_type = "draft-simple"
+    server.spec_draft_n_min = 4
+    server.spec_draft_n_max = 8
+    server.fa = "off"
+    server.start()
+
+    completion = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "n_predict": 8,
+        "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
+    })
+    assert completion.status_code == 200
+
+    save = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "must_not_save_target_only.bin",
+    })
+    assert save.status_code == 501
+
+    restore = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "must_not_restore_target_only.bin",
+        "cache_key": CACHE_SCOPE_A,
+    })
+    assert restore.status_code == 501
 
 
 
@@ -138,6 +210,7 @@ def test_slot_erase():
         "prompt": "What is the capital of France?",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
@@ -152,10 +225,188 @@ def test_slot_erase():
         "prompt": "What is the capital of France?",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
+
+
+def test_prompt_cache_scope_isolation():
+    global server
+    server.start()
+
+    prompt = "What is the capital of France?"
+    cache_key = CACHE_SCOPE_A
+
+    first = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert first.status_code == 200
+    assert first.body["timings"]["cache_n"] == 0
+    assert cache_key not in str(first.body)
+
+    same_scope = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert same_scope.status_code == 200
+    assert same_scope.body["timings"]["cache_n"] > 0
+
+    different_scope = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_B,
+    })
+    assert different_scope.status_code == 200
+    assert different_scope.body["timings"]["cache_n"] == 0
+
+    restored_scope = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert restored_scope.status_code == 200
+    assert restored_scope.body["timings"]["cache_n"] > 0
+
+
+def test_unscoped_prompt_is_not_retained():
+    global server
+    server.start()
+
+    prompt = "What is the capital of France?"
+    for _ in range(2):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "id_slot": 0,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        assert res.body["timings"]["cache_n"] == 0
+
+
+def test_prompt_cache_scope_purge():
+    global server
+    server.start()
+
+    prompt = "What is the capital of France?"
+    cache_key = CACHE_SCOPE_PURGE
+
+    first = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert first.status_code == 200
+
+    purge = server.make_request("POST", "/v1/chat/completions/control", data={
+        "action": "cache_purge",
+        "cache_key": cache_key,
+    })
+    assert purge.status_code == 200
+    assert purge.body["success"] is True
+
+    after_purge = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert after_purge.status_code == 200
+    assert after_purge.body["timings"]["cache_n"] == 0
+
+
+def test_prompt_cache_scope_active_purge_is_reported_pending():
+    global server
+    server.start()
+
+    url = f"http://{server.server_host}:{server.server_port}/completion"
+    active = requests.post(url, json={
+        "prompt": "Count forever: 1, 2, 3,",
+        "n_predict": 4096,
+        "stream": True,
+        "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_PURGE,
+    }, stream=True)
+    try:
+        assert active.status_code == 200
+        purge = server.make_request("POST", "/v1/chat/completions/control", data={
+            "action": "cache_purge",
+            "cache_key": CACHE_SCOPE_PURGE,
+        })
+        assert purge.status_code == 200
+        assert purge.body["success"] is False
+        assert purge.body["pending"] is True
+    finally:
+        active.close()
+
+
+@pytest.mark.parametrize("cache_key", [
+    "v1_" + "a" * 63,
+    "v1_" + "A" * 64,
+    "v2_" + "a" * 64,
+    "not-a-scope",
+])
+def test_prompt_cache_scope_rejects_invalid_keys(cache_key):
+    global server
+    server.start()
+
+    completion = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?",
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert completion.status_code == 400
+
+    purge = server.make_request("POST", "/v1/chat/completions/control", data={
+        "action": "cache_purge",
+        "cache_key": cache_key,
+    })
+    assert purge.status_code == 400
+
+
+def test_prompt_cache_scope_ttl(monkeypatch):
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_PROMPT_CACHE_TTL_MS", "20")
+    server.start()
+
+    prompt = "What is the capital of France?"
+    cache_key = CACHE_SCOPE_TTL
+
+    first = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert first.status_code == 200
+
+    # The queue's idle maintenance tick is one second. Verify expiry happens
+    # before another completion is submitted, not merely on the next lookup.
+    time.sleep(1.2)
+
+    saved = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "slot_expired.bin",
+    })
+    assert saved.status_code == 200
+    assert saved.body["n_saved"] == 0
+
+    expired = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "cache_key": cache_key,
+    })
+    assert expired.status_code == 200
+    assert expired.body["timings"]["cache_n"] == 0
 
 
 #
@@ -194,6 +445,7 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
         "prompt": "The quick brown fox jumps over the lazy dog.",
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     prompt_n = res.body["timings"]["prompt_n"]
@@ -210,6 +462,7 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
     # Restore the saved state into slot 0; it must round-trip exactly.
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot1.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
@@ -219,6 +472,7 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
         "prompt": "The quick brown fox jumps over the lazy dog.",
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
 
@@ -238,6 +492,7 @@ def test_slot_save_restore_with_image(mmproj_server):
         "top_k": 1,
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt_cat,
     })
     assert res.status_code == 200
@@ -260,6 +515,7 @@ def test_slot_save_restore_with_image(mmproj_server):
 
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot_image.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
@@ -271,6 +527,7 @@ def test_slot_save_restore_with_image(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": {
             "prompt_string": "What is this: <__media__>\n",
             "multimodal_data": [_get_img_base64(IMG_URL_TRUCK)],
@@ -284,6 +541,7 @@ def test_slot_save_restore_with_image(mmproj_server):
     # restore again and resend the same image: the image tokens must be reused and greedy sampling must reproduce the original content
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot_image.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
@@ -293,6 +551,7 @@ def test_slot_save_restore_with_image(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt_cat,
     })
     assert res.status_code == 200
@@ -316,6 +575,7 @@ def test_slot_save_restore_with_two_images(mmproj_server):
         "top_k": 1,
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt,
     })
     assert res.status_code == 200
@@ -331,6 +591,7 @@ def test_slot_save_restore_with_two_images(mmproj_server):
 
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot_two_images.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
@@ -340,6 +601,7 @@ def test_slot_save_restore_with_two_images(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt,
     })
     assert res.status_code == 200
@@ -362,6 +624,7 @@ def test_slot_save_restore_with_image_across_restart(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt_cat,
     })
     assert res.status_code == 200
@@ -380,6 +643,7 @@ def test_slot_save_restore_with_image_across_restart(mmproj_server):
 
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot_restart.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == n_saved
@@ -389,6 +653,7 @@ def test_slot_save_restore_with_image_across_restart(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt_cat,
     })
     assert res.status_code == 200
@@ -417,6 +682,7 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": {
             "prompt_string": "What is this: <__media__>\n",
             "multimodal_data": [_get_img_base64(IMG_URL_CAT)],
@@ -433,6 +699,7 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt_cat,
     })
     assert res.status_code == 200
@@ -454,11 +721,13 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
         "prompt": "The quick brown fox",
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
 
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot_large_payload.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 200
 
@@ -467,6 +736,7 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": prompt_cat,
     })
     assert res.status_code == 200
@@ -483,6 +753,7 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": {
             "prompt_string": "What is this: <__media__>\n",
             "multimodal_data": [_get_img_base64(IMG_URL_CAT)],
@@ -502,6 +773,7 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
 
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "mm_slot_no_mmproj.bin",
+        "cache_key": CACHE_SCOPE_A,
     })
     assert res.status_code == 400
     assert "Cannot restore media tokens without an mmproj" in res.body["error"]["message"]
@@ -512,6 +784,7 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
         "top_k": 1,
         "id_slot": 1,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": "The quick brown fox",
     })
     assert res.status_code == 200
@@ -522,6 +795,7 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
         "top_k": 1,
         "id_slot": 0,
         "cache_prompt": True,
+        "cache_key": CACHE_SCOPE_A,
         "prompt": "The quick brown fox",
     })
     assert res.status_code == 200

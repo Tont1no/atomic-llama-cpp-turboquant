@@ -333,6 +333,8 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-speculative-adaptive.cpp)
+llama_build_and_test(test-cache-runtime-policy.cpp)
+llama_build_and_test(test-speculative-runtime-policy.cpp)
 llama_build_and_test(test-speculative-sps.cpp)
 llama_build_and_test(test-speculative-sps-recorder.cpp)
 llama_build_and_test(test-model-resolution.cpp)

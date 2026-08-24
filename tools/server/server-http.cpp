@@ -43,7 +43,10 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
 
     SRV_TRC("done request: %s %s %s %d\n", req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), res.status);
 
-    SRV_DBG("request:  %s\n", req.body.c_str());
+    // Request bodies may contain API inputs and HMAC-derived cache
+    // capabilities. JSON escaping makes substring redaction bypassable, so do
+    // not emit raw bodies at any log level.
+    SRV_DBG("request body: <redacted>, bytes = %zu\n", req.body.size());
     SRV_DBG("response: %s\n", res.body.c_str());
 }
 

@@ -137,12 +137,44 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// Per-sequence routing for the next and subsequent draft passes. Routing only
+// controls proposal generation; model-state maintenance is configured
+// separately so a synchronized model drafter can remain warm while lookups win.
+enum common_speculative_route {
+    COMMON_SPECULATIVE_ROUTE_TARGET,
+    COMMON_SPECULATIVE_ROUTE_LOOKUP_ONLY,
+    COMMON_SPECULATIVE_ROUTE_MODEL_ONLY,
+    COMMON_SPECULATIVE_ROUTE_LOOKUP_THEN_MODEL,
+};
+
+void common_speculative_set_route(
+        common_speculative * spec, llama_seq_id seq_id, enum common_speculative_route route);
+
+// Return the implementation that actually produced the most recent draft for
+// this sequence, or NONE when the route was target-only or no implementation won.
+enum common_speculative_type common_speculative_get_last_type(
+        const common_speculative * spec, llama_seq_id seq_id);
+
+// Drop all speculative state that can carry tokens, proposal choices, or
+// timing information across an authorization/cache scope boundary. This does
+// not change generated target tokens and is safe to call for purge or unscoped
+// requests before the next prompt is processed. Drafting remains target-only
+// until common_speculative_begin() receives the completed new prompt.
+void common_speculative_reset_scope(common_speculative * spec, llama_seq_id seq_id);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// Enable or disable model-drafter maintenance without changing lookup routing.
+// Implementations that do not require optional maintenance may ignore this.
+void common_speculative_set_model_maintenance(
+        common_speculative * spec, llama_seq_id seq_id, bool enabled);
+
 // Disable or enable an implementation's per-sequence maintenance work. DFlash/
 // DSpark use this to provide a true target-only fallback after an adaptive n=0
-// decision. Other implementations ignore it.
+// decision. Other implementations ignore it. This legacy entry point preserves
+// its existing all-implementation dispatch; new routing code should use the
+// model-specific maintenance API above.
 void common_speculative_set_enabled(common_speculative * spec, llama_seq_id seq_id, bool enabled);
 
 // process the batch and update the internal state of the speculative context

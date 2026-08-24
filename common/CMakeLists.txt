@@ -65,6 +65,8 @@ add_library(${TARGET}
     chat-peg-parser.h
     chat.cpp
     chat.h
+    cache-runtime-policy.cpp
+    cache-runtime-policy.h
     common.cpp
     common.h
     console.cpp
@@ -100,6 +102,8 @@ add_library(${TARGET}
     sampling.h
     speculative-sps.cpp
     speculative-sps.h
+    speculative-runtime-policy.cpp
+    speculative-runtime-policy.h
     speculative.cpp
     speculative.h
     subproc.cpp

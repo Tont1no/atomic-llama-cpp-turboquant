@@ -31,6 +31,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
+    add((new field_str("cache_key"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            auto cache_key = data.at("cache_key").get<std::string>();
+            if (!cache_key.empty() && !server_cache_key_is_valid(cache_key)) {
+                throw std::invalid_argument("cache key must use the v1_ prefix followed by 64 lowercase hex characters");
+            }
+            ctx.params.cache_key = std::move(cache_key);
+        })
+        ->set_desc("Scope prompt-cache reuse to requests with the same opaque key"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 

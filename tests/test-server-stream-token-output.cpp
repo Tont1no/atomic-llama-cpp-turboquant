@@ -29,19 +29,20 @@ static json native_partial(llama_token token, const std::string & content, int32
 }
 
 int main() {
-    // An incomplete UTF-8 piece needs a native token-only partial only when
+    // An incomplete UTF-8 piece needs a token-only partial only when
     // the caller explicitly requested raw token IDs.
-    require(server_should_emit_native_token_only_partial(TASK_RESPONSE_TYPE_NONE, true, true, true));
-    require(!server_should_emit_native_token_only_partial(TASK_RESPONSE_TYPE_NONE, true, false, true));
-    require(!server_should_emit_native_token_only_partial(TASK_RESPONSE_TYPE_NONE, true, true, false));
-    require(!server_should_emit_native_token_only_partial(TASK_RESPONSE_TYPE_OAI_CMPL, true, true, true));
+    require(server_should_emit_token_only_partial(TASK_RESPONSE_TYPE_NONE, true, true, true));
+    require(!server_should_emit_token_only_partial(TASK_RESPONSE_TYPE_NONE, true, false, true));
+    require(!server_should_emit_token_only_partial(TASK_RESPONSE_TYPE_NONE, true, true, false));
+    require(server_should_emit_token_only_partial(TASK_RESPONSE_TYPE_OAI_CMPL, true, true, true));
+    require(server_should_emit_token_only_partial(TASK_RESPONSE_TYPE_OAI_CHAT, true, true, true));
 
     // Exercise the same decision and payload seams used by process_token() and
     // send_partial_response(): the first token ends in incomplete UTF-8 and is
     // emitted ID-only; the next token carries the completed text and only its
     // own ID.
     const bool first_is_incomplete = true;
-    require(server_should_emit_native_token_only_partial(
+    require(server_should_emit_token_only_partial(
             TASK_RESPONSE_TYPE_NONE, true, true, first_is_incomplete));
     const json first = native_partial(7001, "\xC3", 1, true);
     const json second = native_partial(7002, "\xC3\xA9", 2);
@@ -82,7 +83,7 @@ int main() {
         require(observed[ordinal] == 1000 + ordinal);
     }
 
-    // OpenAI serialization remains content-only and never exposes native IDs.
+    // OpenAI serialization exposes IDs only for the explicit extension.
     server_task_result_cmpl_partial oai;
     oai.content          = "hello";
     oai.tokens           = { 42 };
@@ -94,6 +95,22 @@ int main() {
     const json oai_json = oai.to_json_oaicompat();
     require(!oai_json.contains("tokens"));
     require(oai_json.at("choices").at(0).at("text") == "hello");
+
+    oai.return_tokens = true;
+    const json oai_tokens_json = oai.to_json_oaicompat();
+    require(oai_tokens_json.at("tokens") == json::array({ 42 }));
+
+    server_task_result_cmpl_partial chat;
+    chat.tokens            = { 43 };
+    chat.n_decoded         = 1;
+    chat.n_prompt_tokens   = 736;
+    chat.return_tokens     = true;
+    chat.res_type          = TASK_RESPONSE_TYPE_OAI_CHAT;
+    chat.oaicompat_model   = "test";
+    chat.oaicompat_cmpl_id = "chatcmpl-test";
+    const json chat_json = chat.to_json_oaicompat_chat();
+    require(chat_json.is_array() && chat_json.size() == 1);
+    require(chat_json.at(0).at("tokens") == json::array({ 43 }));
 
     // The public Prometheus surface must preserve the recurrent depth values,
     // not merely expose correctly named zero-valued gauges.

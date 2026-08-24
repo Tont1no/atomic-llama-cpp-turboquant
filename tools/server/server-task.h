@@ -13,6 +13,21 @@
 
 using json = nlohmann::ordered_json;
 
+inline bool server_cache_key_is_valid(const std::string & cache_key) {
+    if (cache_key.size() != 67 || cache_key.compare(0, 3, "v1_") != 0) {
+        return false;
+    }
+
+    for (size_t i = 3; i < cache_key.size(); ++i) {
+        const char c = cache_key[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
@@ -52,16 +67,17 @@ enum task_response_type {
     TASK_RESPONSE_TYPE_ANTHROPIC,
 };
 
-// Native streaming clients that explicitly request token IDs must receive one
+// Streaming clients that explicitly request token IDs must receive one
 // ID for every generated token, even while its byte piece is being buffered
-// until a complete UTF-8 sequence can be emitted as content.  Keep this
-// native-only so OpenAI-compatible streaming chunk semantics remain unchanged.
-inline bool server_should_emit_native_token_only_partial(
+// until a complete UTF-8 sequence can be emitted as content.
+inline bool server_should_emit_token_only_partial(
         task_response_type res_type,
         bool stream,
         bool return_tokens,
         bool content_utf8_incomplete) {
-    return res_type == TASK_RESPONSE_TYPE_NONE && stream && return_tokens && content_utf8_incomplete;
+    const bool supports_tokens = res_type == TASK_RESPONSE_TYPE_NONE ||
+            res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL;
+    return supports_tokens && stream && return_tokens && content_utf8_incomplete;
 }
 
 enum stop_type {
@@ -77,6 +93,8 @@ struct task_params {
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
     bool return_progress = false;
+
+    std::string cache_key;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
 
@@ -111,6 +129,7 @@ struct task_params {
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
     std::string        control_cmpl_id;
+    std::string        control_cache_key;
 
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
@@ -190,6 +209,7 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::string cache_key;
     };
     slot_action slot_action;
 
@@ -439,6 +459,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     int32_t n_prompt_tokens_cache;
 
     bool post_sampling_probs;
+    bool return_tokens = false;
     bool is_progress = false;
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
@@ -570,10 +591,14 @@ struct server_task_result_slot_erase : server_task_result {
 
 struct server_task_result_control : server_task_result {
     bool        success = false;
+    bool        pending = false;
     std::string message; // optional detail when success is false
 
     virtual json to_json() override {
         json out = json { { "success", success } };
+        if (pending) {
+            out["pending"] = true;
+        }
         if (!message.empty()) {
             out["message"] = message;
         }
@@ -601,9 +626,12 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    std::string cache_key;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        cache_key.clear();
     }
 
     int n_tokens() const {
@@ -614,6 +642,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            cache_key,
         };
     }
 };
@@ -628,24 +657,51 @@ struct server_prompt_data {
 };
 
 struct server_prompt_cache_state {
+    std::string cache_key;
+    int64_t last_used_ms = 0;
+
     server_prompt prompt;
     server_prompt_data data;
 
-    size_t size() const {
-        size_t res = data.size();
+    size_t size() const;
+};
 
-        for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
-        }
+struct server_prompt_cache_counters {
+    uint64_t lookup_attempts = 0;
+    uint64_t lookup_hits = 0;
+    uint64_t stored_tokens = 0;
+    uint64_t stored_bytes = 0;
+    uint64_t reused_tokens = 0;
+    uint64_t reused_bytes = 0;
+    uint64_t stores = 0;
+    uint64_t evictions = 0;
+    uint64_t purges = 0;
+};
 
-        return res;
-    }
+struct server_prompt_cache_telemetry {
+    server_prompt_cache_counters total;
+    server_prompt_cache_counters delta;
+
+    size_t entries = 0;
+    size_t size_bytes = 0;
+    size_t tokens = 0;
+    size_t limit_size_bytes = 0;
+    size_t limit_tokens = 0;
+    int64_t ttl_ms = 0;
+    bool allow_new_retention = false;
+    bool runtime_limit_size_active = false;
+    bool runtime_limit_tokens_active = false;
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    static constexpr int64_t DEFAULT_TTL_MS = 120000;
+    static constexpr int64_t MAX_RUNTIME_TTL_MS = 24*60*60*1000;
+
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int64_t ttl_ms = DEFAULT_TTL_MS) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->ttl_ms       = ttl_ms > 0 && ttl_ms <= MAX_RUNTIME_TTL_MS ? ttl_ms : DEFAULT_TTL_MS;
+        this->allow_new_retention = ttl_ms > 0 && ttl_ms <= MAX_RUNTIME_TTL_MS;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -656,15 +712,49 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    int64_t ttl_ms = DEFAULT_TTL_MS;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, int64_t last_used_ms);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::string & cache_key, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    size_t purge_expired(int64_t now_ms);
+
+    size_t purge_scope(const std::string & cache_key);
+
+    // Runtime zero is a hard zero. Constructor zero keeps the legacy unlimited setting.
+    void set_runtime_limit_size(size_t limit_size_bytes);
+
+    void set_runtime_limit_tokens(size_t n_tokens);
+
+    bool set_runtime_ttl_ms(int64_t ttl_ms_new);
+
+    void set_allow_new_retention(bool allow);
+
+    // Maximum additional bytes that may be allocated before the next fresh
+    // host-memory sample. Zero blocks new entries without evicting old ones.
+    void set_runtime_admission_bytes(size_t bytes);
+
+    server_prompt_cache_telemetry snapshot_and_reset_delta();
 
     void update();
+
+private:
+    bool allow_new_retention = true;
+    bool runtime_limit_size_active = false;
+    bool runtime_limit_tokens_active = false;
+    bool runtime_admission_active = false;
+    size_t runtime_admission_bytes = 0;
+
+    server_prompt_cache_counters counters_total;
+    server_prompt_cache_counters counters_delta;
+
+    void record_counter(uint64_t server_prompt_cache_counters::* field, uint64_t value);
+    void evict_front();
 };
 
 // used exclusively by router mode

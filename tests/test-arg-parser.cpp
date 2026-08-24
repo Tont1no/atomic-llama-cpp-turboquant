@@ -314,6 +314,54 @@ static void test(void) {
     assert(!dynamic_rs_env_off.speculative.draft.dynamic_rs);
     clear_dynamic_rs_env();
 
+    common_params default_runtime_vram_params;
+    assert(default_runtime_vram_params.speculative.draft.runtime_vram_hard_free_mib == 4096);
+    assert(default_runtime_vram_params.speculative.draft.runtime_vram_soft_free_mib == 6144);
+    assert(default_runtime_vram_params.speculative.draft.runtime_vram_soft_max_depth == 1);
+
+    common_params runtime_vram_params;
+    argv = {
+        "binary_name",
+        "--spec-draft-runtime-vram-hard-free-mib", "5120",
+        "--spec-draft-runtime-vram-soft-free-mib", "7168",
+        "--spec-draft-runtime-vram-soft-max-depth", "3",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), runtime_vram_params, LLAMA_EXAMPLE_SERVER));
+    assert(runtime_vram_params.speculative.draft.runtime_vram_hard_free_mib == 5120);
+    assert(runtime_vram_params.speculative.draft.runtime_vram_soft_free_mib == 7168);
+    assert(runtime_vram_params.speculative.draft.runtime_vram_soft_max_depth == 3);
+
+    // Cross-field validation happens after parsing so valid overrides are
+    // independent of CLI ordering.
+    argv = {
+        "binary_name",
+        "--spec-draft-runtime-vram-hard-free-mib", "8192",
+        "--spec-draft-runtime-vram-soft-free-mib", "9216",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), runtime_vram_params, LLAMA_EXAMPLE_SERVER));
+    argv = {
+        "binary_name",
+        "--spec-draft-runtime-vram-soft-free-mib", "9216",
+        "--spec-draft-runtime-vram-hard-free-mib", "8192",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), runtime_vram_params, LLAMA_EXAMPLE_SERVER));
+
+    for (const auto & invalid_argv : std::vector<std::vector<std::string>>{
+            { "binary_name", "--spec-draft-runtime-vram-hard-free-mib", "6145" },
+            { "binary_name", "--spec-draft-runtime-vram-hard-free-mib", "255" },
+            { "binary_name", "--spec-draft-runtime-vram-soft-free-mib", "1048577" },
+            { "binary_name", "--spec-draft-runtime-vram-soft-max-depth", "-1" },
+            { "binary_name", "--spec-draft-runtime-vram-soft-max-depth", "1025" },
+            { "binary_name", "--spec-draft-runtime-vram-hard-free-mib", "512junk" },
+            { "binary_name", "--spec-draft-runtime-vram-hard-free-mib", "999999999999999999999" },
+        }) {
+        common_params invalid_runtime_vram_params;
+        auto invalid_copy = invalid_argv;
+        assert(false == common_params_parse(
+                invalid_copy.size(), list_str_to_char(invalid_copy).data(),
+                invalid_runtime_vram_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     common_params sps_record_params;
     argv = {
         "binary_name", "--spec-type", "draft-dspark",
