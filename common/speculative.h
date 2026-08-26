@@ -150,6 +150,10 @@ enum common_speculative_route {
 void common_speculative_set_route(
         common_speculative * spec, llama_seq_id seq_id, enum common_speculative_route route);
 
+// LOOKUP_THEN_MODEL permits both source classes, so an empty lookup continues to the trained drafter.
+bool common_speculative_route_allows_source(
+        enum common_speculative_route route, enum common_speculative_type type);
+
 // Return the implementation that actually produced the most recent draft for
 // this sequence, or NONE when the route was target-only or no implementation won.
 enum common_speculative_type common_speculative_get_last_type(

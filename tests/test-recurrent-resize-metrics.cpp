@@ -65,5 +65,17 @@ int main() {
     // qualification runner must see 99 and fail their <= configured gate.
     require(snapshot(true, 7, 7, 99).required_depth == 99);
 
+    // Lazy rollback stores one permanent base row per slot plus bounded
+    // sidecars. A pending rejection keeps its sidecar until consumed.
+    require(llama_recurrent_rs_rows(8, 5, 1, true) == 13);
+    require(llama_recurrent_rs_rows(8, 5, 8, false) == 48);
+    require(!llama_recurrent_owner_should_release(1, 0));
+    require(!llama_recurrent_owner_should_release(0, 2));
+    require(llama_recurrent_owner_should_release(0, 0));
+    require(llama_recurrent_lazy_row_is_valid(1, 3, false));
+    require(llama_recurrent_lazy_row_is_valid(2, 0, false));
+    require(!llama_recurrent_lazy_row_is_valid(2, 1, false));
+    require(!llama_recurrent_lazy_row_is_valid(2, 0, true));
+
     return 0;
 }

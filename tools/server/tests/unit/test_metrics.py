@@ -62,6 +62,12 @@ def test_metrics_prometheus_format():
         "llamacpp:spec_decode_num_draft_tokens_total",
         "llamacpp:spec_decode_num_accepted_tokens_total",
         "llamacpp:spec_decode_num_drafts_total",
+        "llamacpp:spec_decode_suffix_draft_tokens_total",
+        "llamacpp:spec_decode_suffix_accepted_tokens_total",
+        "llamacpp:spec_decode_suffix_drafts_total",
+        "llamacpp:spec_decode_dflash_draft_tokens_total",
+        "llamacpp:spec_decode_dflash_accepted_tokens_total",
+        "llamacpp:spec_decode_dflash_drafts_total",
         "llamacpp:recurrent_snapshot_resizes_total",
         "llamacpp:recurrent_snapshot_resize_seconds_total",
     ]

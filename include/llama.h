@@ -357,6 +357,7 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_rs_seq_max;          // max sequences with rollback snapshots (0 = n_seq_max legacy layout) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -576,6 +577,8 @@ extern "C" {
         uint32_t pending_depth;  // UINT32_MAX when no shrink is pending
         uint32_t stable_ticks;
         uint32_t required_depth;
+        uint32_t owner_count;
+        uint32_t owner_capacity;
     };
 
     // Telemetry and an advisory logical-scheduling epoch for dynamic recurrent

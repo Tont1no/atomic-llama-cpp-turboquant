@@ -212,10 +212,19 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
             ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
                                                    conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - slot) * conv_x->nb[0]);
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv,
-                                                   ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
-                                                                conv_states_all->nb[1],
-                                                                ((size_t) slot * mem_size + kv_head) * row_size)));
+            if (!mctx_cur->has_lazy_rs()) {
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv,
+                                                       ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
+                                                                    conv_states_all->nb[1],
+                                                                    ((size_t) slot * mem_size + kv_head) * row_size)));
+            } else {
+                for (int64_t seq = 0; seq < n_seqs; ++seq) {
+                    ggml_tensor * src = ggml_view_1d(ctx0, last_conv, row_count, seq*last_conv->nb[2]);
+                    ggml_tensor * dst = ggml_view_1d(ctx0, conv_states_all, row_count,
+                            (size_t) mctx_cur->get_rs_row((uint32_t) seq, (uint32_t) slot)*row_size);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+                }
+            }
         }
 
         // 1D convolution
@@ -269,12 +278,23 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
         const size_t  y_row_size   = ggml_row_size(y_ssm->type, D);
         const size_t  state_offset = ggml_nelements(x) * ggml_element_size(x);
 
-        ggml_build_forward_expand(
-            gf, ggml_cpy(ctx0,
-                         ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
-                                      y_row_size, y_row_size * n_seqs, state_offset),
-                         ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
-                                      ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+        ggml_tensor * states = ggml_view_3d(ctx0, y_ssm, D, n_seqs, n_written,
+                y_row_size, y_row_size*n_seqs, state_offset);
+        if (!mctx_cur->has_lazy_rs()) {
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx0, states,
+                             ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, n_written,
+                                          ssm_states_all->nb[1], (size_t) mem_size * row_size, kv_head * row_size)));
+        } else {
+            for (int64_t slot = 0; slot < n_written; ++slot) {
+                for (int64_t seq = 0; seq < n_seqs; ++seq) {
+                    ggml_tensor * src = ggml_view_1d(ctx0, states, D, slot*states->nb[2] + seq*states->nb[1]);
+                    ggml_tensor * dst = ggml_view_1d(ctx0, ssm_states_all, D,
+                            (size_t) mctx_cur->get_rs_row((uint32_t) seq, (uint32_t) slot)*row_size);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+                }
+            }
+        }
 
         ggml_tensor * y = ggml_view_4d(ctx0, y_ssm, head_dim, n_head, n_seq_tokens, n_seqs, x->nb[1], n_head * x->nb[1],
                                        n_seq_tokens * n_head * x->nb[1], 0);

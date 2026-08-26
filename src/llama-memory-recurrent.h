@@ -32,6 +32,25 @@ inline llama_memory_recurrent_resize_stats llama_recurrent_resize_metrics_snapsh
     return result;
 }
 
+inline bool llama_recurrent_owner_should_release(uint32_t required_depth, uint32_t pending_rollback) {
+    return required_depth == 0 && pending_rollback == 0;
+}
+
+inline bool llama_recurrent_lazy_row_is_valid(
+        int32_t n_seq_ids,
+        uint32_t required_depth,
+        bool has_pending_rollback) {
+    return n_seq_ids == 1 || (required_depth == 0 && !has_pending_rollback);
+}
+
+inline uint32_t llama_recurrent_rs_rows(
+        uint32_t base_rows,
+        uint32_t depth,
+        uint32_t owner_capacity,
+        bool lazy) {
+    return lazy ? base_rows + owner_capacity*depth : base_rows*(1 + depth);
+}
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
@@ -44,6 +63,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_rs_seq_max,
                          bool   rs_seq_dynamic,
         const layer_filter_cb & filter);
 
@@ -105,6 +125,8 @@ public:
     // n_rs_seq for the dynamic Qwen/DFlash path; plane zero is always present.
     uint32_t n_rs_seq_alloc = 0;
 
+    uint32_t n_rs_seq_max = 0;
+
     // When enabled, each decode executes only the snapshot depth required by
     // the rows present for a sequence in that batch. Supported compact Qwen
     // contexts also resize the resident rollback planes between decode ticks;
@@ -125,6 +147,9 @@ public:
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
     void commit_rs_depth(const llama_ubatch & ubatch, uint32_t active_depth);
     void invalidate_rs_depth(const llama_ubatch & ubatch);
+
+    uint32_t rs_row(llama_seq_id seq_id, uint32_t plane, uint32_t base_row) const;
+    bool has_lazy_rs() const;
 
     // computed before each graph build
     uint32_t n = 0;
@@ -170,6 +195,10 @@ private:
     // configured rollback plane penalizes cap-zero multi-slot throughput.
     // This bounded path changes only the resident plane count between ticks.
     const bool rs_seq_compact = false;
+    const bool rs_seq_lazy = false;
+
+    std::vector<int32_t> rs_owner_by_seq;
+    std::vector<llama_seq_id> rs_owner_seq;
 
     ggml_type type_r;
     ggml_type type_s;
@@ -196,6 +225,9 @@ private:
 
     bool resize_rs_storage(uint32_t depth);
     bool materialize_pending_rollbacks(uint32_t retained_depth);
+    bool prepare_rs_owners(const llama_batch & batch, bool embd_all);
+    bool acquire_rs_owner(llama_seq_id seq_id);
+    void release_rs_owner(llama_seq_id seq_id);
 
     size_t total_size() const;
 
@@ -246,6 +278,8 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    uint32_t get_rs_row(uint32_t seq_index, uint32_t plane) const;
+    bool has_lazy_rs() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;

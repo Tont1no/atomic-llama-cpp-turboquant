@@ -20,10 +20,12 @@ static llama_context * make_ctx(
         const common_params & params,
         llama_model * model,
         uint32_t n_seq_max = 1,
-        bool rs_seq_dynamic = false) {
+        bool rs_seq_dynamic = false,
+        uint32_t n_rs_seq_max = 0) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_seq_max = n_seq_max;
     cparams.n_rs_seq  = 8;
+    cparams.n_rs_seq_max = n_rs_seq_max;
     cparams.rs_seq_dynamic = rs_seq_dynamic;
     cparams.n_batch   = std::max(cparams.n_batch,  (uint32_t) (cparams.n_rs_seq + 1));
     cparams.n_ubatch  = std::max(cparams.n_ubatch, (uint32_t) (cparams.n_rs_seq + 1));
@@ -135,6 +137,76 @@ static bool staged_growth_failure_fails_closed(
     }
     if (memory->seq_rm(0, 1, -1)) {
         fprintf(stderr, "%s : rollback accepted a snapshot from an aborted graph\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    memory->clear(false);
+    llama_free(ctx);
+    return true;
+}
+
+static bool lazy_owner_preserves_pending_rollback(
+        const common_params & params,
+        llama_model * model) {
+    llama_context * ctx = make_ctx(params, model, 8, false, 1);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    llama_memory_recurrent * memory = get_recurrent_memory(ctx);
+    if (memory == nullptr || !memory->has_lazy_rs()) {
+        fprintf(stderr, "%s : missing lazy recurrent memory\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    const auto prepare = [&](llama_seq_id seq_id, uint32_t depth) {
+        llama_batch batch = llama_batch_init(1, 0, 8);
+        auto depths = tag_recurrent_depth(batch, 1, depth);
+        common_batch_add(batch, 1, 0, { seq_id }, true);
+        const bool ok = memory->prepare_batch(ctx, batch, false);
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    if (!prepare(0, 3)) {
+        fprintf(stderr, "%s : failed to acquire first owner\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    auto stats = memory->recurrent_resize_stats();
+    if (stats.owner_capacity != 1 || stats.owner_count != 1) {
+        fprintf(stderr, "%s : first owner metrics mismatch (%u/%u)\n",
+                __func__, stats.owner_count, stats.owner_capacity);
+        llama_free(ctx);
+        return false;
+    }
+
+    memory->set_rs_idx(0, 2);
+    if (!prepare(0, 0) || memory->rs_idx[0] != 2) {
+        fprintf(stderr, "%s : target-only planning released a pending rollback\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    if (prepare(1, 1)) {
+        fprintf(stderr, "%s : second sequence stole a pending rollback owner\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+
+    // s_copy() clears rs_idx during the target graph. The following logical
+    // batch may then recycle the sidecar for another speculative sequence.
+    memory->set_rs_idx(0, 0);
+    if (!prepare(1, 1)) {
+        fprintf(stderr, "%s : failed to recycle a consumed rollback owner\n", __func__);
+        llama_free(ctx);
+        return false;
+    }
+    stats = memory->recurrent_resize_stats();
+    if (stats.owner_capacity != 1 || stats.owner_count != 1) {
+        fprintf(stderr, "%s : recycled owner metrics mismatch (%u/%u)\n",
+                __func__, stats.owner_count, stats.owner_capacity);
         llama_free(ctx);
         return false;
     }
@@ -601,6 +673,39 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     return ok;
 }
 
+static bool decode_lazy_rollback_once(
+        const common_params & params,
+        llama_model * model,
+        int n_vocab) {
+    llama_context * lazy = make_ctx(params, model, 1, false, 1);
+    llama_context * ref  = make_ctx(params, model);
+    if (lazy == nullptr || ref == nullptr) {
+        return false;
+    }
+
+    const uint32_t count = llama_n_rs_seq(lazy) + 1;
+    constexpr uint32_t rollback = 3;
+    std::vector<llama_token> tokens(count);
+    for (uint32_t pos = 0; pos < count; ++pos) {
+        tokens[pos] = (llama_token) ((31 + pos) % n_vocab);
+    }
+    const llama_pos rollback_pos = (llama_pos) count - rollback;
+    bool ok = decode_tokens(lazy, tokens, count) &&
+        decode_tokens(ref, tokens, count) &&
+        llama_memory_seq_rm(llama_get_memory(lazy), 0, rollback_pos, -1) &&
+        llama_memory_seq_rm(llama_get_memory(ref), 0, rollback_pos, -1);
+    for (uint32_t i = 0; ok && i < rollback; ++i) {
+        const llama_pos pos = rollback_pos + i;
+        ok = decode_one(lazy, tokens[pos], pos) &&
+            decode_one(ref, tokens[pos], pos) &&
+            compare_last_logits("lazy rollback", lazy, 0, ref, n_vocab);
+    }
+
+    llama_free(lazy);
+    llama_free(ref);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -635,6 +740,9 @@ int main(int argc, char ** argv) {
     if (!staged_growth_failure_fails_closed(params, model)) {
         return 1;
     }
+    if (!lazy_owner_preserves_pending_rollback(params, model)) {
+        return 1;
+    }
 #endif
 
     if (!decode_ragged_and_compare(params, model, n_vocab)) {
@@ -644,6 +752,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!decode_shared_rollback_shrink(params, model, n_vocab)) {
+        return 1;
+    }
+    if (!decode_lazy_rollback_once(params, model, n_vocab)) {
         return 1;
     }
 

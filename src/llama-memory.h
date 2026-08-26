@@ -35,6 +35,8 @@ struct llama_memory_recurrent_resize_stats {
     uint32_t pending_depth    = UINT32_MAX;
     uint32_t stable_ticks     = 0;
     uint32_t required_depth   = 0;
+    uint32_t owner_count      = 0;
+    uint32_t owner_capacity   = 0;
 };
 
 enum llama_memory_status {

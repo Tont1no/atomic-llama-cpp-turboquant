@@ -1571,6 +1571,30 @@ std::string server_task_result_metrics::to_metrics() {
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
         }, {
+            "spec_decode_suffix_draft_tokens_total",
+            "Speculative suffix: Draft tokens offered to target verification",
+            (double) metrics.n_suffix_draft_tokens
+        }, {
+            "spec_decode_suffix_accepted_tokens_total",
+            "Speculative suffix: Draft tokens accepted by the target model",
+            (double) metrics.n_suffix_accepted
+        }, {
+            "spec_decode_suffix_drafts_total",
+            "Speculative suffix: Target verification steps",
+            (double) metrics.n_suffix_verif_steps
+        }, {
+            "spec_decode_dflash_draft_tokens_total",
+            "Speculative DFlash: Draft tokens offered to target verification",
+            (double) metrics.n_dflash_draft_tokens
+        }, {
+            "spec_decode_dflash_accepted_tokens_total",
+            "Speculative DFlash: Draft tokens accepted by the target model",
+            (double) metrics.n_dflash_accepted
+        }, {
+            "spec_decode_dflash_drafts_total",
+            "Speculative DFlash: Target verification steps",
+            (double) metrics.n_dflash_verif_steps
+        }, {
             "recurrent_snapshot_resizes_total",
             "Dynamic recurrent snapshot storage reallocations",
             (double) metrics.n_recurrent_resizes

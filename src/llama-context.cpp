@@ -122,14 +122,20 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    cparams.n_rs_seq_max = params.n_rs_seq_max;
     cparams.rs_seq_dynamic = params.rs_seq_dynamic;
+    if (cparams.n_rs_seq_max > cparams.n_seq_max) {
+        throw std::runtime_error("n_rs_seq_max must be <= n_seq_max");
+    }
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
+        cparams.n_rs_seq_max = 0;
         cparams.rs_seq_dynamic = false;
     }
     if (cparams.n_rs_seq == 0) {
+        cparams.n_rs_seq_max = 0;
         cparams.rs_seq_dynamic = false;
     }
 
@@ -340,6 +346,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: n_rs_seq_max          = %u\n",   __func__, cparams.n_rs_seq_max);
     LLAMA_LOG_INFO("%s: rs_seq_dynamic        = %s\n",   __func__, cparams.rs_seq_dynamic ? "true" : "false");
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
@@ -515,7 +522,10 @@ llama_context::~llama_context() {
     device_layer_stage.buf.reset();
     device_layer_stage.ctx.reset();
 
-    if (!model.hparams.no_alloc) {
+    // A recurrent resize invalidates the scheduler before the next graph is
+    // built. Destruction can legally happen in that gap after a failed or
+    // cancelled decode.
+    if (!model.hparams.no_alloc && sched) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -4437,6 +4447,8 @@ llama_recurrent_resize_stats llama_context::recurrent_resize_stats() const {
     result.pending_depth    = stats.pending_depth;
     result.stable_ticks     = stats.stable_ticks;
     result.required_depth   = stats.required_depth;
+    result.owner_count      = stats.owner_count;
+    result.owner_capacity   = stats.owner_capacity;
     return result;
 }
 
@@ -4712,6 +4724,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_rs_seq_max                =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

@@ -92,13 +92,16 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_seq_max,
                      bool   rs_seq_dynamic,
     const layer_filter_cb & filter) :
+    n_rs_seq_max(n_rs_seq_max == 0 ? n_seq_max : n_rs_seq_max),
     rs_seq_dynamic(rs_seq_dynamic && n_rs_seq > 0),
     hparams(model.hparams),
     n_seq_max(n_seq_max),
     rs_seq_compact(rs_seq_dynamic && n_rs_seq > 0 &&
             (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE)),
+    rs_seq_lazy(n_rs_seq_max > 0 && n_rs_seq > 0),
     type_r(type_r),
     type_s(type_s) {
     const int32_t n_layer = hparams.n_layer();
@@ -111,6 +114,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq_alloc = rs_seq_compact ? 0 : n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
     rs_valid_depth.assign(n_seq_max, 0);
+    rs_owner_by_seq.assign(n_seq_max, -1);
+    rs_owner_seq.assign(this->n_rs_seq_max, -1);
 
     cells.clear();
     cells.resize(mem_size);
@@ -191,7 +196,7 @@ bool llama_memory_recurrent::resize_rs_storage(uint32_t depth) {
 
     std::vector<ggml_tensor *> r_new(n_layer, nullptr);
     std::vector<ggml_tensor *> s_new(n_layer, nullptr);
-    const uint32_t n_rows = size * (1 + depth);
+    const uint32_t n_rows = llama_recurrent_rs_rows(size, depth, n_rs_seq_max, rs_seq_lazy);
     for (int32_t il = 0; il < n_layer; ++il) {
         if (buft_l[il] == nullptr) {
             continue;
@@ -217,7 +222,8 @@ bool llama_memory_recurrent::resize_rs_storage(uint32_t depth) {
     }
 
     if (!ctxs_bufs.empty()) {
-        const uint32_t copy_rows = size * (1 + std::min(depth, n_rs_seq_alloc));
+        const uint32_t retained_depth = std::min(depth, n_rs_seq_alloc);
+        const uint32_t copy_rows = llama_recurrent_rs_rows(size, retained_depth, n_rs_seq_max, rs_seq_lazy);
         ggml_init_params copy_params = {
             /*.mem_size   =*/ size_t(4u*n_layer*ggml_tensor_overhead()),
             /*.mem_buffer =*/ nullptr,
@@ -270,6 +276,139 @@ bool llama_memory_recurrent::resize_rs_storage(uint32_t depth) {
     return true;
 }
 
+bool llama_memory_recurrent::acquire_rs_owner(llama_seq_id seq_id) {
+    if (!rs_seq_lazy) {
+        return true;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= rs_owner_by_seq.size()) {
+        return false;
+    }
+    if (rs_owner_by_seq[seq_id] >= 0) {
+        return true;
+    }
+    for (size_t owner = 0; owner < rs_owner_seq.size(); ++owner) {
+        if (rs_owner_seq[owner] < 0) {
+            rs_owner_seq[owner] = seq_id;
+            rs_owner_by_seq[seq_id] = (int32_t) owner;
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_memory_recurrent::release_rs_owner(llama_seq_id seq_id) {
+    if (!rs_seq_lazy || seq_id < 0 || (size_t) seq_id >= rs_owner_by_seq.size()) {
+        return;
+    }
+    const int32_t owner = rs_owner_by_seq[seq_id];
+    if (owner >= 0 && (size_t) owner < rs_owner_seq.size() && rs_owner_seq[owner] == seq_id) {
+        rs_owner_seq[owner] = -1;
+    }
+    rs_owner_by_seq[seq_id] = -1;
+    rs_idx[seq_id] = 0;
+    rs_valid_depth[seq_id] = 0;
+}
+
+bool llama_memory_recurrent::prepare_rs_owners(const llama_batch & batch, bool embd_all) {
+    GGML_UNUSED(embd_all);
+    if (!rs_seq_lazy) {
+        return true;
+    }
+    if (batch.n_tokens <= 0 || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        LLAMA_LOG_ERROR("%s: lazy recurrent rollback requires per-row sequence metadata\n", __func__);
+        return false;
+    }
+
+    std::vector<uint32_t> required(n_seq_max, 0);
+    std::vector<bool> participating(n_seq_max, false);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const int32_t n_ids = batch.n_seq_id[i];
+        // Standard target-only and warm-up batches do not carry rs_depth.
+        // Explicit speculative batches attach it before llama_decode().
+        const uint32_t row_depth = batch.rs_depth == nullptr ? 0 : batch.rs_depth[i];
+        if (n_ids <= 0 || n_ids > (int32_t) n_seq_max || batch.seq_id[i] == nullptr ||
+                row_depth > n_rs_seq) {
+            LLAMA_LOG_ERROR("%s: invalid lazy recurrent rollback batch metadata\n", __func__);
+            return false;
+        }
+        bool has_pending_rollback = false;
+        for (int32_t j = 0; j < n_ids; ++j) {
+            const llama_seq_id seq_id = batch.seq_id[i][j];
+            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max && rs_idx[seq_id] != 0) {
+                has_pending_rollback = true;
+            }
+        }
+        if (!llama_recurrent_lazy_row_is_valid(
+                n_ids, row_depth, has_pending_rollback)) {
+            LLAMA_LOG_ERROR("%s: lazy rollback rows with snapshots or pending rollback require exactly one sequence id\n",
+                    __func__);
+            return false;
+        }
+        for (int32_t j = 0; j < n_ids; ++j) {
+            const llama_seq_id seq_id = batch.seq_id[i][j];
+            if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+                LLAMA_LOG_ERROR("%s: sequence %d is outside lazy rollback owner range\n", __func__, seq_id);
+                return false;
+            }
+            participating[seq_id] = true;
+            required[seq_id] = std::max(required[seq_id], row_depth);
+        }
+    }
+
+    uint32_t owners_after_release = 0;
+    uint32_t owners_needed = 0;
+    for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
+        // A zero-depth or absent sequence no longer needs its old snapshots,
+        // unless a rejection still points at one of them. s_copy() consumes
+        // rs_idx while building the target graph, so the owner is released on
+        // the next logical batch, after that graph has completed.
+        const bool release = llama_recurrent_owner_should_release(required[seq], rs_idx[seq]);
+        if (rs_owner_by_seq[seq] >= 0 && !release) {
+            owners_after_release++;
+        }
+        if (required[seq] > 0 && rs_owner_by_seq[seq] < 0) {
+            owners_needed++;
+        }
+    }
+    if (owners_after_release + owners_needed > n_rs_seq_max) {
+        LLAMA_LOG_ERROR("%s: recurrent rollback owner capacity exceeded (%u requested, %u available)\n",
+                __func__, owners_after_release + owners_needed, n_rs_seq_max);
+        return false;
+    }
+
+    for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
+        if (llama_recurrent_owner_should_release(required[seq], rs_idx[seq])) {
+            release_rs_owner((llama_seq_id) seq);
+        }
+    }
+    for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
+        if (required[seq] > 0 && !acquire_rs_owner((llama_seq_id) seq)) {
+            LLAMA_LOG_ERROR("%s: failed to assign recurrent rollback owner to sequence %u\n", __func__, seq);
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t llama_memory_recurrent::rs_row(llama_seq_id seq_id, uint32_t plane, uint32_t base_row) const {
+    GGML_ASSERT(base_row < size);
+    GGML_ASSERT(plane <= n_rs_seq_alloc);
+    if (plane == 0) {
+        return base_row;
+    }
+    if (!rs_seq_lazy) {
+        return plane*size + base_row;
+    }
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rs_owner_by_seq.size());
+    const int32_t owner = rs_owner_by_seq[seq_id];
+    GGML_ASSERT(owner >= 0 && (uint32_t) owner < n_rs_seq_max);
+    return size + (plane - 1)*n_rs_seq_max + (uint32_t) owner;
+}
+
+bool llama_memory_recurrent::has_lazy_rs() const {
+    return rs_seq_lazy;
+}
+
 bool llama_memory_recurrent::materialize_pending_rollbacks(uint32_t retained_depth) {
     ggml_init_params params = {
         /*.mem_size   =*/ size_t(4u*hparams.n_layer()*ggml_tensor_overhead()),
@@ -286,7 +425,8 @@ bool llama_memory_recurrent::materialize_pending_rollbacks(uint32_t retained_dep
         if (rollback == 0 || rollback <= retained_depth) {
             continue;
         }
-        if (rollback > n_rs_seq_alloc || seq >= cells.size()) {
+        if (rollback > n_rs_seq_alloc || seq >= cells.size() ||
+                (rs_seq_lazy && rs_owner_by_seq[seq] < 0)) {
             LLAMA_LOG_ERROR("%s: rollback plane %u is not resident for seq %zu (resident %u)\n",
                     __func__, rollback, seq, n_rs_seq_alloc);
             return false;
@@ -300,7 +440,7 @@ bool llama_memory_recurrent::materialize_pending_rollbacks(uint32_t retained_dep
 
         auto copy_row = [&](ggml_tensor * tensor) {
             ggml_tensor * src = ggml_view_2d(ctx.get(), tensor, tensor->ne[0], 1, tensor->nb[1],
-                    ((size_t) rollback*size + tail)*tensor->nb[1]);
+                    (size_t) rs_row((llama_seq_id) seq, rollback, (uint32_t) tail)*tensor->nb[1]);
             ggml_tensor * dst = ggml_view_2d(ctx.get(), tensor, tensor->ne[0], 1, tensor->nb[1],
                     (size_t) tail*tensor->nb[1]);
             if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS ||
@@ -334,6 +474,9 @@ bool llama_memory_recurrent::prepare_batch(
         llama_context * lctx,
         const llama_batch & batch,
         bool embd_all) {
+    if (!prepare_rs_owners(batch, embd_all)) {
+        return false;
+    }
     if (!rs_seq_compact) {
         return true;
     }
@@ -470,8 +613,16 @@ bool llama_memory_recurrent::prepare_batch(
 
 uint32_t llama_memory_recurrent::active_rs_depth(const llama_batch & batch, bool embd_all, bool * used_fallback) {
     bool fallback = false;
-    const uint32_t active = !rs_seq_dynamic || embd_all ? n_rs_seq :
-            llama_recurrent_batch_active_rs_depth(batch, n_rs_seq, n_seq_max, &fallback);
+    uint32_t active = n_rs_seq;
+    if (rs_seq_lazy) {
+        // Missing depth metadata is the normal target-only/warm-up contract.
+        // Storage stays resident, but the graph must not write sidecars that
+        // have no owner. Explicit speculative batches provide rs_depth.
+        active = batch.rs_depth == nullptr ? 0 :
+                llama_recurrent_batch_active_rs_depth(batch, n_rs_seq, n_seq_max, &fallback);
+    } else if (rs_seq_dynamic && !embd_all) {
+        active = llama_recurrent_batch_active_rs_depth(batch, n_rs_seq, n_seq_max, &fallback);
+    }
 
     if (used_fallback) {
         *used_fallback = fallback;
@@ -507,6 +658,8 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+    std::fill(rs_owner_by_seq.begin(), rs_owner_by_seq.end(), -1);
+    std::fill(rs_owner_seq.begin(), rs_owner_seq.end(), -1);
     rs_shrink_pending_depth = UINT32_MAX;
     rs_shrink_pending_load  = UINT32_MAX;
     rs_shrink_stable_ticks  = 0;
@@ -532,9 +685,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             if ((size_t) seq_id < rs_valid_depth.size()) {
                 rs_valid_depth[seq_id] = 0;
             }
+            release_rs_owner(seq_id);
         } else {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
             std::fill(rs_valid_depth.begin(), rs_valid_depth.end(), 0);
+            std::fill(rs_owner_by_seq.begin(), rs_owner_by_seq.end(), -1);
+            std::fill(rs_owner_seq.begin(), rs_owner_seq.end(), -1);
         }
     }
 
@@ -557,7 +713,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                             rs_valid_depth[seq_id] : 0;
                     if (!llama_recurrent_rollback_is_valid(
                             rs_seq_dynamic, (uint32_t) rollback, n_rs_seq,
-                            n_rs_seq_alloc, valid_depth)) {
+                            n_rs_seq_alloc, valid_depth) ||
+                            (rs_seq_lazy && rs_owner_by_seq[seq_id] < 0)) {
                         return false;
                     }
                     set_rs_idx(seq_id, (uint32_t) rollback);
@@ -630,11 +787,15 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 
     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
+        if (rs_seq_lazy && rs_idx[seq_id_src] != 0) {
+            GGML_ABORT("cannot copy recurrent sequence with a pending lazy rollback");
+        }
+        release_rs_owner(seq_id_dst);
         if ((size_t) seq_id_dst < rs_valid_depth.size() && (size_t) seq_id_src < rs_valid_depth.size()) {
-            rs_valid_depth[seq_id_dst] = rs_valid_depth[seq_id_src];
+            rs_valid_depth[seq_id_dst] = rs_seq_lazy ? 0 : rs_valid_depth[seq_id_src];
         }
         if ((size_t) seq_id_dst < rs_idx.size() && (size_t) seq_id_src < rs_idx.size()) {
-            rs_idx[seq_id_dst] = rs_idx[seq_id_src];
+            rs_idx[seq_id_dst] = rs_seq_lazy ? 0 : rs_idx[seq_id_src];
         }
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
@@ -689,6 +850,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
         if ((llama_seq_id) i != seq_id) {
             rs_valid_depth[i] = 0;
             rs_idx[i] = 0;
+            release_rs_owner((llama_seq_id) i);
         }
     }
 
@@ -861,7 +1023,7 @@ llama_memory_recurrent_resize_stats llama_memory_recurrent::recurrent_resize_sta
     // Previously the non-compact early return made server gauges report zero
     // even when n_rs_seq planes were allocated. Dynamic contexts additionally
     // expose their last requested execution depth and resize lifecycle.
-    return llama_recurrent_resize_metrics_snapshot(
+    auto result = llama_recurrent_resize_metrics_snapshot(
             rs_seq_dynamic,
             n_rs_seq,
             n_rs_seq_alloc,
@@ -870,6 +1032,10 @@ llama_memory_recurrent_resize_stats llama_memory_recurrent::recurrent_resize_sta
             rs_shrink_stable_ticks,
             rs_resize_count,
             rs_resize_time_us);
+    result.owner_capacity = rs_seq_lazy ? n_rs_seq_max : n_seq_max;
+    result.owner_count = rs_seq_lazy ? (uint32_t) std::count_if(
+            rs_owner_seq.begin(), rs_owner_seq.end(), [](llama_seq_id seq_id) { return seq_id >= 0; }) : n_seq_max;
+    return result;
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -1235,7 +1401,12 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            llama_seq_id row_seq_id = seq_id;
+            if (row_seq_id < 0 && !cell.seq_id.empty()) {
+                row_seq_id = *cell.seq_id.begin();
+            }
+            const uint32_t cell_id = rs_row(
+                    row_seq_id, rs_idx_cur, cell.src >= 0 ? (uint32_t) cell.src : i);
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
@@ -1746,6 +1917,30 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+uint32_t llama_memory_recurrent_context::get_rs_row(uint32_t seq_index, uint32_t plane) const {
+    if (is_full) {
+        GGML_ASSERT(seq_index < mem->size && plane <= mem->n_rs_seq_alloc);
+        if (plane == 0 || !mem->has_lazy_rs()) {
+            return plane*mem->size + seq_index;
+        }
+        // Full-memory contexts are used only to reserve graph capacity. They
+        // have no logical batch and therefore no runtime owners. Reusing the
+        // bounded sidecar rows is safe because this graph is never executed.
+        GGML_ASSERT(mem->n_rs_seq_max > 0);
+        return mem->size + (plane - 1)*mem->n_rs_seq_max + seq_index%mem->n_rs_seq_max;
+    }
+    GGML_ASSERT(i_next < ubatches.size());
+    const llama_ubatch & ubatch = ubatches[i_next];
+    GGML_ASSERT(seq_index < ubatch.n_seqs && ubatch.n_seq_tokens > 0);
+    const uint32_t token_index = seq_index*ubatch.n_seq_tokens;
+    GGML_ASSERT(ubatch.n_seq_id[token_index] > 0 && ubatch.seq_id[token_index] != nullptr);
+    return mem->rs_row(ubatch.seq_id[token_index][0], plane, mem->head + seq_index);
+}
+
+bool llama_memory_recurrent_context::has_lazy_rs() const {
+    return mem->has_lazy_rs();
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }
@@ -1774,5 +1969,6 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     if (idx > mem->n_rs_seq_alloc) {
         return src0;
     }
-    return (int32_t)(idx * mem->size) + src0;
+    const llama_seq_id seq = mem->cells[cell_idx].seq_id.empty() ? -1 : *mem->cells[cell_idx].seq_id.begin();
+    return (int32_t) mem->rs_row(seq, idx, (uint32_t) src0);
 }

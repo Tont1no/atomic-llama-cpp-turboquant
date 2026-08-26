@@ -277,7 +277,15 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
-| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache,suffix-session` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
+| `--spec-suffix-match-min N` | minimum session suffix match length (default: 4) |
+| `--spec-suffix-match-max N` | maximum session suffix match length (default: 64) |
+| `--spec-suffix-draft-min N` | minimum session suffix draft length (default: 2) |
+| `--spec-suffix-draft-max N` | maximum session suffix draft length (default: 64) |
+| `--spec-suffix-max-candidates N` | maximum session suffix candidates to score (default: 64) |
+| `--spec-suffix-history-max N` | maximum retained prior-session suffix tokens; active prompt is separate (default: 2097152) |
+| `--spec-suffix-min-confidence P` | minimum session suffix confidence (default: 0.75) |
+| `--spec-suffix-acceptance-alpha P` | session suffix acceptance EMA weight (default: 0.25) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
@@ -1100,6 +1108,12 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_draft_tokens_total` | Counter | Total draft tokens generated (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
+| `llamacpp:spec_decode_suffix_draft_tokens_total` | Counter | Session suffix tokens offered to target verification. |
+| `llamacpp:spec_decode_suffix_accepted_tokens_total` | Counter | Session suffix tokens accepted by the target. |
+| `llamacpp:spec_decode_suffix_drafts_total` | Counter | Session suffix verification steps. |
+| `llamacpp:spec_decode_dflash_draft_tokens_total` | Counter | DFlash tokens offered to target verification. |
+| `llamacpp:spec_decode_dflash_accepted_tokens_total` | Counter | DFlash tokens accepted by the target. |
+| `llamacpp:spec_decode_dflash_drafts_total` | Counter | DFlash verification steps. |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
 | `llamacpp:recurrent_snapshot_resizes_total` | Counter | Dynamic recurrent snapshot storage reallocations. |
 | `llamacpp:recurrent_snapshot_resize_seconds_total` | Counter | Time spent synchronizing and reallocating recurrent snapshot storage. |

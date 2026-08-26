@@ -179,6 +179,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION, // variable suffix lookup in the current sequence
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -336,6 +337,7 @@ struct common_params_speculative_draft {
     // have not yet qualified growth headroom. Adaptive DFlash keeps its
     // existing dynamic behavior independently.
     bool dynamic_rs = false;
+    uint32_t max_sequences = 0;
     std::vector<int32_t> adaptive_load_caps = { 7, 3, 2, 1, 1, 1, 1, 0 };
     float adaptive_ema_alpha     = 0.0f; // 0 disables acceptance-based adaptation
     float adaptive_ema_threshold = 0.55f;
@@ -411,6 +413,18 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_suffix_session {
+    uint16_t match_min = 4;
+    uint16_t match_max = 64;
+    uint16_t draft_min = 2;
+    uint16_t draft_max = 64;
+    uint16_t max_candidates = 64;
+    uint32_t history_max = 2 * 1024 * 1024;
+
+    float min_confidence = 0.75f;
+    float acceptance_alpha = 0.25f;
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -423,6 +437,7 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+    common_params_speculative_suffix_session suffix_session;
 
     bool has_dft() const {
         return !draft.mparams.empty();

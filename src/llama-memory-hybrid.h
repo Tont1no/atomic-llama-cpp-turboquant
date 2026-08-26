@@ -35,6 +35,7 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_seq_max,
                      bool   rs_seq_dynamic,
                      bool   offload,
                      bool   unified,

@@ -4203,6 +4203,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_DYNAMIC_RS"));
     add_opt(common_arg(
+        {"--spec-draft-max-sequences"}, "N",
+        "maximum sequences that may own recurrent rollback snapshots; 0 keeps one rollback set per slot (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 256) {
+                throw std::invalid_argument("speculative draft max sequences must be between 0 and 256");
+            }
+            params.speculative.draft.max_sequences = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_MAX_SEQUENCES"));
+    add_opt(common_arg(
         {"--spec-draft-load-caps"}, "N1,N2,...",
         "adaptive maximum proposal length for 1,2,... active generating slots; "
         "the last value covers larger loads and every value must be one of 0,1,2,3,7 "
@@ -4498,6 +4508,78 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             spec_types_append(params, common_speculative_types_from_names(types_str));
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
+        {"--spec-suffix-match-min"}, "N",
+        string_format("minimum session suffix match length (default: %u)", params.speculative.suffix_session.match_min),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) throw std::invalid_argument("suffix match-min must be 1..1024");
+            params.speculative.suffix_session.match_min = (uint16_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-match-max"}, "N",
+        string_format("maximum session suffix match length (default: %u)", params.speculative.suffix_session.match_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) throw std::invalid_argument("suffix match-max must be 1..1024");
+            params.speculative.suffix_session.match_max = (uint16_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-draft-min"}, "N",
+        string_format("minimum session suffix draft length (default: %u)", params.speculative.suffix_session.draft_min),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) throw std::invalid_argument("suffix draft-min must be 1..1024");
+            params.speculative.suffix_session.draft_min = (uint16_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-draft-max"}, "N",
+        string_format("maximum session suffix draft length (default: %u)", params.speculative.suffix_session.draft_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) throw std::invalid_argument("suffix draft-max must be 1..1024");
+            params.speculative.suffix_session.draft_max = (uint16_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-max-candidates"}, "N",
+        string_format("maximum session suffix candidates to score (default: %u)", params.speculative.suffix_session.max_candidates),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 65535) throw std::invalid_argument("suffix max-candidates must be 1..65535");
+            params.speculative.suffix_session.max_candidates = (uint16_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-history-max"}, "N",
+        string_format("maximum retained prior-session suffix tokens; active prompt is separate (default: %u)", params.speculative.suffix_session.history_max),
+        [](common_params & params, int value) {
+            if (value < 1024 || value > 100000000) throw std::invalid_argument("suffix history-max must be 1024..100000000");
+            params.speculative.suffix_session.history_max = (uint32_t) value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-min-confidence"}, "P",
+        string_format("minimum session suffix confidence (default: %.2f)", (double) params.speculative.suffix_session.min_confidence),
+        [](common_params & params, const std::string & value) {
+            size_t consumed = 0;
+            const float parsed = std::stof(value, &consumed);
+            if (consumed != value.size() || !std::isfinite(parsed) || parsed < 0.0f || parsed > 1.0f) {
+                throw std::invalid_argument("suffix confidence must be 0..1");
+            }
+            params.speculative.suffix_session.min_confidence = parsed;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-suffix-acceptance-alpha"}, "P",
+        string_format("session suffix acceptance EMA weight (default: %.2f)", (double) params.speculative.suffix_session.acceptance_alpha),
+        [](common_params & params, const std::string & value) {
+            size_t consumed = 0;
+            const float parsed = std::stof(value, &consumed);
+            if (consumed != value.size() || !std::isfinite(parsed) || parsed <= 0.0f || parsed > 1.0f) {
+                throw std::invalid_argument("suffix acceptance alpha must be greater than 0 and at most 1");
+            }
+            params.speculative.suffix_session.acceptance_alpha = parsed;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),

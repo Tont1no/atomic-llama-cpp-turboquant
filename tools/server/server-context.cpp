@@ -107,7 +107,8 @@ static bool server_speculative_type_is_lookup(common_speculative_type type) {
            type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
            type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V ||
            type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
-           type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+           type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE ||
+           type == COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION;
 }
 
 static common_spec_runtime::model_drafter server_runtime_model_drafter(
@@ -2739,6 +2740,9 @@ private:
             slot.spec_adaptive_disabled = false;
             common_speculative_set_model_maintenance(spec.get(), slot.id, true);
             common_speculative_set_route(spec.get(), slot.id, COMMON_SPECULATIVE_ROUTE_TARGET);
+        } else if (slot.can_speculate()) {
+            common_speculative_set_model_maintenance(spec.get(), slot.id, true);
+            common_speculative_set_route(spec.get(), slot.id, COMMON_SPECULATIVE_ROUTE_LOOKUP_THEN_MODEL);
         }
 
         if (can_reuse_task) {
@@ -4203,13 +4207,10 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
-            if (runtime_adaptive) {
-                for (server_slot * slot : drafting) {
-                    if (!slot->spec_runtime_pending) {
-                        continue;
-                    }
+            for (server_slot * slot : drafting) {
+                slot->spec_runtime_last_type = common_speculative_get_last_type(spec.get(), slot->id);
+                if (runtime_adaptive && slot->spec_runtime_pending) {
                     slot->spec_runtime_actual_depth = (int32_t) slot->spec_draft.size();
-                    slot->spec_runtime_last_type = common_speculative_get_last_type(spec.get(), slot->id);
                 }
             }
         }
@@ -4403,6 +4404,13 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            if (!draft.empty()) {
+                if (slot.spec_runtime_last_type == COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION) {
+                    metrics.n_suffix_draft_tokens += draft.size();
+                } else if (slot.spec_runtime_last_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                    metrics.n_dflash_draft_tokens += draft.size();
+                }
+            }
             if (slot.n_drafted_per_pos.size() < draft.size()) {
                 slot.n_drafted_per_pos.resize(draft.size(), 0);
             }
@@ -5526,6 +5534,13 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            if (slot.spec_runtime_last_type == COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION) {
+                metrics.n_suffix_accepted += n_accepted;
+                metrics.n_suffix_verif_steps++;
+            } else if (slot.spec_runtime_last_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) {
+                metrics.n_dflash_accepted += n_accepted;
+                metrics.n_dflash_verif_steps++;
+            }
 
             if (adaptive_dflash && !slot.spec_adaptive_replay_recorded) {
                 common_speculative_adaptive_acceptance_update(

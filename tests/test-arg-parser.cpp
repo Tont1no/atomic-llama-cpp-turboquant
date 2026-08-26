@@ -269,6 +269,35 @@ static void test(void) {
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_none_unknown_params, LLAMA_EXAMPLE_SERVER));
     }
 
+    {
+        common_params suffix_params;
+        argv = {
+            "binary_name", "--spec-type", "suffix-session,draft-dflash",
+            "--spec-suffix-match-min", "6",
+            "--spec-suffix-match-max", "96",
+            "--spec-suffix-draft-min", "3",
+            "--spec-suffix-draft-max", "32",
+            "--spec-suffix-max-candidates", "128",
+            "--spec-suffix-history-max", "4000000",
+            "--spec-suffix-min-confidence", "0.8",
+            "--spec-suffix-acceptance-alpha", "0.2",
+        };
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), suffix_params, LLAMA_EXAMPLE_SERVER));
+        assert(suffix_params.speculative.suffix_session.match_min == 6);
+        assert(suffix_params.speculative.suffix_session.match_max == 96);
+        assert(suffix_params.speculative.suffix_session.draft_min == 3);
+        assert(suffix_params.speculative.suffix_session.draft_max == 32);
+        assert(suffix_params.speculative.suffix_session.max_candidates == 128);
+        assert(suffix_params.speculative.suffix_session.history_max == 4000000);
+        assert(suffix_params.speculative.suffix_session.min_confidence == 0.8f);
+        assert(suffix_params.speculative.suffix_session.acceptance_alpha == 0.2f);
+
+        argv = {"binary_name", "--spec-suffix-min-confidence", "nan"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), suffix_params, LLAMA_EXAMPLE_SERVER));
+        argv = {"binary_name", "--spec-suffix-draft-max", "0"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), suffix_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     common_params sps_params;
     argv = {"binary_name", "--spec-type", "draft-dspark", "--spec-draft-sps-profile", "profile.json", "--spec-draft-sps-shadow"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), sps_params, LLAMA_EXAMPLE_SERVER));

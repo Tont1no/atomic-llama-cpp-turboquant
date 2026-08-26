@@ -106,6 +106,8 @@ add_library(${TARGET}
     speculative-runtime-policy.h
     speculative.cpp
     speculative.h
+    suffix-draft.cpp
+    suffix-draft.h
     subproc.cpp
     subproc.h
     trie.cpp

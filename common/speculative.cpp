@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "suffix-draft.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-dspark-packed.h"
@@ -209,7 +210,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"suffix-session", COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -344,6 +346,8 @@ struct common_speculative_impl {
     // Drop state that can influence proposals after an authorization/cache
     // scope changes. Stateless implementations may keep the default no-op.
     virtual void reset_scope(llama_seq_id /*seq_id*/) {}
+
+    virtual std::string stats_extra() const { return {}; }
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -2443,6 +2447,84 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     }
 };
 
+struct common_speculative_impl_suffix_session : public common_speculative_impl {
+    std::vector<common_suffix_drafter> states;
+
+    common_speculative_impl_suffix_session(
+            const common_params_speculative_suffix_session & params,
+            uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION, n_seq) {
+        common_suffix_draft_config config {
+            /* .match_min       = */ params.match_min,
+            /* .match_max       = */ params.match_max,
+            /* .draft_min       = */ params.draft_min,
+            /* .draft_max       = */ params.draft_max,
+            /* .max_candidates  = */ params.max_candidates,
+            /* .history_max     = */ params.history_max,
+            /* .min_confidence  = */ params.min_confidence,
+            /* .acceptance_alpha = */ params.acceptance_alpha,
+        };
+        states.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            states.emplace_back(config);
+        }
+
+        SPC_TRC("%s", "adding speculative implementation 'suffix-session'\n");
+        SPC_TRC("- match=[%u,%u], draft=[%u,%u], candidates=%u, confidence=%.3f\n",
+                params.match_min, params.match_max, params.draft_min, params.draft_max,
+                params.max_candidates, params.min_confidence);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) states.size());
+        states[seq_id].begin(prompt);
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        GGML_ASSERT(dparams.size() == states.size());
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) states.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            *dp.result = states[seq_id].draft(*dp.prompt, dp.id_last, dp.n_max);
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) states.size());
+        if (!is_other) {
+            states[seq_id].accept(n_accepted);
+        }
+    }
+
+    void reset_scope(llama_seq_id seq_id) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) states.size()) {
+            return;
+        }
+        states[seq_id].reset();
+    }
+
+    std::string stats_extra() const override {
+        common_suffix_draft_metrics total;
+        for (const auto & state : states) {
+            const auto & metrics = state.metrics();
+            total.lookups += metrics.lookups;
+            total.hits += metrics.hits;
+            total.weak_misses += metrics.weak_misses;
+            total.proposed_tokens += metrics.proposed_tokens;
+        }
+
+        std::ostringstream oss;
+        oss << ", #lookup(hits,weak,tokens) = " << total.hits << "," << total.weak_misses << "," << total.proposed_tokens;
+        return oss.str();
+    }
+};
+
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
@@ -2809,6 +2891,7 @@ static bool common_speculative_type_is_lookup(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+        case COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION:
             return true;
         default:
             return false;
@@ -2828,7 +2911,7 @@ static bool common_speculative_type_is_model(common_speculative_type type) {
     }
 }
 
-static bool common_speculative_route_allows(
+bool common_speculative_route_allows_source(
         common_speculative_route route, common_speculative_type type) {
     switch (route) {
         case COMMON_SPECULATIVE_ROUTE_TARGET:
@@ -2908,6 +2991,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION: return "suffix-session";
         default:                                    return "unknown";
     }
 }
@@ -3074,6 +3158,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
                 break;
+            case COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION:
+                n_max = std::max(n_max, (int32_t) spec->suffix_session.draft_max);
+                break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
                 break;
@@ -3155,6 +3242,7 @@ common_speculative_init_result::common_speculative_init_result(
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
+    cparams.n_rs_seq_max = 0;
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;
@@ -3232,10 +3320,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -3317,6 +3406,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_SUFFIX_SESSION: {
+                impls.push_back(std::make_unique<common_speculative_impl_suffix_session>(
+                        config.params.suffix_session, n_seq));
                 break;
             }
             default:
@@ -3520,7 +3614,7 @@ void common_speculative_draft(common_speculative * spec) {
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
             auto & dp = dparams[seq_id];
             if (dp.drafting && (!spec->scope_ready[seq_id] ||
-                    !common_speculative_route_allows(spec->routes[seq_id], impl->type))) {
+                    !common_speculative_route_allows_source(spec->routes[seq_id], impl->type))) {
                 dp.drafting = false;
                 route_masked.push_back(seq_id);
             } else if (dp.drafting) {
@@ -3702,5 +3796,11 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+
+        const std::string extra = impl->stats_extra();
+        if (!extra.empty()) {
+            SPC_TRC("statistics %16s%s\n",
+                    common_speculative_type_to_str(impl->type).c_str(), extra.c_str());
+        }
     }
 }

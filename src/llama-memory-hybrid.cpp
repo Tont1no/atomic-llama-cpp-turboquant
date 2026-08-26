@@ -25,6 +25,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_seq_max,
                      bool   rs_seq_dynamic,
                      bool   offload,
                      bool   unified,
@@ -60,6 +61,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         rs_size,
         n_seq_max,
         n_rs_seq,
+        n_rs_seq_max,
         rs_seq_dynamic,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
