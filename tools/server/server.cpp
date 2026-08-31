@@ -11,6 +11,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "speculative.h"
 
 #include <atomic>
 #include <clocale>
@@ -154,6 +155,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
             params.n_parallel = 4;
             params.kv_unified = true;
+        }
+
+        const std::string controller_error = common_speculative_validate_runtime_controller(
+                params.speculative, (uint32_t) params.n_parallel);
+        if (!controller_error.empty()) {
+            SRV_ERR("invalid speculative runtime configuration: %s\n", controller_error.c_str());
+            return 1;
         }
     }
 

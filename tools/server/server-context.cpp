@@ -894,6 +894,7 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    std::unique_ptr<common_speculative_owner_arbiter> spec_owner_arbiter;
 
     bool add_bos_token = true;
 
@@ -1252,6 +1253,10 @@ private:
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
+            if (params_base.speculative.runtime_controller) {
+                spec_owner_arbiter = std::make_unique<common_speculative_owner_arbiter>((uint32_t) params_base.n_parallel);
+                SRV_INF("%s", "speculative runtime controller initialized, owner capacity = 1, dynamic RS = false\n");
+            }
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
@@ -2932,6 +2937,25 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        int32_t spec_owner = -1;
+        if (spec_owner_arbiter) {
+            std::vector<uint8_t> candidates(slots.size(), 0);
+            for (const auto & slot : slots) {
+                candidates[slot.id] = slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0;
+            }
+
+            bool owner_idle = true;
+            bool owner_has_pending_rollback = false;
+            const int32_t current_owner = spec_owner_arbiter->owner();
+            if (current_owner >= 0) {
+                const auto & owner_slot = slots[current_owner];
+                owner_idle = owner_slot.state == SLOT_STATE_IDLE;
+                owner_has_pending_rollback = owner_slot.spec_is_replay || !owner_slot.spec_draft.empty() || !owner_slot.spec_i_batch.empty();
+            }
+
+            spec_owner = spec_owner_arbiter->select(candidates, owner_idle, owner_has_pending_rollback);
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -2957,6 +2981,10 @@ private:
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
+
+                    if (spec_owner_arbiter && slot.id != spec_owner) {
+                        return;
+                    }
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -4553,6 +4581,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
 
     std::string tmpl_default = common_chat_templates_source(meta.chat_params.tmpls.get(), "");
     std::string tmpl_tools   = common_chat_templates_source(meta.chat_params.tmpls.get(), "tool_use");
+    const auto runtime_manifest = common_speculative_get_runtime_manifest(params.speculative, (uint32_t) params.n_parallel);
+    const auto & rs_geometry = runtime_manifest.requested_geometry;
 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
@@ -4576,6 +4606,28 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "bos_token",                   meta.bos_token_str },
         { "eos_token",                   meta.eos_token_str },
         { "build_info",                  meta.build_info },
+        { "speculative_runtime", json {
+            { "base_commit", runtime_manifest.base_commit },
+            { "runtime_commit", runtime_manifest.runtime_commit },
+            { "active_spec_types", runtime_manifest.active_types },
+            { "dflash2", runtime_manifest.dflash2 },
+            { "controller", json {
+                { "available", runtime_manifest.controller_available },
+                { "enabled", runtime_manifest.controller_enabled },
+                { "owner_capacity", rs_geometry.owner_capacity },
+                { "handoff", "deterministic-idle-no-pending-rollback" },
+            } },
+            { "recurrent_state", json {
+                { "storage", runtime_manifest.rs_storage },
+                { "static_sparse_available", runtime_manifest.static_sparse_rs_available },
+                { "static_sparse_requested", runtime_manifest.static_sparse_rs_requested },
+                { "dynamic_resize", runtime_manifest.dynamic_rs },
+                { "depth", rs_geometry.depth },
+                { "requested_base_planes", rs_geometry.base_planes },
+                { "requested_rollback_planes", rs_geometry.rollback_planes },
+                { "requested_total_planes", rs_geometry.total_planes },
+            } },
+        } },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
     };

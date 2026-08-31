@@ -5,6 +5,50 @@
 
 struct common_speculative;
 
+struct common_speculative_static_rs_geometry {
+    uint32_t n_slots;
+    uint32_t owner_capacity;
+    uint32_t depth;
+    uint32_t base_planes;
+    uint32_t rollback_planes;
+    uint32_t total_planes;
+};
+
+struct common_speculative_runtime_manifest {
+    std::string base_commit;
+    std::string runtime_commit;
+    std::string active_types;
+    std::string rs_storage;
+    bool dflash2;
+    bool controller_available;
+    bool controller_enabled;
+    bool static_sparse_rs_available;
+    bool static_sparse_rs_requested;
+    bool dynamic_rs;
+    common_speculative_static_rs_geometry requested_geometry;
+};
+
+class common_speculative_owner_arbiter {
+public:
+    explicit common_speculative_owner_arbiter(uint32_t n_slots);
+
+    int32_t select(const std::vector<uint8_t> & candidates, bool owner_idle, bool owner_has_pending_rollback);
+    int32_t owner() const;
+
+private:
+    uint32_t n_slots;
+    uint32_t next = 0;
+    int32_t current = -1;
+};
+
+common_speculative_static_rs_geometry common_speculative_get_static_rs_geometry(uint32_t n_slots, uint32_t depth);
+
+common_speculative_runtime_manifest common_speculative_get_runtime_manifest(
+        const common_params_speculative & params, uint32_t n_slots);
+
+std::string common_speculative_validate_runtime_controller(
+        const common_params_speculative & params, uint32_t n_slots);
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 

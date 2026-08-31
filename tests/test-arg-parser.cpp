@@ -36,6 +36,67 @@ static void test(void) {
             std::numeric_limits<int32_t>::max());
 
     {
+        const auto k4 = common_speculative_get_static_rs_geometry(4, 4);
+        assert(k4.n_slots == 4);
+        assert(k4.owner_capacity == 1);
+        assert(k4.base_planes == 4);
+        assert(k4.rollback_planes == 4);
+        assert(k4.total_planes == 8);
+
+        const auto k5 = common_speculative_get_static_rs_geometry(4, 5);
+        assert(k5.base_planes == 4);
+        assert(k5.rollback_planes == 5);
+        assert(k5.total_planes == 9);
+    }
+
+    {
+        common_speculative_owner_arbiter arbiter(4);
+        assert(arbiter.select({1, 1, 1, 1}, true, false) == 0);
+        assert(arbiter.select({0, 1, 1, 1}, false, false) == 0);
+        assert(arbiter.select({0, 1, 1, 1}, true, true) == 0);
+        assert(arbiter.select({0, 1, 1, 1}, true, false) == 1);
+        assert(arbiter.select({0, 0, 1, 1}, true, false) == 2);
+        assert(arbiter.select({0, 0, 0, 0}, true, false) == -1);
+        assert(arbiter.select({1, 0, 0, 0}, true, false) == 0);
+
+        bool rejected = false;
+        try {
+            arbiter.select({1, 0}, true, false);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+
+    {
+        common_params_speculative runtime;
+        runtime.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+        runtime.runtime_controller = true;
+        runtime.draft.n_max = 4;
+
+        assert(common_speculative_validate_runtime_controller(runtime, 4).empty());
+
+        const auto manifest = common_speculative_get_runtime_manifest(runtime, 4);
+        assert(manifest.base_commit == "b10f9ca58c89ccfc3653ac01e979dd085d582b76");
+        assert(!manifest.runtime_commit.empty());
+        assert(manifest.active_types == "draft-dflash");
+        assert(manifest.dflash2);
+        assert(manifest.controller_available);
+        assert(manifest.controller_enabled);
+        assert(!manifest.static_sparse_rs_available);
+        assert(!manifest.static_sparse_rs_requested);
+        assert(!manifest.dynamic_rs);
+        assert(manifest.rs_storage == "dense-per-slot");
+
+        runtime.static_sparse_rs = true;
+        assert(!common_speculative_validate_runtime_controller(runtime, 4).empty());
+        const auto unavailable = common_speculative_get_runtime_manifest(runtime, 4);
+        assert(!unavailable.static_sparse_rs_available);
+        assert(unavailable.static_sparse_rs_requested);
+        assert(unavailable.rs_storage == "unavailable");
+    }
+
+    {
         common_params_speculative spec;
         spec.synth_len = 3.4;
 
@@ -266,6 +327,14 @@ static void test(void) {
         argv = {"binary_name", "--spec-synth-rates", "0.8,0.6,0.2"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
         assert(synth_params.speculative.synth_rates == std::vector<double>({0.8, 0.6, 0.2}));
+    }
+
+    {
+        common_params runtime_params;
+        argv = {"binary_name", "--spec-runtime-controller", "--spec-rs-static-sparse"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), runtime_params, LLAMA_EXAMPLE_SERVER));
+        assert(runtime_params.speculative.runtime_controller);
+        assert(runtime_params.speculative.static_sparse_rs);
     }
 
     {

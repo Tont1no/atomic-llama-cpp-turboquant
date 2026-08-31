@@ -1,5 +1,6 @@
 #include "speculative.h"
 
+#include "build-info.h"
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -29,6 +30,103 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+static constexpr const char * SPEC_RUNTIME_BASE_COMMIT = "b10f9ca58c89ccfc3653ac01e979dd085d582b76";
+static constexpr uint32_t SPEC_RUNTIME_OWNER_CAPACITY = 1;
+
+common_speculative_owner_arbiter::common_speculative_owner_arbiter(uint32_t n_slots) : n_slots(n_slots) {
+    if (n_slots == 0) {
+        throw std::invalid_argument("speculative owner arbiter requires at least one slot");
+    }
+}
+
+int32_t common_speculative_owner_arbiter::select(
+        const std::vector<uint8_t> & candidates,
+        bool owner_idle,
+        bool owner_has_pending_rollback) {
+    if (candidates.size() != n_slots) {
+        throw std::invalid_argument("speculative owner candidate count does not match slot count");
+    }
+
+    if (current >= 0) {
+        if (!owner_idle || owner_has_pending_rollback) {
+            return current;
+        }
+
+        next = (uint32_t) (current + 1) % n_slots;
+        current = -1;
+    }
+
+    for (uint32_t i = 0; i < n_slots; ++i) {
+        const uint32_t slot = (next + i) % n_slots;
+        if (candidates[slot]) {
+            current = (int32_t) slot;
+            return current;
+        }
+    }
+
+    return -1;
+}
+
+int32_t common_speculative_owner_arbiter::owner() const {
+    return current;
+}
+
+common_speculative_static_rs_geometry common_speculative_get_static_rs_geometry(uint32_t n_slots, uint32_t depth) {
+    const uint32_t rollback_planes = SPEC_RUNTIME_OWNER_CAPACITY*depth;
+    return {
+        /* .n_slots         = */ n_slots,
+        /* .owner_capacity  = */ SPEC_RUNTIME_OWNER_CAPACITY,
+        /* .depth           = */ depth,
+        /* .base_planes     = */ n_slots,
+        /* .rollback_planes = */ rollback_planes,
+        /* .total_planes    = */ n_slots + rollback_planes,
+    };
+}
+
+common_speculative_runtime_manifest common_speculative_get_runtime_manifest(
+        const common_params_speculative & params,
+        uint32_t n_slots) {
+    const uint32_t depth = (uint32_t) std::max(0, params.draft.n_max);
+    return {
+        /* .base_commit                = */ SPEC_RUNTIME_BASE_COMMIT,
+        /* .runtime_commit             = */ llama_commit(),
+        /* .active_types               = */ common_speculative_type_name_str(params.types),
+        /* .rs_storage                 = */ params.static_sparse_rs ? "unavailable" : "dense-per-slot",
+        /* .dflash2                    = */ true,
+        /* .controller_available       = */ true,
+        /* .controller_enabled         = */ params.runtime_controller,
+        /* .static_sparse_rs_available = */ false,
+        /* .static_sparse_rs_requested = */ params.static_sparse_rs,
+        /* .dynamic_rs                 = */ false,
+        /* .requested_geometry         = */ common_speculative_get_static_rs_geometry(n_slots, depth),
+    };
+}
+
+std::string common_speculative_validate_runtime_controller(
+        const common_params_speculative & params,
+        uint32_t n_slots) {
+    if (!params.runtime_controller && !params.static_sparse_rs) {
+        return {};
+    }
+
+    if (n_slots == 0) {
+        return "spec runtime controller requires at least one slot";
+    }
+
+    const bool has_supported_draft = std::any_of(params.types.begin(), params.types.end(), [](auto type) {
+        return type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+    if (!has_supported_draft) {
+        return "spec runtime controller requires draft-dflash or draft-dspark";
+    }
+
+    if (params.static_sparse_rs) {
+        return "static sparse recurrent-state storage is not available in this build";
+    }
+
+    return {};
+}
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},

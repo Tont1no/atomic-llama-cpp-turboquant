@@ -3964,6 +3964,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     //
 
     add_opt(common_arg(
+        {"--spec-runtime-controller"},
+        {"--no-spec-runtime-controller"},
+        "allow one draft owner at a time with deterministic idle-slot handoff",
+        [](common_params & params, bool value) {
+            params.speculative.runtime_controller = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_RUNTIME_CONTROLLER"));
+    add_opt(common_arg(
+        {"--spec-rs-static-sparse"},
+        "require fixed sparse recurrent-state storage (fails closed when unavailable)",
+        [](common_params & params) {
+            params.speculative.static_sparse_rs = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_RS_STATIC_SPARSE"));
+
+    add_opt(common_arg(
         {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",
         "Same as --hf-repo, but for the draft model (default: unused)",
         [](common_params & params, const std::string & value) {
