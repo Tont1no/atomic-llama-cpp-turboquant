@@ -4583,6 +4583,19 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     std::string tmpl_tools   = common_chat_templates_source(meta.chat_params.tmpls.get(), "tool_use");
     const auto runtime_manifest = common_speculative_get_runtime_manifest(params.speculative, (uint32_t) params.n_parallel);
     const auto & rs_geometry = runtime_manifest.requested_geometry;
+    json normalized_runtime_capabilities = json::array({ "capabilities_json_v1" });
+    if (runtime_manifest.dflash2) {
+        normalized_runtime_capabilities.push_back("dflash2");
+    }
+    if (runtime_manifest.controller_available) {
+        normalized_runtime_capabilities.push_back("runtime_controller");
+    }
+    if (rs_geometry.owner_capacity == 1) {
+        normalized_runtime_capabilities.push_back("spec_owner_m1");
+    }
+    if (runtime_manifest.static_sparse_rs_available) {
+        normalized_runtime_capabilities.push_back("static_sparse_rs");
+    }
 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
@@ -4606,6 +4619,21 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "bos_token",                   meta.bos_token_str },
         { "eos_token",                   meta.eos_token_str },
         { "build_info",                  meta.build_info },
+        { "runtime_capabilities", json {
+            { "schema", "llama.cpp-runtime-capabilities/v1" },
+            { "commit", runtime_manifest.runtime_commit },
+            { "base_commit", runtime_manifest.base_commit },
+            { "capabilities", normalized_runtime_capabilities },
+            { "effective", json {
+                { "speculative_rs_storage", runtime_manifest.static_sparse_rs_available &&
+                    runtime_manifest.static_sparse_rs_requested ? "static_sparse" : "legacy_rectangular" },
+                { "dynamic_rs", runtime_manifest.dynamic_rs },
+                { "spec_owner_capacity", rs_geometry.owner_capacity },
+                { "speculative_depth", rs_geometry.depth },
+                { "runtime_controller", runtime_manifest.controller_enabled },
+                { "active_spec_types", runtime_manifest.active_types },
+            } },
+        } },
         { "speculative_runtime", json {
             { "base_commit", runtime_manifest.base_commit },
             { "runtime_commit", runtime_manifest.runtime_commit },
