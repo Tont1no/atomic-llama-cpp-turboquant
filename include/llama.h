@@ -1,6 +1,8 @@
 #ifndef LLAMA_H
 #define LLAMA_H
 
+#define LLAMA_SUPPORTS_AI_LOADER_MANUAL_LAYER_DEVICES 1
+
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-backend.h"

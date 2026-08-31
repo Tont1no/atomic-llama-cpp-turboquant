@@ -31,6 +31,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -38,6 +39,40 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+static bool llama_full_layer_override_index(const char * pattern, int & layer_index) {
+    static const char prefix[] = "^blk\\.";
+    static const char suffix[] = "\\.";
+
+    if (pattern == nullptr || strncmp(pattern, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+
+    const char * cursor = pattern + sizeof(prefix) - 1;
+    if (*cursor < '0' || *cursor > '9') {
+        return false;
+    }
+    if (*cursor == '0' && cursor[1] >= '0' && cursor[1] <= '9') {
+        return false;
+    }
+
+    int value = 0;
+    do {
+        const int digit = *cursor - '0';
+        if (value > (std::numeric_limits<int>::max() - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+        ++cursor;
+    } while (*cursor >= '0' && *cursor <= '9');
+
+    if (strcmp(cursor, suffix) != 0) {
+        return false;
+    }
+
+    layer_index = value;
+    return true;
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1472,6 +1507,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    // A complete block override also defines where its compute and KV state live.
+    // Partial tensor overrides, including expert-only CPU placement, stay weight-only.
+    if (params.tensor_buft_overrides) {
+        auto layer_dev_for_override = [&](ggml_backend_buffer_type_t buft) -> llama_model::impl::layer_dev {
+            if (buft == ggml_backend_cpu_buffer_type()) {
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr) {
+                throw std::runtime_error("full-layer tensor override has no owning device");
+            }
+            if (dev == cpu_dev) {
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+            const auto it = pimpl->gpu_buft_list.find(dev);
+            if (it == pimpl->gpu_buft_list.end()) {
+                throw std::runtime_error(format(
+                    "full-layer tensor override uses unavailable device %s",
+                    ggml_backend_dev_name(dev)));
+            }
+            return {dev, &it->second};
+        };
+
+        std::vector<bool> layer_overridden(n_layer_all, false);
+        bool output_overridden = false;
+        for (const auto * override = params.tensor_buft_overrides;
+             override->pattern != nullptr; ++override) {
+            int il = -1;
+            if (llama_full_layer_override_index(override->pattern, il)) {
+                if (il >= 0 && il < n_layer_all && !layer_overridden[il]) {
+                    pimpl->dev_layer[il] = layer_dev_for_override(override->buft);
+                    layer_overridden[il] = true;
+                    LLAMA_LOG_DEBUG("load_tensors: full layer override assigns layer %3d to device %s\n",
+                        il, ggml_backend_dev_name(pimpl->dev_layer[il].dev));
+                }
+                continue;
+            }
+            if (!output_overridden && strcmp(override->pattern, "^output") == 0) {
+                pimpl->dev_output = layer_dev_for_override(override->buft);
+                output_overridden = true;
+                LLAMA_LOG_DEBUG("load_tensors: output override assigns output to device %s\n",
+                    ggml_backend_dev_name(pimpl->dev_output.dev));
+            }
+        }
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
