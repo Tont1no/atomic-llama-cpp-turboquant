@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-row-reorder.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -340,6 +341,9 @@ private:
     };
 
     std::vector<swap_info> output_swaps;
+
+    // all-input-row buffers must not use the selected-output permutation
+    llama_row_reorder input_reorder;
 
     ggml_backend_sched_ptr sched;
 

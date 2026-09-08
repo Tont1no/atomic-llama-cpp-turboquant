@@ -1,9 +1,11 @@
 #include "mmvq.cuh"
+#include "mmq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -289,6 +291,27 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
+    }
+    if (cc == GGML_CUDA_CC_BLACKWELL) {
+        // Experimental dense-batch crossover. Unset preserves the tuned defaults.
+        static const int max_batch = []() {
+            const char * value = std::getenv("GGML_CUDA_BLACKWELL_MMVQ_MAX_BATCH");
+            if (!value) {
+                return 0;
+            }
+            char * end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed < 1 || parsed > MMVQ_MAX_BATCH_SIZE) {
+                GGML_LOG_WARN("CUDA: ignoring invalid GGML_CUDA_BLACKWELL_MMVQ_MAX_BATCH\n");
+                return 0;
+            }
+            GGML_LOG_WARN("CUDA: experimental Blackwell MMVQ max batch = %ld\n", parsed);
+            return static_cast<int>(parsed);
+        }();
+        if (max_batch > 0 && ne11 > max_batch &&
+                ggml_cuda_should_use_mmq(type, cc, ne11, /*n_experts=*/0)) {
+            return false;
+        }
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
@@ -858,8 +881,14 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+    constexpr bool batched_swiglu = c_ncols_dst >= 2 && c_ncols_dst <= 4 &&
+                                    (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S);
+    if constexpr (c_ncols_dst == 1 || batched_swiglu) {
         if (has_fusion) {
+            if constexpr (batched_swiglu) {
+                GGML_ASSERT(!ids && fusion.gate && fusion.glu_op == GGML_GLU_OP_SWIGLU);
+                GGML_ASSERT(!fusion.x_bias && !fusion.gate_bias && !fusion.x_scale && !fusion.gate_scale);
+            }
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
@@ -869,7 +898,7 @@ static void mul_mat_vec_q_switch_fusion(
         }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "unsupported quantized matrix-vector fusion");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
@@ -1276,7 +1305,17 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        if (!ids && dst->ne[1] != 1) {
+            GGML_ASSERT(ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL);
+            GGML_ASSERT(dst->ne[1] >= 2 && dst->ne[1] <= 4);
+            GGML_ASSERT(src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ3_S);
+            GGML_ASSERT(fusion->gate && fusion->glu_op == GGML_GLU_OP_SWIGLU);
+            GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+            GGML_ASSERT(ggml_are_same_shape(src0, fusion->gate));
+            for (const ggml_tensor * tensor : std::array<const ggml_tensor *, 4>{src0, src1, dst, fusion->gate}) {
+                GGML_ASSERT(ggml_is_contiguous(tensor) && tensor->ne[2] == 1 && tensor->ne[3] == 1);
+            }
+        }
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);

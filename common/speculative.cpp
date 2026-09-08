@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-mtp-state.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1004,6 +1006,104 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// Default-off, bounded DFlash phase profiling. Set LLAMA_DFLASH_PROFILE_WINDOW
+// to 8..4096 to emit one aggregate line per that many non-empty draft calls.
+// dflash_profile/v1 is a stable key=value schema. All *_cpu_wall_us fields are
+// host wall time and can include backend submission, synchronization and readback
+// waits; they are not GPU kernel timings. No prompts, token IDs or payloads are logged.
+// noise_rows is the submitted batch row count. generated_proposals_before_outer_cap
+// is this implementation's output before the caller applies its remaining-budget cap.
+struct common_dflash_profile_window {
+    static constexpr uint64_t WINDOW_MIN = 8;
+    static constexpr uint64_t WINDOW_MAX = 4096;
+
+    bool enabled = false;
+    const char * implementation = "draft-dflash";
+    uint64_t window_size  = 0;
+    uint64_t window_index = 0;
+
+    uint64_t process_calls  = 0;
+    uint64_t process_chunks = 0;
+    uint64_t process_rows   = 0;
+    uint64_t draft_calls     = 0;
+    uint64_t draft_sequences = 0;
+    uint64_t noise_rows      = 0;
+    uint64_t generated_proposals_before_outer_cap = 0;
+
+    int64_t feature_gather_cpu_wall_us          = 0;
+    // Kept for dflash_profile/v1 compatibility; the fused path has no standalone encoder/readback.
+    int64_t encoder_submit_readback_cpu_wall_us = 0;
+    int64_t inject_cpu_wall_us                  = 0;
+    int64_t draft_prepare_cpu_wall_us           = 0;
+    int64_t draft_decode_cpu_wall_us             = 0;
+    int64_t draft_extract_cpu_wall_us           = 0;
+    int64_t draft_total_cpu_wall_us             = 0;
+
+    void configure(common_speculative_type type) {
+        implementation = type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ? "draft-dspark" : "draft-dflash";
+
+        const char * value = std::getenv("LLAMA_DFLASH_PROFILE_WINDOW");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
+            return;
+        }
+
+        char * end = nullptr;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < WINDOW_MIN || parsed > WINDOW_MAX) {
+            LOG_WRN("%s: ignoring invalid LLAMA_DFLASH_PROFILE_WINDOW; expected integer 0 or %" PRIu64 "..%" PRIu64 "\n",
+                    __func__, WINDOW_MIN, WINDOW_MAX);
+            return;
+        }
+
+        enabled = true;
+        window_size = (uint64_t) parsed;
+        LOG_INF("%s: DFlash phase profiling enabled: schema=dflash_profile/v1 window_size=%" PRIu64
+                " cpu_wall_includes_backend_wait=true\n", __func__, window_size);
+    }
+
+    void finish_draft(int64_t draft_started_us) {
+        if (!enabled) {
+            return;
+        }
+        draft_total_cpu_wall_us += ggml_time_us() - draft_started_us;
+        ++draft_calls;
+        if (draft_calls >= window_size) {
+            flush(false);
+        }
+    }
+
+    void flush(bool partial) {
+        if (!enabled || (process_calls == 0 && draft_calls == 0)) {
+            return;
+        }
+
+        LOG_INF("dflash_profile/v1 implementation=%s window=%" PRIu64 " partial=%s"
+                " cpu_wall_includes_backend_wait=true process_calls=%" PRIu64
+                " process_chunks=%" PRIu64 " process_rows=%" PRIu64
+                " feature_gather_cpu_wall_us=%" PRId64
+                " encoder_submit_readback_cpu_wall_us=%" PRId64
+                " inject_cpu_wall_us=%" PRId64 " draft_calls=%" PRIu64
+                " draft_sequences=%" PRIu64 " noise_rows=%" PRIu64
+                " generated_proposals_before_outer_cap=%" PRIu64
+                " draft_prepare_cpu_wall_us=%" PRId64
+                " draft_decode_cpu_wall_us=%" PRId64
+                " draft_extract_cpu_wall_us=%" PRId64
+                " draft_total_cpu_wall_us=%" PRId64 "\n",
+                implementation, ++window_index, partial ? "true" : "false",
+                process_calls, process_chunks, process_rows,
+                feature_gather_cpu_wall_us, encoder_submit_readback_cpu_wall_us,
+                inject_cpu_wall_us, draft_calls, draft_sequences, noise_rows,
+                generated_proposals_before_outer_cap, draft_prepare_cpu_wall_us, draft_decode_cpu_wall_us,
+                draft_extract_cpu_wall_us, draft_total_cpu_wall_us);
+
+        process_calls = process_chunks = process_rows = 0;
+        draft_calls = draft_sequences = noise_rows = generated_proposals_before_outer_cap = 0;
+        feature_gather_cpu_wall_us = encoder_submit_readback_cpu_wall_us = 0;
+        inject_cpu_wall_us = draft_prepare_cpu_wall_us = draft_decode_cpu_wall_us = 0;
+        draft_extract_cpu_wall_us = draft_total_cpu_wall_us = 0;
+    }
+};
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1036,8 +1136,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
-    // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
-    std::vector<float> features_buf;
+    common_dflash_profile_window profile;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1076,6 +1175,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        profile.configure(type);
+
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
@@ -1093,7 +1194,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1138,6 +1239,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
+        profile.flush(true);
+
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1190,6 +1293,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
+        if (profile.enabled) {
+            ++profile.process_calls;
+        }
+
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
         std::vector<int32_t> i_batch_end(n_seq, -1);
@@ -1219,75 +1326,52 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                {
+                    common_time_meas timing(profile.feature_gather_cpu_wall_us, !profile.enabled);
+
+                    // gather target features per extract layer; the fused decode encodes and
+                    // injects them into the K/V cache at the target positions
+                    batch_inject.n_tokens = n_chunk;
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
                     }
                 }
 
-                // fuse extracted features through DFlash encoder
-                // M-RoPE drafts read 4 position rows per token from embd batches, so pass them explicitly
-                std::vector<llama_pos> enc_pos;
-                if (is_mrope) {
-                    enc_pos.resize((size_t) 4 * n_chunk);
+                if (profile.enabled) {
+                    ++profile.process_chunks;
+                    profile.process_rows += (uint64_t) n_chunk;
+                }
+
+                {
+                    common_time_meas timing(profile.inject_cpu_wall_us, !profile.enabled);
+
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        enc_pos[0 * n_chunk + i] = p;
-                        enc_pos[1 * n_chunk + i] = p;
-                        enc_pos[2 * n_chunk + i] = p;
-                        enc_pos[3 * n_chunk + i] = 0;
+                        batch_inject.pos[i] = p;
+                        if (is_mrope) {
+                            batch_inject.pos[1 * n_chunk + i] = p;
+                            batch_inject.pos[2 * n_chunk + i] = p;
+                            batch_inject.pos[3 * n_chunk + i] = 0;
+                        }
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
                     }
-                }
 
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.pos[i] = p;
-                    if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
-                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
                     }
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
                 }
             }
         }
@@ -1298,30 +1382,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
-        common_batch_clear(batch);
+        const int64_t draft_started_us = profile.enabled ? ggml_time_us() : 0;
 
-        // build one batch holding every drafting sequence's noise block into a single decode)
-        // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
+        {
+            common_time_meas timing(profile.draft_prepare_cpu_wall_us, !profile.enabled);
+            common_batch_clear(batch);
 
-            common_sampler_reset(smpls[seq_id].get());
+            // build one batch holding every drafting sequence's noise block into a single decode)
+            // record where each block starts and its size
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
 
-            const int32_t n = (int32_t) dp.n_past;
+                common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n_draft = params.n_max;
+                const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
-            i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_block_tokens;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                const int32_t n_draft = params.n_max;
+
+                const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+                i_block_beg[seq_id] = batch.n_tokens;
+                n_block    [seq_id] = n_block_tokens;
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                }
             }
         }
 
@@ -1329,13 +1418,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        if (profile.enabled) {
+            profile.noise_rows += (uint64_t) batch.n_tokens;
+            for (const int32_t beg : i_block_beg) {
+                profile.draft_sequences += beg >= 0 ? 1 : 0;
+            }
+        }
+
         // decode all sequence's noise block in a single batch
-        int ret = llama_decode(ctx_dft, batch);
+        int ret;
+        {
+            common_time_meas timing(profile.draft_decode_cpu_wall_us, !profile.enabled);
+            ret = llama_decode(ctx_dft, batch);
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+            profile.finish_draft(draft_started_us);
             return;
         }
 
+        uint64_t proposals = 0;
+        const int64_t extract_started_us = profile.enabled ? ggml_time_us() : 0;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
                 continue;
@@ -1348,6 +1451,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+            const size_t result_size_before = result.size();
 
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
@@ -1376,6 +1480,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
                 }
+                proposals += result.size() >= result_size_before ? result.size() - result_size_before : 0;
                 continue;
             }
 
@@ -1435,7 +1540,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+            proposals += result.size() >= result_size_before ? result.size() - result_size_before : 0;
         }
+
+        if (profile.enabled) {
+            profile.draft_extract_cpu_wall_us += ggml_time_us() - extract_started_us;
+            profile.generated_proposals_before_outer_cap += proposals;
+        }
+        profile.finish_draft(draft_started_us);
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
@@ -1579,14 +1691,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    void reset_carry(llama_seq_id seq_id) {
+        common_speculative_mtp_reset_carry(pending_h[seq_id], verify_h[seq_id],
+                verify_h_rows[seq_id], chain_heads ? &chain_h[seq_id] : nullptr);
+        i_last[seq_id] = -1;
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
-        const int32_t N = (int32_t) prompt.size();
-        if (N <= 0) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
 
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        if (common_speculative_mtp_reset_at_begin(prompt.empty(), pos_max)) {
+            reset_carry(seq_id);
+            i_batch_beg[seq_id] = i_batch_end[seq_id] = -1;
+        }
+
+        const int32_t N = (int32_t) prompt.size();
+        if (N <= 0) {
+            return;
+        }
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
@@ -1630,6 +1756,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        // A new prompt can arrive before begin() (llama-server), or without
+        // begin() for grammar-only requests. No previous request's hidden row
+        // may seed position zero. Keep the current batch ranges intact.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const int32_t beg = i_batch_beg[seq_id];
+            if (beg >= 0 && batch_in.pos[beg] == 0) {
+                reset_carry(seq_id);
+            }
+        }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {

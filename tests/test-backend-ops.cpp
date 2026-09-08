@@ -6519,6 +6519,14 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// Bounded opt-in-kernel qualification, including the target model's FFN shape.
+struct test_blackwell_batched_swiglu : public test_mul_mat_vec_fusion {
+    test_blackwell_batched_swiglu(ggml_type type, int64_t columns, int64_t width, int64_t input)
+        : test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, columns, width, input,
+                                 false, 1, 1, false, false, true, false, {1, 1}) {}
+    std::string op_desc(ggml_tensor *) override { return "BLACKWELL_BATCHED_SWIGLU"; }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -8305,6 +8313,15 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (int64_t columns : {1, 2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_blackwell_batched_swiglu(type, columns, 32, 256));
+        }
+        for (int64_t columns : {2, 3, 4}) {
+            test_cases.emplace_back(new test_blackwell_batched_swiglu(type, columns, 17408, 5120));
+        }
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

@@ -1425,6 +1425,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
+    // Encoder split_simple consumes one batch in original input order.
+    input_reorder.clear();
+    output_swaps.clear();
+
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
@@ -1652,7 +1656,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const int64_t n_vocab = vocab.n_tokens();
     const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    // DFlash embd batches carry the fused target features at the encoder input width
+    const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
+    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -1725,6 +1731,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+
+    input_reorder.clear();
 
     sched_reserve();
 
@@ -1969,6 +1977,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
+    // Layer inputs and unmasked nextn contain every token, in ubatch order.
+    // Their permutation cannot be derived from the subset in out_ids.
+    if ((cparams.embeddings_nextn && !cparams.embeddings_nextn_masked) ||
+            std::any_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(),
+                        [](bool enabled) { return enabled; })) {
+        GGML_ASSERT(n_tokens_prev == n_tokens_all);
+        if (!input_reorder.prepare(balloc->get_input_ids(), n_tokens_all)) {
+            GGML_ABORT("invalid all-input-row permutation after batch splitting");
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -2210,6 +2229,8 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+        GGML_ASSERT(row_floats == (size_t) model.hparams.n_embd);
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
@@ -2221,7 +2242,6 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
-    const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
@@ -2240,19 +2260,9 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
-            }
-        }
-
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
             }
         }
 
@@ -2285,6 +2295,21 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+
+    if (input_reorder.pending()) {
+        std::vector<llama_row_reorder::buffer> input_buffers;
+        for (auto & layer : embd_layer_inp) {
+            if (layer.has_data()) {
+                input_buffers.push_back({layer.data, layer.size, (size_t) model.hparams.n_embd});
+            }
+        }
+        if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
+            input_buffers.push_back({embd_nextn.data, embd_nextn.size, (size_t) n_embd_out});
+        }
+        if (!input_reorder.apply(input_buffers)) {
+            GGML_ABORT("all-input-row buffer is too small for its permutation");
+        }
+    }
 }
 
 //

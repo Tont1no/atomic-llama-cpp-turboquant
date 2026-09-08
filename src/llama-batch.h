@@ -92,6 +92,9 @@ public:
     // the array of output indices in the order they were encountered during the ubatch splitting
     std::vector<int32_t> & get_out_ids();
 
+    // every original input index, in ubatch extraction order, regardless of logits selection
+    const std::vector<int32_t> & get_input_ids() const;
+
     // min/max positions of each sequence in the current ubatch
     llama_pos seq_pos_min(llama_seq_id seq_id) const;
     llama_pos seq_pos_max(llama_seq_id seq_id) const;
@@ -164,6 +167,9 @@ private:
 
     // batch indices of the output
     std::vector<int32_t> out_ids;
+
+    // batch indices of all rows, including those without requested logits
+    std::vector<int32_t> input_ids;
 
     uint32_t n_used;
 

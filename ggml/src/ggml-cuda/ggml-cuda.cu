@@ -1813,6 +1813,48 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// Opt-in experiment: reuse the existing gate accumulator for narrow dense batches.
+// Keep this separate from the general predicate: bias/scale and MoE fusion remain C1-only.
+static bool ggml_cuda_should_fuse_blackwell_batched_swiglu(
+        const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_BLACKWELL_BATCHED_SWIGLU");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (cc != GGML_CUDA_CC_BLACKWELL || up->op != GGML_OP_MUL_MAT ||
+            gate->op != GGML_OP_MUL_MAT || up->src[2] || gate->src[2] ||
+            up->ne[1] < 2 || up->ne[1] > 4 ||
+            !ggml_cuda_should_fuse_mul_mat(up, gate, glu) || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    const ggml_tensor * weights = up->src[0];
+    const ggml_tensor * input = up->src[1];
+    if ((weights->type != GGML_TYPE_IQ2_S && weights->type != GGML_TYPE_IQ3_S) ||
+            input->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+            gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            !ggml_cuda_should_use_mmvq(weights->type, cc, input->ne[1]) ||
+            !ggml_are_same_shape(up, gate) || !ggml_are_same_shape(up, glu) ||
+            input->ne[1] != up->ne[1] || input->ne[0] != weights->ne[0] || up->ne[0] != weights->ne[1]) {
+        return false;
+    }
+    for (const ggml_tensor * tensor : std::array<const ggml_tensor *, 6>{weights, gate->src[0], input, up, gate, glu}) {
+        if (!ggml_is_contiguous(tensor) || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * tensor : std::array<const ggml_tensor *, 2>{weights, gate->src[0]}) {
+        if (ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_nbytes(tensor) != ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor) && tensor->view_src) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -3790,11 +3832,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            const bool batched_swiglu = ggml_cuda_should_fuse_blackwell_batched_swiglu(up, gate, glu);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) || batched_swiglu) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
+                if (batched_swiglu) {
+                    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+                    if (!reported.test_and_set(std::memory_order_relaxed)) {
+                        GGML_LOG_WARN("CUDA: experimental Blackwell batched SwiGLU selected (type=%s, columns=%" PRId64 ")\n",
+                                      ggml_type_name(src0->type), up->ne[1]);
+                    }
+                }
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;

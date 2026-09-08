@@ -5,6 +5,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -17,6 +19,34 @@
 // Still, the value range should be shifted as much as necessary but as little as possible.
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+
+static inline bool ggml_cuda_fattn_q4_batch_invariant_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_FA_Q4_BATCH_INVARIANT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static inline bool ggml_cuda_fattn_q4_batch_invariant(const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_q4_batch_invariant_enabled() || dst == nullptr ||
+            dst->op != GGML_OP_FLASH_ATTN_EXT || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    return Q != nullptr && K != nullptr && V != nullptr && mask != nullptr &&
+        Q->type == GGML_TYPE_F32 &&
+        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256 &&
+        K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+        mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 &&
+        Q->ne[1] >= 1 && Q->ne[1] <= 16 &&
+        K->ne[1] > 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+}
 
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
@@ -1116,6 +1146,10 @@ void launch_fattn(
 
     const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
+    const bool q4_batch_invariant = ggml_cuda_fattn_q4_batch_invariant(KQV);
+    GGML_ASSERT(!q4_batch_invariant ||
+        (!stream_k && DV == 256 && ncols1 == 1 && ncols2 == 1 && nbatch_fa == 256));
+
     dim3 blocks_num;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
@@ -1149,28 +1183,32 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
-        // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+        if (q4_batch_invariant) {
+            parallel_blocks = 1;
+        } else {
+            // parallel_blocks must not be larger than what the tensor size allows:
+            parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        int nwaves_best = 0;
-        int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+            // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+            // Test whether parallel_blocks can be set to a higher value for better efficiency.
+            const int blocks_per_wave = nsm * max_blocks_per_sm;
+            int nwaves_best = 0;
+            int efficiency_percent_best = 0;
+            for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+                const int nblocks_total = ntiles_dst * parallel_blocks_test;
+                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                break;
-            }
+                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                    break;
+                }
 
-            if (efficiency_percent > efficiency_percent_best) {
-                nwaves_best = nwaves;
-                efficiency_percent_best = efficiency_percent;
-                parallel_blocks = parallel_blocks_test;
+                if (efficiency_percent > efficiency_percent_best) {
+                    nwaves_best = nwaves;
+                    efficiency_percent_best = efficiency_percent;
+                    parallel_blocks = parallel_blocks_test;
+                }
             }
         }
 

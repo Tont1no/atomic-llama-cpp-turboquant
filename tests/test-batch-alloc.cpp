@@ -5,6 +5,7 @@
 #include "../src/llama-batch.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-vocab.h"
+#include "../src/llama-row-reorder.h"
 
 #include <cstdlib>
 #include <initializer_list>
@@ -407,6 +408,7 @@ static void test_split(testing & t) {
         t.assert_equal(2, ub.n_seq_id[0]);
         t.assert_equal(0, ub.seq_idx[0]);
         t.assert_equal(1, ub.seq_idx[1]);
+        t.assert_true("coupled sequences retain one index per input row", ba.get_input_ids() == std::vector<int32_t>({0, 1}));
     });
 
     t.test("split_seq_per_sequence", [&](testing & t) {
@@ -650,6 +652,139 @@ static void test_mrope(testing & t) {
     });
 }
 
+static void test_input_row_order(testing & t) {
+    llama_vocab vocab;
+
+    // All four splitting routes must retain original indices, even when only
+    // each sequence's final token requests logits and recurrent tails are kept.
+    for (int mode = 0; mode < 4; ++mode) {
+        t.test("split_mode_" + std::to_string(mode), [&](testing & t) {
+            batch_builder bb;
+            const int lengths[] = {110, 99, 73, 110};
+            for (int seq = 0; seq < 4; ++seq) {
+                for (int pos = 0; pos < lengths[seq]; ++pos) {
+                    bb.add(pos, {seq}, pos + 1 == lengths[seq]);
+                }
+            }
+            llama_batch_allocr ba(1);
+            if (!t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false))) {
+                return;
+            }
+            std::vector<float> extracted;
+            std::vector<int32_t> observed_ids;
+            while (true) {
+                const auto ub = mode == 0 ? ba.split_simple(128) :
+                                mode == 3 ? ba.split_seq(128) : ba.split_equal(128, mode == 2, 6);
+                if (ub.n_tokens == 0) {
+                    break;
+                }
+                extracted.insert(extracted.end(), ub.embd, ub.embd + (size_t) ub.n_tokens * bb.n_embd);
+                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                    observed_ids.push_back((int32_t) (ub.embd[i * bb.n_embd] / 100.0f));
+                }
+            }
+            t.assert_equal(ba.get_n_tokens(), ba.get_n_used());
+            t.assert_true("input mapping covers actual ubatch extraction order", ba.get_input_ids() == observed_ids);
+            t.assert_equal((size_t) 4, ba.get_out_ids().size());
+            if (mode == 1 || mode == 2) {
+                t.assert_true("hybrid splitting produced a non-identity permutation", extracted != bb.embd);
+            }
+            llama_row_reorder reorder;
+            if (!t.assert_true(reorder.prepare(ba.get_input_ids(), ba.get_n_tokens()))) {
+                return;
+            }
+            t.assert_true(reorder.apply({{extracted.data(), extracted.size(), bb.n_embd}}));
+            t.assert_true("all hidden rows recover original batch order", extracted == bb.embd);
+
+            // Reset/resplit models preparation retries and the next batch.
+            ba.split_reset();
+            t.assert_true(ba.get_input_ids().empty());
+            t.assert_true(ba.get_out_ids().empty());
+            const auto encoder_ub = ba.split_simple(ba.get_n_tokens());
+            t.assert_equal(ba.get_n_tokens(), encoder_ub.n_tokens);
+            t.assert_true(reorder.prepare(ba.get_input_ids(), ba.get_n_tokens()));
+            t.assert_true(reorder.apply({{extracted.data(), extracted.size(), bb.n_embd}}));
+            t.assert_true("single embedding-input encoder batch is identity", extracted == bb.embd);
+        });
+    }
+
+    t.test("equal_c4_sparse_logits_are_already_sorted", [&](testing & t) {
+        batch_builder bb;
+        for (int seq = 0; seq < 4; ++seq) {
+            for (int pos = 0; pos < 110; ++pos) {
+                bb.add(pos, {seq}, pos == 109);
+            }
+        }
+        llama_batch_allocr ba(1);
+        if (!t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false))) {
+            return;
+        }
+        std::vector<float> extracted;
+        while (true) {
+            const auto ub = ba.split_equal(128, true, 6);
+            if (ub.n_tokens == 0) {
+                break;
+            }
+            extracted.insert(extracted.end(), ub.embd, ub.embd + (size_t) ub.n_tokens * bb.n_embd);
+        }
+        t.assert_true("selected outputs alone cannot repair hidden rows", ba.get_out_ids() == std::vector<int32_t>({109, 219, 329, 439}));
+        if (!t.assert_equal((size_t) 440, ba.get_input_ids().size())) {
+            return;
+        }
+        t.assert_equal("raw row 32 belongs to the next sequence", 110, ba.get_input_ids()[32]);
+        llama_row_reorder reorder;
+        t.assert_true(reorder.prepare(ba.get_input_ids(), 440));
+        t.assert_true(reorder.apply({{extracted.data(), extracted.size(), bb.n_embd}}));
+        t.assert_true("hidden rows match the original batch", extracted == bb.embd);
+    });
+
+    t.test("independent_masked_unmasked_and_repeated_getters", [&](testing & t) {
+        const std::vector<int32_t> ids = {2, 0, 4, 1, 3};
+        std::vector<float> layer = {20, 21, 0, 1, 40, 41, 10, 11, 30, 31};
+        std::vector<float> nextn = {2, 0, 4, 1, 3};
+        std::vector<float> masked = {4, 1};
+        llama_row_reorder input_order;
+        t.assert_true(input_order.prepare(ids, 5));
+        t.assert_true(input_order.apply({{layer.data(), layer.size(), 2}, {nextn.data(), nextn.size(), 1}}));
+        t.assert_true(layer == std::vector<float>({0, 1, 10, 11, 20, 21, 30, 31, 40, 41}));
+        t.assert_true(nextn == std::vector<float>({0, 1, 2, 3, 4}));
+        t.assert_true("masked nextn does not receive input swaps", masked == std::vector<float>({4, 1}));
+
+        llama_row_reorder selected_order;
+        t.assert_true(selected_order.prepare({1, 0}, 2));
+        t.assert_true(selected_order.apply({{masked.data(), masked.size(), 1}}));
+        t.assert_true(masked == std::vector<float>({1, 4}));
+        t.assert_true(!input_order.pending());
+        t.assert_true(input_order.apply({{layer.data(), layer.size(), 2}, {nextn.data(), nextn.size(), 1}}));
+        t.assert_true("another getter does not apply swaps twice", nextn == std::vector<float>({0, 1, 2, 3, 4}));
+        t.assert_true(input_order.prepare(ids, 5));
+        input_order.clear();
+        t.assert_true(input_order.apply({{nextn.data(), nextn.size(), 1}}));
+        t.assert_true("reset discards a previous pending permutation", nextn == std::vector<float>({0, 1, 2, 3, 4}));
+    });
+
+    t.test("invalid_mapping_and_buffer_fail_without_mutation", [&](testing & t) {
+        llama_row_reorder reorder;
+        t.assert_true(!reorder.prepare({0, 1}, 3));
+        t.assert_true(!reorder.prepare({0, 0, 2}, 3));
+        t.assert_true(!reorder.prepare({0, -1, 2}, 3));
+        t.assert_true(!reorder.prepare({0, 1, 3}, 3));
+        t.assert_true(!reorder.pending());
+        t.assert_true(reorder.prepare({1, 0}, 2));
+        std::vector<float> valid = {1, 0};
+        std::vector<float> short_buffer = {1};
+        t.assert_true(!reorder.apply({{valid.data(), valid.size(), 1}, {short_buffer.data(), short_buffer.size(), 1}}));
+        t.assert_true("validation precedes every write", valid == std::vector<float>({1, 0}));
+        t.assert_true(reorder.pending());
+        t.assert_true(!reorder.apply({{nullptr, 2, 1}}));
+        t.assert_true(!reorder.apply({{valid.data(), valid.size(), 0}}));
+        t.assert_true(reorder.apply({{valid.data(), valid.size(), 1}}));
+        t.assert_true(valid == std::vector<float>({0, 1}));
+        t.assert_true(reorder.prepare({}, 0));
+        t.assert_true(reorder.apply({}));
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -669,6 +804,7 @@ int main(int argc, char ** argv) {
     t.test("split",     test_split);
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
+    t.test("input_rows", test_input_row_order);
 
     return t.summary();
 }
