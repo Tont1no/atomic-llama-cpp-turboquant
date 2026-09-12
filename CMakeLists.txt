@@ -166,6 +166,8 @@ if (NOT DEFINED GGML_LLAMAFILE)
     set(GGML_LLAMAFILE_DEFAULT ON)
 endif()
 
+# P03-15: graphs are compiled in by default here on purpose (ggml's own default is OFF).
+# GGML_CUDA_DISABLE_GRAPHS turns them off at runtime; GGML_CUDA_GRAPHS=OFF removes them.
 if (NOT DEFINED GGML_CUDA_GRAPHS)
     set(GGML_CUDA_GRAPHS_DEFAULT ON)
 endif()

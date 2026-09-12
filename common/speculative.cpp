@@ -1409,7 +1409,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 i_block_beg[seq_id] = batch.n_tokens;
                 n_block    [seq_id] = n_block_tokens;
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
-                    common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, !is_dflash2);
+                    // P02-09: DFlash1 samples rows 1..n only, so the anchor row 0 does not need logits.
+                    // DSpark keeps logits on every row: its confidence walk indexes the masked nextn
+                    // buffer by output row, so a missing row would shift it.
+                    const bool want_logits = !is_dflash2 && (is_dspark || i > 0);
+                    common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, want_logits);
                 }
             }
         }

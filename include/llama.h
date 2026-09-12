@@ -919,6 +919,20 @@ extern "C" {
 
     typedef uint32_t llama_state_seq_flags;
 
+    // Capture complete sequence state at a caller-owned decode boundary. Metadata
+    // and tensor copies are independent of ctx. Currently supports CPU and CUDA.
+    // max_bytes bounds owned snapshot storage, excluding subsequent host output.
+    // Returns NULL on unsupported buffers, insufficient budget or capture failure.
+    struct llama_state_seq_snapshot;
+    LLAMA_API struct llama_state_seq_snapshot * llama_state_seq_snapshot_create(
+            struct llama_context * ctx, llama_seq_id seq_id, size_t max_bytes);
+    // Context-free materialization may run on another thread after capture returns.
+    // Keep the backend runtime loaded until snapshot_free; do not free concurrently.
+    LLAMA_API size_t llama_state_seq_snapshot_get_size(const struct llama_state_seq_snapshot * snapshot);
+    LLAMA_API size_t llama_state_seq_snapshot_get_data(const struct llama_state_seq_snapshot * snapshot,
+            uint8_t * dst, size_t size);
+    LLAMA_API void llama_state_seq_snapshot_free(struct llama_state_seq_snapshot * snapshot);
+
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,

@@ -3888,7 +3888,12 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // P02-10: the checkpoint restore below can only run for FULL/RS contexts, so do not pay for a
+                // sampler clone on PART contexts (plain KV), where use_ckpt_tgt is always false
+                common_sampler_ptr smpl_save;
+                if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                    smpl_save = common_sampler_ptr(common_sampler_clone(slot.smpl.get()));
+                }
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());

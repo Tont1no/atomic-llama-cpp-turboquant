@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-state-snapshot.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -2995,6 +2996,15 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+llama_state_seq_snapshot * llama_context::state_seq_snapshot_create(llama_seq_id seq_id, size_t max_bytes) {
+    auto snapshot = std::make_unique<llama_state_seq_snapshot>(max_bytes);
+    snapshot->write(&io_magic, sizeof(io_magic));
+    snapshot->write(&seq_id, sizeof(seq_id));
+    state_seq_write_data(*snapshot, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    snapshot->freeze();
+    return snapshot.release();
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -4107,6 +4117,31 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
     return ctx->state_seq_get_size(seq_id, flags);
+}
+
+llama_state_seq_snapshot * llama_state_seq_snapshot_create(llama_context * ctx, llama_seq_id seq_id, size_t max_bytes) {
+    if (!ctx || !max_bytes) return nullptr;
+    try {
+        ctx->synchronize();
+        return ctx->state_seq_snapshot_create(seq_id, max_bytes);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_DEBUG("%s: capture skipped: %s\n", __func__, err.what());
+        return nullptr;
+    }
+}
+
+size_t llama_state_seq_snapshot_get_size(const llama_state_seq_snapshot * snapshot) {
+    return snapshot && snapshot->frozen ? snapshot->bytes : 0;
+}
+
+size_t llama_state_seq_snapshot_get_data(const llama_state_seq_snapshot * snapshot, uint8_t * dst, size_t size) {
+    if (!snapshot) return 0;
+    try { return snapshot->materialize(dst, size); }
+    catch (const std::exception &) { return 0; }
+}
+
+void llama_state_seq_snapshot_free(llama_state_seq_snapshot * snapshot) {
+    delete snapshot;
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {

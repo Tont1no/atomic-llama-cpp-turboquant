@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#include "graph-policy.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -1230,6 +1231,8 @@ struct ggml_tensor_extra_gpu {
 
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
+    explicit ggml_cuda_graph(const ggml_cuda_graph_policy & policy) : policy(policy) {}
+
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
@@ -1254,9 +1257,10 @@ struct ggml_cuda_graph {
     };
     std::vector<node_properties> node_props;
 
+    const ggml_cuda_graph_policy policy;
+
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return policy.is_enabled(disable_due_to_gpu_arch);
     }
 #endif
 };
@@ -1425,6 +1429,8 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
+    const ggml_cuda_graph_policy graph_policy;
+
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
@@ -1448,7 +1454,7 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>(graph_policy)).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
