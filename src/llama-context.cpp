@@ -4120,14 +4120,26 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 llama_state_seq_snapshot * llama_state_seq_snapshot_create(llama_context * ctx, llama_seq_id seq_id, size_t max_bytes) {
+    return llama_state_seq_snapshot_create_ex(ctx, seq_id, max_bytes, nullptr);
+}
+
+llama_state_seq_snapshot * llama_state_seq_snapshot_create_ex(llama_context * ctx, llama_seq_id seq_id,
+        size_t max_bytes, llama_state_seq_snapshot_status * status) {
+    if (status) *status = LLAMA_STATE_SEQ_SNAPSHOT_INVALID;
     if (!ctx || !max_bytes) return nullptr;
     try {
         ctx->synchronize();
-        return ctx->state_seq_snapshot_create(seq_id, max_bytes);
-    } catch (const std::exception & err) {
-        LLAMA_LOG_DEBUG("%s: capture skipped: %s\n", __func__, err.what());
-        return nullptr;
+        auto * result = ctx->state_seq_snapshot_create(seq_id, max_bytes);
+        if (status) *status = LLAMA_STATE_SEQ_SNAPSHOT_OK;
+        return result;
+    } catch (const llama_state_snapshot_error & err) {
+        if (status) *status = err.status;
+    } catch (const std::bad_alloc &) {
+        if (status) *status = LLAMA_STATE_SEQ_SNAPSHOT_ALLOCATION;
+    } catch (...) {
+        if (status) *status = LLAMA_STATE_SEQ_SNAPSHOT_FAILED;
     }
+    return nullptr;
 }
 
 size_t llama_state_seq_snapshot_get_size(const llama_state_seq_snapshot * snapshot) {

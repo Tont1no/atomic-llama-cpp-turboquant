@@ -924,6 +924,19 @@ extern "C" {
     // max_bytes bounds owned snapshot storage, excluding subsequent host output.
     // Returns NULL on unsupported buffers, insufficient budget or capture failure.
     struct llama_state_seq_snapshot;
+    enum llama_state_seq_snapshot_status {
+        LLAMA_STATE_SEQ_SNAPSHOT_OK = 0,
+        LLAMA_STATE_SEQ_SNAPSHOT_INVALID,
+        LLAMA_STATE_SEQ_SNAPSHOT_BUDGET,
+        LLAMA_STATE_SEQ_SNAPSHOT_UNSUPPORTED,
+        LLAMA_STATE_SEQ_SNAPSHOT_ALLOCATION,
+        LLAMA_STATE_SEQ_SNAPSHOT_FAILED,
+        LLAMA_STATE_SEQ_SNAPSHOT_STATUS_COUNT
+    };
+    // Optional fixed diagnostic code; no backend exception text or source data.
+    LLAMA_API struct llama_state_seq_snapshot * llama_state_seq_snapshot_create_ex(
+            struct llama_context * ctx, llama_seq_id seq_id, size_t max_bytes,
+            enum llama_state_seq_snapshot_status * status);
     LLAMA_API struct llama_state_seq_snapshot * llama_state_seq_snapshot_create(
             struct llama_context * ctx, llama_seq_id seq_id, size_t max_bytes);
     // Context-free materialization may run on another thread after capture returns.
