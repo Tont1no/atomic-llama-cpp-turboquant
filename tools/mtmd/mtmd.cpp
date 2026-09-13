@@ -2270,6 +2270,26 @@ const mtmd_image_tokens * mtmd_input_chunk_get_tokens_image(const mtmd_input_chu
     return nullptr;
 }
 
+size_t mtmd_input_chunk_get_memory_size(const mtmd_input_chunk * chunk) {
+    size_t bytes = sizeof(*chunk) + chunk->tokens_text.capacity() * sizeof(llama_token);
+    const auto add_batch = [&](const clip_image_f32_batch & batch, const std::string & id) {
+        size_t size = batch.entries.capacity() * sizeof(clip_image_f32) + id.capacity();
+        for (const auto & image : batch.entries) {
+            if (!image.is_placeholder()) {
+                size += image.get_ro_buf().capacity() * sizeof(float);
+            }
+        }
+        return size;
+    };
+    if (chunk->tokens_image) {
+        bytes += sizeof(*chunk->tokens_image) + add_batch(chunk->tokens_image->batch_f32, chunk->tokens_image->id);
+    }
+    if (chunk->tokens_audio) {
+        bytes += sizeof(*chunk->tokens_audio) + add_batch(chunk->tokens_audio->batch_f32, chunk->tokens_audio->id);
+    }
+    return bytes;
+}
+
 size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         return chunk->tokens_text.size();

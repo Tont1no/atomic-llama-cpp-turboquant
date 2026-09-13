@@ -3946,7 +3946,11 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                if (!common_speculative_accept(spec.get(), slot.id, accepted.size() - 1)) {
+                    send_error(slot, "accepted draft state synchronization failed", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -4232,12 +4236,88 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+static std::string prepared_prompt_owner(const server_http_req & req) {
+    std::string owner;
+    for (const auto & header : req.headers) {
+        std::string name = header.first;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (name == "authorization") {
+            owner += header.second + '\n';
+        }
+    }
+    return owner;
+}
+
+std::string server_routes::cache_prepared_prompt(const server_http_req & req, std::string body, server_tokens tokens) {
+    constexpr size_t limit = 128 * 1024 * 1024;
+    const std::string owner = prepared_prompt_owner(req);
+    const size_t bytes = tokens.memory_size() + body.capacity() + owner.capacity() + 4096;
+    if (bytes > limit || req.should_stop()) {
+        return {};
+    }
+    // Each random-device sample contributes a full 32 bits to this bearer capability.
+    std::random_device random;
+    const char * hex = "0123456789abcdef";
+    std::string id;
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t value = random();
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            id += hex[(value >> shift) & 15];
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(mutex_prepared);
+    for (auto it = prepared_prompts.begin(); it != prepared_prompts.end();) {
+        if (it->second.expires <= now) {
+            prepared_bytes -= it->second.bytes;
+            it = prepared_prompts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (prepared_prompts.count(id)) {
+        return {};
+    }
+    while (!prepared_prompts.empty() && (prepared_prompts.size() >= 8 || prepared_bytes + bytes > limit)) {
+        prepared_bytes -= prepared_prompts.begin()->second.bytes;
+        prepared_prompts.erase(prepared_prompts.begin());
+    }
+    prepared_prompts.emplace(id, prepared_prompt{owner, std::move(body), std::move(tokens), now + std::chrono::seconds(60), bytes});
+    prepared_bytes += bytes;
+    return id;
+}
+
+bool server_routes::take_prepared_prompt(const server_http_req & req, const std::string & id, prepared_prompt & out) {
+    if (id.size() != 64 || req.should_stop()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_prepared);
+    const auto it = prepared_prompts.find(id);
+    if (it == prepared_prompts.end() || it->second.owner != prepared_prompt_owner(req)) {
+        return false;
+    }
+    const bool fresh = it->second.expires > std::chrono::steady_clock::now();
+    prepared_bytes -= it->second.bytes;
+    if (fresh) {
+        out = std::move(it->second);
+    }
+    prepared_prompts.erase(it);
+    return fresh;
+}
+
+void server_routes::clear_prepared_prompts() {
+    std::lock_guard<std::mutex> lock(mutex_prepared);
+    prepared_prompts.clear();
+    prepared_bytes = 0;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type) {
+            task_response_type res_type,
+            server_tokens * prepared) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -4269,7 +4349,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (prepared) {
+            inputs.push_back(std::move(*prepared));
+        } else if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
@@ -4961,16 +5043,34 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        prepared_prompt prepared;
+        json body_parsed;
+        const bool has_prepared = body.contains("prepared_prompt_id");
+        if (has_prepared) {
+            if (!take_prepared_prompt(req, body.at("prepared_prompt_id").get<std::string>(), prepared)) {
+                res->error(format_error_response("prepared_prompt_expired_or_consumed", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            body_parsed = json::parse(prepared.body);
+            // Prompt/template/tool inputs stay bound to the measured request.
+            for (const char * key : {"model", "n_predict", "stream", "stream_options", "temperature", "top_p", "top_k", "seed", "cache_prompt", "cache_key"}) {
+                if (body.contains(key)) {
+                    body_parsed[key] = body.at(key);
+                }
+            }
+            if (body.contains("max_tokens") && !body.contains("n_predict")) {
+                body_parsed["n_predict"] = body.at("max_tokens");
+            }
+        } else {
+            body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
             body_parsed,
             files,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+            TASK_RESPONSE_TYPE_OAI_CHAT,
+            has_prepared ? &prepared.tokens : nullptr);
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
@@ -5549,16 +5649,27 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
 
     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
     size_t n_tokens;
+    server_tokens prepared;
+    const bool prepare = res_type == TASK_RESPONSE_TYPE_OAI_CHAT && mctx && !files.empty() && json_value(body, "ai_loader_prepare", false);
     if (mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt, true).size();
+        prepared = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, init_opt, !prepare);
+        n_tokens = prepared.size();
     } else {
         n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
     }
 
     json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};
+    if (prepare) {
+        body_parsed.erase("messages");
+        body_parsed.erase("ai_loader_prepare");
+        const auto id = cache_prepared_prompt(req, body_parsed.dump(), std::move(prepared));
+        if (!id.empty()) {
+            response["prepared_prompt_id"] = id;
+        }
+    }
     if (is_oai) {
         response["object"] = "response.input_tokens";
     }
@@ -5571,6 +5682,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
     std::unique_lock<std::mutex> lock(mutex_cache);
 
     if (is_sleeping) {
+        clear_prepared_prompts();
         cached_models  = get_res_models(*meta);
         cached_props   = get_res_props(*meta, params, true);
         cached_metrics = ctx_server.get_metrics();

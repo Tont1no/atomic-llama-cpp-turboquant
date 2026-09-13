@@ -117,6 +117,26 @@ def test_vision_chat_completion_token_count():
     assert res.body["input_tokens"] > 10
 
 
+def test_prepared_vision_prompt_is_exact_and_single_use():
+    server.start()
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What is this:"},
+        {"type": "image_url", "image_url": {"url": get_img_url("IMG_BASE64_URI_0")}},
+    ]}]}
+    counted = server.make_request("POST", "/chat/completions/input_tokens", data=body)
+    prepared = server.make_request("POST", "/chat/completions/input_tokens", data={**body, "ai_loader_prepare": True})
+    assert prepared.status_code == counted.status_code == 200
+    assert prepared.body["input_tokens"] == counted.body["input_tokens"]
+    request = {"prepared_prompt_id": prepared.body["prepared_prompt_id"],
+               "temperature": 0.0, "top_k": 1, "max_tokens": 8, "cache_prompt": False}
+    completed = server.make_request("POST", "/chat/completions", data=request)
+    assert completed.status_code == 200
+    assert completed.body["usage"]["prompt_tokens"] == counted.body["input_tokens"]
+    replay = server.make_request("POST", "/chat/completions", data=request)
+    assert replay.status_code == 400
+    assert "prepared_prompt_expired_or_consumed" in str(replay.body)
+
+
 @pytest.mark.parametrize(
     "prompt, image_data, success, re_content",
     [

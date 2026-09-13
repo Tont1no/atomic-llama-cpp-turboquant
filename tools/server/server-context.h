@@ -7,6 +7,7 @@
 #include "json.h"
 
 #include <cstddef>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -123,6 +124,7 @@ struct server_routes {
 
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
+        clear_prepared_prompts();
         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
     }
 
@@ -164,7 +166,8 @@ private:
             server_task_type type,
             const json & data,
             const std::vector<raw_buffer> & files,
-            task_response_type res_type);
+            task_response_type res_type,
+            server_tokens * prepared = nullptr);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
@@ -180,6 +183,20 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    struct prepared_prompt {
+        std::string owner;
+        std::string body;
+        server_tokens tokens;
+        std::chrono::steady_clock::time_point expires;
+        size_t bytes = 0;
+    };
+    std::mutex mutex_prepared;
+    std::map<std::string, prepared_prompt> prepared_prompts;
+    size_t prepared_bytes = 0;
+    std::string cache_prepared_prompt(const server_http_req & req, std::string body, server_tokens tokens);
+    bool take_prepared_prompt(const server_http_req & req, const std::string & id, prepared_prompt & out);
+    void clear_prepared_prompts();
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;

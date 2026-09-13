@@ -641,6 +641,16 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    struct llama_model_memory_ownership {
+        uint64_t file_mapped_bytes;
+        uint64_t private_host_bytes;
+        uint64_t device_bytes;
+        bool measured;
+    };
+    // Actual allocated weight buffers, including repacking. use_mmap alone
+    // does not establish that CPU weights avoid private committed memory.
+    LLAMA_API struct llama_model_memory_ownership llama_model_get_memory_ownership(const struct llama_model * model);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
@@ -1102,6 +1112,19 @@ extern "C" {
     // When accepting multiple outputs, accept a contiguous prefix in output order.
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
+
+    // One synchronized view of an output row. Pointers expire at the next decode
+    // or context mutation, just like the individual logits/candidate getters.
+    struct llama_sampling_output {
+        llama_token token;
+        const float * logits;
+        const float * probs;
+        const llama_token * candidates;
+        uint32_t logits_count;
+        uint32_t probs_count;
+        bool backend_logits;
+    };
+    LLAMA_API struct llama_sampling_output llama_get_sampling_output_ith(struct llama_context * ctx, int32_t i);
 
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().

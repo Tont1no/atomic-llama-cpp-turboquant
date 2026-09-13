@@ -5522,8 +5522,74 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+template <typename T>
+static __global__ void compact_kq_mask(const int32_t * keys, const int32_t * queries,
+        T * output, int64_t n_kv, int64_t count, bool causal) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+            i += int64_t(blockDim.x) * gridDim.x) {
+        const int32_t key = keys[i % n_kv];
+        output[i] = T(key >= 0 && (!causal || key <= queries[i / n_kv]) ? 0.0f : -INFINITY);
+    }
+}
+
+static bool ggml_backend_cuda_kq_mask_v1(ggml_backend_t backend, ggml_tensor * dst,
+        const int32_t * keys, const int32_t * queries, bool causal) {
+    if (!ggml_backend_is_cuda(backend) || !dst->buffer || !ggml_backend_buffer_is_cuda(dst->buffer) ||
+            (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32) || !ggml_is_contiguous(dst) ||
+            dst->ne[0] <= 0 || dst->ne[0] > (1 << 20) || dst->ne[1] < 32 || dst->ne[1] > 4096 ||
+            dst->ne[2] != 1 || dst->ne[3] != 1) return false;
+    auto & ctx = *(ggml_backend_cuda_context *) backend->context;
+    auto * buffer = (ggml_backend_cuda_buffer_context *) dst->buffer->context;
+    if (ctx.device != buffer->device) return false;
+    ggml_cuda_set_device(ctx.device);
+    ggml_cuda_pool_alloc<int32_t> key_data(ctx.pool(), dst->ne[0]);
+    ggml_cuda_pool_alloc<int32_t> query_data(ctx.pool(), dst->ne[1]);
+    auto stream = ctx.stream();
+    if (cudaMemcpyAsync(key_data.get(), keys, dst->ne[0] * sizeof(int32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaMemcpyAsync(query_data.get(), queries, dst->ne[1] * sizeof(int32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        cudaStreamSynchronize(stream);
+        return false;
+    }
+    const int64_t count = ggml_nelements(dst);
+    const int blocks = (int) std::min<int64_t>((count + 255) / 256, 65535);
+    if (dst->type == GGML_TYPE_F16)
+        compact_kq_mask<<<blocks, 256, 0, stream>>>(key_data.get(), query_data.get(), (half *) dst->data, dst->ne[0], count, causal);
+    else
+        compact_kq_mask<<<blocks, 256, 0, stream>>>(key_data.get(), query_data.get(), (float *) dst->data, dst->ne[0], count, causal);
+    const auto launched = cudaGetLastError();
+    const auto completed = cudaStreamSynchronize(stream);
+    return launched == cudaSuccess && completed == cudaSuccess;
+}
+
+// Private optional backend extension: 0 unsupported, 1 copied, -1 transfer error.
+// The caller synchronizes producers before entry. The copy completes before return.
+static int ggml_backend_cuda_tensor_copy_2d_v1(const ggml_tensor * src, ggml_tensor * dst,
+        size_t src_offset, size_t dst_offset, size_t width, size_t rows, size_t src_pitch, size_t dst_pitch) {
+    if (!src->buffer || !dst->buffer || !ggml_backend_buffer_is_cuda(src->buffer) ||
+            !ggml_backend_buffer_is_cuda(dst->buffer)) return 0;
+    auto * src_ctx = (ggml_backend_cuda_buffer_context *) src->buffer->context;
+    auto * dst_ctx = (ggml_backend_cuda_buffer_context *) dst->buffer->context;
+    if (ggml_cuda_get_physical_device(src_ctx->device) != ggml_cuda_get_physical_device(dst_ctx->device)) return 0;
+    const auto fits = [rows, width](size_t offset, size_t pitch, size_t bytes) {
+        return rows > 0 && width > 0 && pitch >= width && offset <= bytes && width <= bytes - offset &&
+            rows - 1 <= (bytes - offset - width) / pitch;
+    };
+    if (!fits(src_offset, src_pitch, ggml_nbytes(src)) || !fits(dst_offset, dst_pitch, ggml_nbytes(dst))) return -1;
+    ggml_cuda_set_device(src_ctx->device);
+    if (cudaMemcpy2DAsync((char *) dst->data + dst_offset, dst_pitch,
+            (const char *) src->data + src_offset, src_pitch, width, rows,
+            cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess) return -1;
+    return cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess ? 1 : -1;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_kq_mask_v1") == 0) {
+        return (void *) ggml_backend_cuda_kq_mask_v1;
+    }
+    if (strcmp(name, "ggml_backend_tensor_copy_2d_v1") == 0) {
+        return (void *) ggml_backend_cuda_tensor_copy_2d_v1;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

@@ -3,11 +3,17 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <functional>
 #include <vector>
+
+struct ggml_tensor;
+struct llama_ubatch;
+using llama_embd_input_callback = std::function<bool(ggml_tensor *, const llama_ubatch *)>;
 
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
+    const llama_embd_input_callback * embd_input_callback = nullptr;
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;

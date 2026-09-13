@@ -254,7 +254,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
-    auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_inp, cparams.embd_input_callback);
 
     inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
     ggml_set_input(inp_target->embd);

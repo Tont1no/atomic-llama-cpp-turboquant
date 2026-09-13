@@ -114,6 +114,11 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Default-off DFlash transfer; at most 64 MiB retained per target context.
+LLAMA_API bool llama_has_device_layer_inputs(struct llama_context * ctx, const int32_t * ids, size_t count);
+LLAMA_API int32_t llama_decode_layer_inputs(struct llama_context * dst, struct llama_context * src,
+        struct llama_batch batch, const int32_t * ids, size_t count, size_t row_offset);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

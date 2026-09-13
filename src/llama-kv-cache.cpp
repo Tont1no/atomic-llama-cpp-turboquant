@@ -1732,8 +1732,39 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+bool llama_kv_cache::supports_compact_mask(const llama_ubatch & ubatch) const {
+    // Narrow exact lane: one stream/owner, ordinary positions, no ALiBi or SWA.
+    // Other geometries keep their existing host implementation.
+    if (n_stream != 1 || hparams.use_alibi || swa_type != LLAMA_SWA_TYPE_NONE ||
+            ubatch.is_pos_2d() || ubatch.n_seqs_unq != 1 || ubatch.n_tokens < 32 || ubatch.n_tokens > 4096) return false;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != ubatch.seq_id[0][0] || ubatch.pos[i] < 0) return false;
+    }
+    return true;
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
+
+    if (std::strcmp(dst->name, "attn_inp_kq_mask_compact") == 0) {
+        if (!supports_compact_mask(*ubatch) || dst->ne[0] <= 0 || dst->ne[0] > (1 << 20))
+            throw std::runtime_error("compact mask geometry changed");
+        ggml_backend_t backend = nullptr;
+        std::memcpy(&backend, dst->op_params, sizeof(backend));
+        using Fill = bool (*)(ggml_backend_t, ggml_tensor *, const int32_t *, const int32_t *, bool);
+        auto device = ggml_backend_get_device(backend);
+        auto fill = (Fill) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),
+                "ggml_backend_kq_mask_v1");
+        if (!fill) throw std::runtime_error("compact mask backend unavailable");
+        const auto seq = ubatch->seq_id[0][0];
+        const auto & cells = v_cells[0];
+        std::vector<int32_t> positions(dst->ne[0], -1);
+        for (size_t i = 0; i < positions.size(); ++i)
+            if (!cells.is_empty(i) && cells.seq_has(i, seq)) positions[i] = cells.pos_get(i);
+        if (!fill(backend, dst, positions.data(), ubatch->pos, causal_attn))
+            throw std::runtime_error("compact mask transfer failed");
+        return;
+    }
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -2716,6 +2747,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::supports_compact_mask(const llama_ubatch & ubatch) const {
+    return kv->supports_compact_mask(ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

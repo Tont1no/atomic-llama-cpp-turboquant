@@ -5,6 +5,21 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+// Opt-in qualification range for direct quantized-KV vector attention.
+// Zero retains the hardware-specific default; no production threshold is guessed.
+static inline int ggml_cuda_fattn_quant_vec_max_batch() {
+    static const int value = []() {
+        const char * text = std::getenv("GGML_CUDA_FA_QUANT_VEC_MAX_BATCH");
+        if (!text || !*text) {
+            return 0;
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(text, &end, 10);
+        return end != text && *end == '\0' && parsed >= 1 && parsed <= 16 ? int(parsed) : 0;
+    }();
+    return value;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -470,6 +485,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                if (Q->ne[1] <= ggml_cuda_fattn_quant_vec_max_batch()) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;

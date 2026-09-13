@@ -90,6 +90,9 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
+    bool has_device_layer_inputs(const int32_t * ids, size_t count) const;
+    int decode_layer_inputs(llama_context & source, const llama_batch & batch,
+            const int32_t * ids, size_t count, size_t row_offset);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -305,6 +308,15 @@ private:
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+    struct device_layer_input {
+        ggml_context_ptr context;
+        ggml_backend_buffer_ptr buffer;
+        ggml_tensor * tensor = nullptr;
+        size_t rows = 0;
+        bool host_current = false;
+    };
+    std::vector<device_layer_input> device_layer_inputs;
+    llama_embd_input_callback embd_input_callback;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

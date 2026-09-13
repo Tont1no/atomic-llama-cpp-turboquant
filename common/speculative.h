@@ -127,11 +127,17 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+bool common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// Complete host carry at a prefill boundary, paired with BOTH contexts' sequence
+// snapshots. Unlike the legacy recurrent-boundary stash, unsupported/multiple
+// implementations fail closed. No proposal may be in flight when called.
+bool common_speculative_get_checkpoint(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+bool common_speculative_set_checkpoint(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

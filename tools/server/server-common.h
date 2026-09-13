@@ -217,6 +217,7 @@ public:
     void set_token(llama_pos pos, llama_token id);
 
     size_t size() const { return tokens.size(); }
+    size_t memory_size() const;
 
     bool empty() const { return tokens.empty(); }
 

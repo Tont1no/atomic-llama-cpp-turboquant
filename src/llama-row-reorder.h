@@ -25,6 +25,10 @@ public:
         return n_rows != 0;
     }
 
+    bool identity() const {
+        return swaps.empty();
+    }
+
     bool prepare(const std::vector<int32_t> & input_ids, size_t expected_rows) {
         clear();
         if (input_ids.size() != expected_rows) {

@@ -393,6 +393,9 @@ static void test_backend_top_k_sampling(const test_params & params) {
 
     llama_token * candidates = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), batch_idx);
     uint32_t n_candidates = llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), batch_idx);
+    const auto output = llama_get_sampling_output_ith(test_ctx.ctx.get(), batch_idx);
+    GGML_ASSERT(output.backend_logits && output.logits == logits && output.logits_count == n_logits);
+    GGML_ASSERT(output.candidates == candidates && output.token == llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx));
     for (size_t i = 0; i < n_candidates; ++i) {
         printf("top_k candidate[%zu] = %d : %s\n", i, candidates[i],
                test_ctx.token_to_piece(candidates[i], false).c_str());

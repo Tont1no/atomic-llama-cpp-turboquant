@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -125,6 +126,8 @@ llama_context::llama_context(
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    device_layer_inputs.resize(hparams.n_layer() + 1);
+    cparams.embd_input_callback = &embd_input_callback;
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -973,11 +976,78 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
 }
 
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
-    output_reorder();
-
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
+    // Input-row reordering applies to every extracted layer at once. Materialize
+    // all retained device rows before consuming that permutation; otherwise the
+    // first getter would clear it and later layers would expose backend order.
+    for (size_t i = 0; i < device_layer_inputs.size(); ++i) {
+        auto & device = device_layer_inputs[i];
+        if (device.tensor && device.rows && !device.host_current) {
+            GGML_ASSERT(embd_layer_inp[i].has_data());
+            ggml_backend_tensor_get(device.tensor, embd_layer_inp[i].data, 0,
+                    device.rows * model.hparams.n_embd * sizeof(float));
+            device.host_current = true;
+        }
+    }
+    output_reorder();
+
     return embd_layer_inp[lid].data;
+}
+
+bool llama_context::has_device_layer_inputs(const int32_t * ids, size_t count) const {
+    // The retained tensors use graph/backend row order. Until a device-side
+    // permutation exists, reordered batches must use the exact host fallback.
+    if (!ids || !count || !input_reorder.identity()) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (ids[i] < 0 || (size_t) ids[i] >= device_layer_inputs.size() ||
+                !device_layer_inputs[ids[i]].tensor || !device_layer_inputs[ids[i]].rows) return false;
+    }
+    return true;
+}
+
+int llama_context::decode_layer_inputs(llama_context & source, const llama_batch & batch,
+        const int32_t * ids, size_t count, size_t row_offset) {
+    if (model.arch != LLM_ARCH_DFLASH || batch.token || !batch.embd || batch.n_tokens <= 0 ||
+            (uint32_t) batch.n_tokens > cparams.n_ubatch || embd_input_callback ||
+            !source.has_device_layer_inputs(ids, count) ||
+            count * source.model.hparams.n_embd != (size_t) model.hparams.n_embd_inp_enc()) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t rows = source.device_layer_inputs[ids[i]].rows;
+        if (row_offset > rows || (size_t) batch.n_tokens > rows - row_offset) return -1;
+    }
+    source.synchronize();
+    struct Reset { llama_embd_input_callback & value; ~Reset() { value = {}; } } reset{embd_input_callback};
+    embd_input_callback = [&](ggml_tensor * dst, const llama_ubatch * ubatch) {
+        // The speculative caller submits one sequence and one microbatch at a time.
+        if (ubatch->n_tokens != (uint32_t) batch.n_tokens || dst->type != GGML_TYPE_F32)
+            throw std::runtime_error("device feature microbatch changed");
+        const size_t width = source.model.hparams.n_embd * sizeof(float);
+        using Copy = int (*)(const ggml_tensor *, ggml_tensor *, size_t, size_t, size_t, size_t, size_t, size_t);
+        for (size_t i = 0; i < count; ++i) {
+            auto * src = source.device_layer_inputs[ids[i]].tensor;
+            auto device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+            auto copy = device ? (Copy) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),
+                    "ggml_backend_tensor_copy_2d_v1") : nullptr;
+            const int result = copy ? copy(src, dst, row_offset * width, i * width, width,
+                    batch.n_tokens, width, count * width) : 0;
+            if (result < 0) throw std::runtime_error("device feature transfer failed");
+            if (result == 0) {
+                // CPU/off-device placement keeps an exact, bounded host fallback.
+                std::vector<float> row(width / sizeof(float));
+                for (int j = 0; j < batch.n_tokens; ++j) {
+                    ggml_backend_tensor_get(src, row.data(), (row_offset + j) * width, width);
+                    ggml_backend_tensor_set(dst, row.data(), ((size_t) j * count + i) * width, width);
+                }
+            }
+        }
+        return true;
+    };
+    try { return decode(batch); }
+    catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
+        return -1;
+    }
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -2237,6 +2307,46 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+        auto & retained = device_layer_inputs[il];
+        if (token_offset == 0) retained.rows = 0;
+        const char * bridge = std::getenv("LLAMA_DFLASH_DEVICE_FEATURES");
+        const size_t enabled = std::count(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true);
+        const size_t layer_bytes = (size_t) model.hparams.n_embd * cparams.n_batch * sizeof(float);
+        auto buft = ggml_backend_buffer_get_type(t->buffer);
+        auto device = ggml_backend_buft_get_device(buft);
+        const bool supported = device && !ggml_backend_buffer_is_host(t->buffer) &&
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),
+                "ggml_backend_tensor_copy_2d_v1");
+        if (bridge && std::strcmp(bridge, "1") == 0 && supported && enabled &&
+                layer_bytes <= (60ULL << 20) / enabled) {
+            if (!retained.tensor || ggml_backend_buffer_get_type(retained.buffer.get()) != buft) {
+                // A placement change materializes earlier chunks before releasing their buffer.
+                if (retained.rows) get_embeddings_layer_inp(il);
+                retained = {};
+                retained.context.reset(ggml_init({ggml_tensor_overhead() + 1024, nullptr, true}));
+                if (retained.context) {
+                    retained.tensor = ggml_new_tensor_2d(retained.context.get(), GGML_TYPE_F32,
+                            model.hparams.n_embd, cparams.n_batch);
+                    retained.buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(retained.context.get(), buft));
+                    if (!retained.buffer) retained = {};
+                }
+            }
+            // A new allocation mid-batch lacks the earlier rows; fall back for that batch.
+            if (retained.tensor && (token_offset == 0 || retained.rows == token_offset)) {
+                ggml_backend_synchronize(backend);
+                ggml_tensor slice = *t;
+                slice.buffer = retained.buffer.get();
+                slice.data = (char *) retained.tensor->data + dst_offset * sizeof(float);
+                slice.view_src = nullptr;
+                slice.view_offs = 0;
+                ggml_backend_tensor_copy(t, &slice);
+                retained.rows = token_offset + n_tokens;
+                retained.host_current = false;
+                continue;
+            }
+        }
+        if (retained.rows) get_embeddings_layer_inp(il);
+        retained.rows = 0;
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
 }
@@ -2298,6 +2408,23 @@ void llama_context::output_reorder() {
     output_swaps.clear();
 
     if (input_reorder.pending()) {
+        // Any output getter can consume this permutation. Preserve every layer
+        // before it runs, then invalidate device order for this batch. Identity
+        // permutations need no host transfer and remain eligible for D2D.
+        if (!input_reorder.identity()) {
+            for (size_t i = 0; i < device_layer_inputs.size(); ++i) {
+                auto & device = device_layer_inputs[i];
+                if (device.tensor && device.rows) {
+                    GGML_ASSERT(embd_layer_inp[i].has_data());
+                    if (!device.host_current) {
+                        ggml_backend_tensor_get(device.tensor, embd_layer_inp[i].data, 0,
+                                device.rows * model.hparams.n_embd * sizeof(float));
+                        device.host_current = true;
+                    }
+                    device.rows = 0;
+                }
+            }
+        }
         std::vector<llama_row_reorder::buffer> input_buffers;
         for (auto & layer : embd_layer_inp) {
             if (layer.has_data()) {
@@ -3847,6 +3974,15 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     return ctx->get_embeddings_layer_inp(lid);
 }
 
+bool llama_has_device_layer_inputs(llama_context * ctx, const int32_t * ids, size_t count) {
+    return ctx && ctx->has_device_layer_inputs(ids, count);
+}
+
+int32_t llama_decode_layer_inputs(llama_context * dst, llama_context * src, llama_batch batch,
+        const int32_t * ids, size_t count, size_t row_offset) {
+    return dst && src ? dst->decode_layer_inputs(*src, batch, ids, count, row_offset) : -1;
+}
+
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
 }
@@ -3855,6 +3991,22 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+llama_sampling_output llama_get_sampling_output_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    llama_sampling_output out{};
+    out.token = ctx->get_sampled_token_ith(i);
+    out.logits = ctx->get_sampled_logits_ith(i);
+    out.backend_logits = out.logits != nullptr;
+    out.probs = ctx->get_sampled_probs_ith(i);
+    out.candidates = ctx->get_sampled_candidates_ith(i);
+    out.probs_count = out.probs ? static_cast<uint32_t>(ctx->get_sampled_probs_count(i)) : 0;
+    out.logits_count = out.backend_logits ? static_cast<uint32_t>(ctx->get_sampled_logits_count(i)) : llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (!out.backend_logits) {
+        out.logits = ctx->get_logits_ith(i);
+    }
+    return out;
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {

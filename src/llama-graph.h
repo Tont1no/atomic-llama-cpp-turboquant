@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-cparams.h"
 
 #include <cstdint>
 #include <vector>
@@ -125,7 +126,8 @@ using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
-    llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
+    llm_graph_input_embd(int64_t n_embd, const llama_embd_input_callback * callback = nullptr)
+        : n_embd(n_embd), callback(callback) {}
     virtual ~llm_graph_input_embd() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -136,6 +138,7 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+    const llama_embd_input_callback * callback = nullptr;
 };
 
 // similar to llm_graph_input_embd but with an additional hidden state input

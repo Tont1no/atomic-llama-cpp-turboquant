@@ -550,6 +550,14 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
+size_t server_tokens::memory_size() const {
+    size_t bytes = sizeof(*this) + tokens.capacity() * sizeof(llama_token);
+    for (const auto & item : map_idx_to_media) {
+        bytes += sizeof(item) + 4 * sizeof(void *) + mtmd_input_chunk_get_memory_size(item.second.get());
+    }
+    return bytes;
+}
+
 std::vector<char> server_tokens::serialize() const {
     static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
 

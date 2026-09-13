@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -35,6 +36,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1171,6 +1173,7 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    std::set<ggml_backend_buffer_t> file_mapped_buffers;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1797,6 +1800,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
                 bufs.emplace_back(buf);
+                pimpl->file_mapped_buffers.insert(buf);
                 buf_map.emplace(idx, buf);
             }
         } else {
@@ -1862,6 +1866,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (ml.no_alloc) {
         return true;
     }
+
+    const auto ownership = memory_ownership();
+    LLAMA_LOG_INFO("%s: weight ownership: file_mapped=%" PRIu64 " private_host=%" PRIu64 " device=%" PRIu64 " bytes\n",
+            __func__, ownership.file_mapped_bytes, ownership.private_host_bytes, ownership.device_bytes);
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
@@ -1944,6 +1952,31 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+llama_model_memory_ownership llama_model::memory_ownership() const {
+    llama_model_memory_ownership out{};
+    if (hparams.no_alloc || pimpl->ctxs_bufs.empty()) {
+        return out;
+    }
+    for (const auto & item : pimpl->ctxs_bufs) {
+        for (const auto & buffer : item.second) {
+            const auto size = ggml_backend_buffer_get_size(buffer.get());
+            if (pimpl->file_mapped_buffers.count(buffer.get())) {
+                out.file_mapped_bytes += size;
+            } else if (ggml_backend_buffer_is_host(buffer.get())) {
+                out.private_host_bytes += size;
+            } else {
+                out.device_bytes += size;
+            }
+        }
+    }
+    out.measured = true;
+    return out;
+}
+
+llama_model_memory_ownership llama_model_get_memory_ownership(const llama_model * model) {
+    return model ? model->memory_ownership() : llama_model_memory_ownership{};
 }
 
 uint64_t llama_model::n_elements() const {
