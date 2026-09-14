@@ -101,6 +101,12 @@ NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU perfor
 ```
 
 When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
+
+An NCCL-enabled CUDA build also enables CUDA peer access for the VMM path as
+part of NCCL setup. There is no separate compile-time batch-size knob for that
+behavior; the old `GGML_CUDA_PEER_MAX_BATCH_SIZE` cache option was unused and
+has been removed. The runtime `GGML_CUDA_P2P` switch below remains the opt-in
+for non-NCCL peer copies.
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
