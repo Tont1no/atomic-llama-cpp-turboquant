@@ -10394,6 +10394,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // vec-dot/dequant reference implementation for the backend comparison.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    // Two-column VEC (NQ=8, speculative decode) and the prefill dispatch that
+    // moves NQ above GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH onto the MMA-F16 kernel
+    // over a transient F16 copy of the strided K/V views. NQ=256 with KV=4096
+    // is one n_ubatch tile of the measured 32K TQ4 prefill regression.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 4096, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
 
     // Hybrid PyramidKV contract: D64 is padded to D128, one softmax spans
     // TQ4 cold rows and F16 hot rows, and position metadata is per KV head.
@@ -10836,6 +10844,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // TURBO4_0 KV: decode (NQ=1, direct vector kernel) against prefill tiles
+    // (NQ=256, MMA-F16 over a transient F16 copy) at the VibeThinker D128/2-KV-head
+    // geometry with a 32K cache, next to the F16 cache as the reference.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

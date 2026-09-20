@@ -20,6 +20,27 @@ static inline int ggml_cuda_fattn_quant_vec_max_batch() {
     return value;
 }
 
+// Largest Q column count that keeps symmetric TURBO4_0 K/V on the direct
+// vector kernel. The vector kernel reads the quantized cache once per two Q
+// columns; the MMA path reads it once, writes and reads it again as F16 (about
+// nine cache passes), so it only wins for wider Q tiles such as prefill. The
+// F16 copy lives in the FLASH_ATTN_EXT allocation (see
+// ggml_cuda_flash_attn_ext_get_alloc_size). Override for A/B runs with
+// GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH=0..1024 (0 sends single-token decode
+// through the MMA path as well).
+static inline int ggml_cuda_fattn_turbo4_vec_max_batch() {
+    static const int value = []() {
+        const char * text = std::getenv("GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH");
+        if (!text || !*text) {
+            return 16;
+        }
+        char * end = nullptr;
+        const long parsed = std::strtol(text, &end, 10);
+        return end != text && *end == '\0' && parsed >= 0 && parsed <= 1024 ? int(parsed) : 16;
+    }();
+    return value;
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -434,8 +455,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const bool has_turbo4_kv = K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0;
     if (has_turbo4_kv) {
-        // TQ4 stays quantized through the direct vector kernel. Returning NONE
-        // for unsupported shapes prevents the generic F16-cache fallbacks.
+        // Decode-sized Q tiles stay quantized through the direct vector kernel.
+        // Returning NONE for unsupported shapes prevents the generic fallbacks.
         if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
                 K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
                 (Q->ne[0] != 128 && Q->ne[0] != 256) ||
@@ -445,6 +466,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 (mask != nullptr && (mask->type != GGML_TYPE_F16 ||
                     Q->ne[2] % mask->ne[2] != 0 || Q->ne[3] % mask->ne[3] != 0))) {
             return BEST_FATTN_KERNEL_NONE;
+        }
+        // Prefill-sized Q tiles (n_ubatch queries against the whole cache) ran
+        // the two-column vector kernel once per column pair over every KV row,
+        // an order of magnitude slower than F16 at 32K. Route them through the
+        // tensor-core kernel on a transient F16 copy of the layer's K/V, the
+        // same way Q4_0/Q8_0 caches are handled above the vector batch limit.
+        const int cc = ggml_cuda_info().devices[device].cc;
+        if (Q->ne[1] > ggml_cuda_fattn_turbo4_vec_max_batch() &&
+                turing_mma_available(cc) && (mask == nullptr || mask->ne[2] == 1)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
         }
         return BEST_FATTN_KERNEL_VEC;
     }
