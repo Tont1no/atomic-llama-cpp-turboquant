@@ -10432,6 +10432,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 1, 1024, 96, 1, true,  false, true));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 16, 2, 1, 1024, 96, 1, true,  false, false, 0.0f, 10.0f));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 16, 2, 1, 1024, 96, 1, true,  true,  false));
+    // Decode geometries with many key splits (16 keys per split): every
+    // split must merge exactly, including ranges that are entirely masked.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 1, 1280, 1024, 1, true,  false, false));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 1, 1280, 1024, 1, true,  false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 32, 4, 1, 4864, 1024, 1, true,  false, false));
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
