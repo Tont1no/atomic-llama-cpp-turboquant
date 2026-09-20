@@ -10402,6 +10402,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 4096, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    // GQA bundling in the TQ4 vector kernel (NQ=1): group sizes 2, 4, 3 (tail
+    // column past the group), 16 (two column tiles per K/V head), several
+    // sequences, D256, and a 4096-row cache that needs the parallel-block
+    // combine. The 2-KV-head / GQA-8 cases above already cover the common shape.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {2, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {3, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 3}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
 
     // Hybrid PyramidKV contract: D64 is padded to D128, one softmax spans
     // TQ4 cold rows and F16 hot rows, and position metadata is per KV head.
@@ -10849,6 +10861,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // (NQ=256, MMA-F16 over a transient F16 copy) at the VibeThinker D128/2-KV-head
     // geometry with a 32K cache, next to the F16 cache as the reference.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1},   2048,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1},   8192,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 131072,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 32768,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

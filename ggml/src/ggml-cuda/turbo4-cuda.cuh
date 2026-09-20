@@ -32,6 +32,19 @@ static __device__ __forceinline__ uint8_t ggml_cuda_turbo4_nearest(const float v
     return index;
 }
 
+// Warp-resident centroid table. Indexing the __constant__ table with a
+// different code per lane serialises the constant cache one address at a
+// time (up to 16 replays per warp load); holding centroid[lane & 15] in a
+// register and shuffling it by code is a single instruction. Every lane of
+// the warp must call the shuffle (uniform control flow).
+static __device__ __forceinline__ float ggml_cuda_turbo4_centroid_lane() {
+    return ggml_cuda_turbo4_centroids[threadIdx.x & 0x0f];
+}
+
+static __device__ __forceinline__ float ggml_cuda_turbo4_centroid_shfl(const uint8_t code, const float lane_centroid) {
+    return __shfl_sync(0xFFFFFFFF, lane_centroid, code & 0x0f, 32);
+}
+
 static __device__ __forceinline__ float ggml_cuda_turbo4_dequant_element(
         const block_turbo4_0 * block, const int index, const float norm) {
     const uint8_t packed = block->qs[index >> 1];

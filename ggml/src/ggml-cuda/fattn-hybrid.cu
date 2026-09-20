@@ -6,12 +6,17 @@
 #include <cstdint>
 #include <limits>
 
+// One TQ4 element of a cold row. The centroid comes from the warp-resident
+// table (see ggml_cuda_turbo4_centroid_shfl): every lane calls this with the
+// same key row and a different element, so the shuffle is warp-uniform.
 static __device__ __forceinline__ float ggml_cuda_hybrid_turbo4_value(
-        const char * row, const int index) {
+        const char * row, const int index, const float lane_centroid) {
     const int block_index = index / GGML_TURBO4_QK;
     const int offset = index % GGML_TURBO4_QK;
     const block_turbo4_0 * block = (const block_turbo4_0 *) row + block_index;
-    return ggml_cuda_turbo4_dequant_element(block, offset, __half2float(block->norm));
+    const uint8_t packed = block->qs[offset >> 1];
+    const uint8_t code = (packed >> ((offset & 1) * 4)) & 0x0f;
+    return ggml_cuda_turbo4_centroid_shfl(code, lane_centroid) * __half2float(block->norm);
 }
 
 static __device__ __forceinline__ float ggml_cuda_hybrid_warp_sum(float value) {
@@ -102,6 +107,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
     }
     const int lane = threadIdx.x & 31;
     constexpr unsigned int warp_mask = 0xffffffffu;
+    const float lane_centroid = ggml_cuda_turbo4_centroid_lane();
 
     const int64_t iq3 = row/(NQ_HEADS*NQ);
     const int64_t iq2 = (row - iq3*NQ_HEADS*NQ)/NQ;
@@ -164,7 +170,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
         for (int64_t d = lane; d < D; d += 32) {
             const float key = hot
                 ? __half2float(*(const half *) (k_row + d*sizeof(half)))
-                : ggml_cuda_hybrid_turbo4_value(k_row, (int) d);
+                : ggml_cuda_hybrid_turbo4_value(k_row, (int) d, lane_centroid);
             dot += q_row[d]*key;
         }
         dot = ggml_cuda_hybrid_warp_sum(dot);
@@ -184,7 +190,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
         for (int64_t d = lane; d < D; d += 32) {
             const float value = hot
                 ? __half2float(*(const half *) (v_row + d*sizeof(half)))
-                : ggml_cuda_hybrid_turbo4_value(v_row, (int) d);
+                : ggml_cuda_hybrid_turbo4_value(v_row, (int) d, lane_centroid);
             output[d/32] = output[d/32]*old_scale + value*weight;
         }
         S = S*old_scale + weight;

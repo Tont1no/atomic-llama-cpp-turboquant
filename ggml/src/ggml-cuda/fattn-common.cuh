@@ -370,6 +370,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb/sizeof(float);
     float sum = 0.0f;
+    const float lane_centroid = ggml_cuda_turbo4_centroid_lane();
 
 #pragma unroll
     for (int i0 = 0; i0 < D/2; i0 += nthreads*cpy_ne) {
@@ -384,8 +385,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
             const uint8_t code1 = (packed >> 4) & 0x0f;
             const float norm = __half2float(K[block_index].norm);
             const float2 kv = make_float2(
-                ggml_cuda_turbo4_centroid(code0)*norm,
-                ggml_cuda_turbo4_centroid(code1)*norm);
+                ggml_cuda_turbo4_centroid_shfl(code0, lane_centroid)*norm,
+                ggml_cuda_turbo4_centroid_shfl(code1, lane_centroid)*norm);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             const half2 qv = ((const half2 *) Q_v)[i0/nthreads + i1];
@@ -685,6 +686,81 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
         }
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+// One TQ4 K row against ncols Q columns held in shared memory (GQA bundling:
+// the columns are the Q heads that share this K/V head). The row is decoded
+// once; every column reads the same Q pair, which is a shared-memory broadcast.
+// Q_sh holds ncols*(D/2) half2 (or float2 without V_DOT2_F32_F16_AVAILABLE),
+// column j at Q_sh + j*(D/2), already scaled.
+template <int D, int ncols, typename Q_t>
+static __device__ __forceinline__ void vec_dot_fattn_vec_KQ_turbo4_0_cols(
+        const char * __restrict__ K_c, const Q_t * __restrict__ Q_sh, float * __restrict__ sums) {
+    const block_turbo4_0 * K = (const block_turbo4_0 *) K_c;
+    const float lane_centroid = ggml_cuda_turbo4_centroid_lane();
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        sums[j] = 0.0f;
+    }
+#pragma unroll
+    for (int block_index = 0; block_index < D/GGML_TURBO4_QK; ++block_index) {
+        const float norm = __half2float(K[block_index].norm);
+        // qs starts 4 bytes into the 68-byte block, so word loads stay aligned.
+        const uint32_t * qs32 = (const uint32_t *) K[block_index].qs;
+#pragma unroll
+        for (int w = 0; w < GGML_TURBO4_QK/8; ++w) {
+            const uint32_t packed4 = qs32[w];
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const uint8_t packed = (packed4 >> (8*b)) & 0xff;
+                const int pair = block_index*(GGML_TURBO4_QK/2) + w*4 + b;
+                const float2 kv = make_float2(
+                    ggml_cuda_turbo4_centroid_shfl(packed & 0x0f, lane_centroid)*norm,
+                    ggml_cuda_turbo4_centroid_shfl((packed >> 4) & 0x0f, lane_centroid)*norm);
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    float2 qv;
+                    if constexpr (std::is_same<Q_t, half2>::value) {
+                        qv = __half22float2(Q_sh[j*(D/2) + pair]);
+                    } else {
+                        qv = Q_sh[j*(D/2) + pair];
+                    }
+                    sums[j] += kv.x*qv.x + kv.y*qv.y;
+                }
+            }
+        }
+    }
+}
+
+// Same as dequantize_V_turbo4_0 below, with the centroid table shuffled from
+// a lane register instead of read from the serialising constant cache. The
+// flash-attention vector kernel calls it from uniform control flow.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4_0_lane(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const float lane_centroid) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const int64_t block_index = i0/GGML_TURBO4_QK;
+    const int offset = i0%GGML_TURBO4_QK;
+    const float norm = __half2float(x[block_index].norm);
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+#pragma unroll
+    for (int i = 0; i < ne; ++i) {
+        const int index = offset + i;
+        const uint8_t packed = x[block_index].qs[index >> 1];
+        const uint8_t code = (packed >> ((index & 1) * 4)) & 0x0f;
+        const float value = ggml_cuda_turbo4_centroid_shfl(code, lane_centroid) * norm;
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same<T, half>::value) {
+            ((half *) dst)[i] = __float2half(value);
+        } else
+#endif
+        if constexpr (std::is_same<T, float>::value) {
+            ((float *) dst)[i] = value;
+        } else {
+            static_assert(std::is_same<T, void>::value, "unsupported type");
+        }
     }
 }
 
