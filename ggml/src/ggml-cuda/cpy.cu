@@ -241,7 +241,12 @@ static __global__ void cpy_turbo4_f32(
 
     const block_turbo4_0 * block = (const block_turbo4_0 *)(cx + x_offset);
     const float norm = __half2float(block->norm);
-    *(float *)(cdst + dst_offset + j*nb10) = ggml_cuda_turbo4_dequant_element(block, j, norm);
+    // The early return above is block-uniform, so the warp shuffle of the
+    // centroid table is safe here (see ggml_cuda_turbo4_centroid_shfl).
+    const uint8_t packed = block->qs[j >> 1];
+    const uint8_t code = (packed >> ((j & 1) * 4)) & 0x0f;
+    *(float *)(cdst + dst_offset + j*nb10) =
+        ggml_cuda_turbo4_centroid_shfl(code, ggml_cuda_turbo4_centroid_lane()) * norm;
 }
 
 template<typename src_t, typename dst_t>

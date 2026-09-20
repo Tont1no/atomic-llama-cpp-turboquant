@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 // One TQ4 element of a cold row. The centroid comes from the warp-resident
@@ -292,15 +293,33 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_merge_kernel(
     }
 }
 
+// One warp per (query row, key range). The kernel walks its keys serially
+// with a dependent load chain per key, so latency hiding comes only from
+// warps resident per SM: with 16 query heads and 32 splits a 5090 (170 SMs)
+// held under two warps per SM and the 1024+96 key perf case took 128 us.
+// Smaller key ranges and more splits put ten or more warps on every SM; the
+// merge kernel reduces any split count. GGML_CUDA_HYBRID_KEYS_PER_SPLIT and
+// GGML_CUDA_HYBRID_MAX_SPLIT override the defaults for A/B runs.
+static int ggml_cuda_hybrid_split_setting(const char * name, const int fallback, const int lo, const int hi) {
+    const char * text = std::getenv(name);
+    if (!text || !*text) {
+        return fallback;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(text, &end, 10);
+    return end != text && *end == '\0' && parsed >= lo && parsed <= hi ? int(parsed) : fallback;
+}
+
 static int ggml_cuda_hybrid_split_count(const int64_t n_keys) {
-    constexpr int64_t min_keys_for_split = 128;
-    constexpr int64_t target_keys_per_block = 64;
+    static const int target_keys_per_block = ggml_cuda_hybrid_split_setting("GGML_CUDA_HYBRID_KEYS_PER_SPLIT", 16, 1, 4096);
+    static const int max_split_limit       = ggml_cuda_hybrid_split_setting("GGML_CUDA_HYBRID_MAX_SPLIT", 512, 1, 4096);
+    constexpr int64_t min_keys_for_split = 32;
     if (n_keys < min_keys_for_split) {
         return 1;
     }
 
     const int device = ggml_cuda_get_device();
-    const int max_split_k = std::max(1, std::min(32, ggml_cuda_info().devices[device].nsm*2));
+    const int max_split_k = std::max(1, std::min(max_split_limit, ggml_cuda_info().devices[device].nsm*16));
     const int requested = (int) ((n_keys + target_keys_per_block - 1)/target_keys_per_block);
     return std::max(1, std::min(max_split_k, requested));
 }

@@ -447,6 +447,28 @@ private:
 
     std::vector<pyramidkv_c1_layer_state> pyramidkv_c1_layers;
 
+    // C1 index and position tensors the graph reads per layer, resident on
+    // the KV device. As per-layer graph inputs they lived in host memory and
+    // ggml_backend_sched synchronised the device once per input before
+    // copying it (about 150 stream syncs per decode token on a 36-layer
+    // model). They are rebuilt together with the pools; the graph views them
+    // per layer and set_input uploads each kind once per ubatch.
+    struct pyramidkv_c1_aux_tensors {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * k_positions    = nullptr; // I32 [pos_stride, n_layers]
+        ggml_tensor * hot_write_idxs = nullptr; // I32 [hot_stride, n_layers]
+        ggml_tensor * q_positions    = nullptr; // I32 [n_ubatch]
+        uint32_t pos_stride = 0;
+        uint32_t hot_stride = 0;
+        uint32_t n_ubatch   = 0;
+        std::vector<int32_t> stage_pos;
+        std::vector<int32_t> stage_hot;
+        std::vector<int32_t> stage_q;
+    };
+    pyramidkv_c1_aux_tensors pyramidkv_c1_aux;
+    bool pyramidkv_c1_aux_rebuild(std::string & error);
+
     std::vector<kv_layer> layers;
 
     // model layer id -> KV cache layer id

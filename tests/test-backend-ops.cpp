@@ -7535,8 +7535,8 @@ struct test_flash_attn_ext_hybrid : public test_case {
 struct test_flash_attn_ext_hybrid_perf : public test_flash_attn_ext_hybrid {
     static constexpr uint32_t input_seed = 0x54413450u;
 
-    test_flash_attn_ext_hybrid_perf()
-        : test_flash_attn_ext_hybrid(128, 16, 2, 1, 1024, 96, 1, true, false, false, 0.0f, 0.0f, false) {}
+    test_flash_attn_ext_hybrid_perf(int64_t nh = 16, int64_t nkv = 2, int64_t n_cold = 1024, int64_t n_hot = 96)
+        : test_flash_attn_ext_hybrid(128, nh, nkv, 1, n_cold, n_hot, 1, true, false, false, 0.0f, 0.0f, false) {}
 
     std::string vars() override {
         return test_flash_attn_ext_hybrid::vars() + ",seed=" + std::to_string(input_seed);
@@ -7553,7 +7553,8 @@ struct test_flash_attn_ext_hybrid_perf : public test_flash_attn_ext_hybrid {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        fprintf(stderr, "hybrid_perf_input seed=%" PRIu32 " logical_d=128 nh=16 nkv=2 nq=1 n_cold=1024 n_hot=96\n", input_seed);
+        fprintf(stderr, "hybrid_perf_input seed=%" PRIu32 " logical_d=128 nh=%" PRId64 " nkv=%" PRId64 " nq=1 n_cold=%" PRId64 " n_hot=%" PRId64 "\n",
+            input_seed, nh, nkv, n_cold, n_hot);
 
         auto fill_values = [&](ggml_tensor * t, uint32_t salt) {
             const size_t n = ggml_nelements(t);
@@ -10856,6 +10857,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // PyramidKV C1 hybrid decode at the Vibe (16/2 heads) and Qwen 27B (32/4)
+    // geometries: cold pool sizes after the once-selection, 1024 hot rows.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf(16, 2,  1280, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf(16, 2,  4864, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf(32, 4,  4864, 1024));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf(32, 4, 32768, 1024));
 
     // TURBO4_0 KV: decode (NQ=1, direct vector kernel) against prefill tiles
     // (NQ=256, MMA-F16 over a transient F16 copy) at the VibeThinker D128/2-KV-head
