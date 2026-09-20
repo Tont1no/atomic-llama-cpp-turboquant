@@ -276,6 +276,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
@@ -348,6 +351,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_HYBRID  = 500,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -365,6 +369,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             return true;
+        case GGML_TYPE_TURBO4_0:
+            return true;
         default:
             return false;
     }
@@ -381,6 +387,67 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * K_hot = dst->src[5];
+    const ggml_tensor * V_hot = dst->src[6];
+    const ggml_tensor * q_pos = dst->src[7];
+    const ggml_tensor * k_pos = dst->src[8];
+
+    if (K_hot != nullptr || V_hot != nullptr || q_pos != nullptr || k_pos != nullptr) {
+        const bool positions_ok = (q_pos == nullptr && k_pos == nullptr) ||
+            (Q != nullptr && K != nullptr && K_hot != nullptr && q_pos != nullptr && k_pos != nullptr &&
+             q_pos->type == GGML_TYPE_I32 &&
+             k_pos->type == GGML_TYPE_I32 && ggml_is_contiguous(q_pos) && ggml_is_contiguous(k_pos) &&
+             q_pos->ne[0] == Q->ne[1] && (q_pos->ne[1] == 1 || q_pos->ne[1] == Q->ne[2]) &&
+             (q_pos->ne[2] == 1 || q_pos->ne[2] == Q->ne[3]) && q_pos->ne[3] == 1 &&
+             k_pos->ne[0] == K->ne[1] + K_hot->ne[1] && k_pos->ne[1] == K->ne[2] &&
+             (k_pos->ne[2] == 1 || k_pos->ne[2] == Q->ne[3]) && k_pos->ne[3] == 1);
+        if (Q == nullptr || K == nullptr || V == nullptr || K_hot == nullptr || V_hot == nullptr ||
+                dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
+                K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
+                K_hot->type != GGML_TYPE_F16 || V_hot->type != GGML_TYPE_F16 ||
+                Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] || Q->ne[0] != K_hot->ne[0] ||
+                Q->ne[0] != V_hot->ne[0] || (Q->ne[0] != 128 && Q->ne[0] != 256) ||
+                K->ne[1] <= 0 || K_hot->ne[1] <= 0 || K->ne[1] != V->ne[1] ||
+                K_hot->ne[1] != V_hot->ne[1] || K->ne[2] != K_hot->ne[2] ||
+                K->ne[2] <= 0 || K_hot->ne[2] <= 0 || K->ne[2] != V->ne[2] ||
+                K_hot->ne[2] != V_hot->ne[2] || Q->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 ||
+                Q->ne[3] <= 0 || K->ne[3] <= 0 || V->ne[3] <= 0 ||
+                K_hot->ne[3] <= 0 || V_hot->ne[3] <= 0 ||
+                Q->ne[3] != K->ne[3] || Q->ne[3] != V->ne[3] ||
+                Q->ne[3] != K_hot->ne[3] || Q->ne[3] != V_hot->ne[3] ||
+                Q->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+                K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type) ||
+                K_hot->nb[0] != sizeof(ggml_fp16_t) ||
+                V_hot->nb[0] != sizeof(ggml_fp16_t) ||
+                (sinks != nullptr && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
+                    sinks->ne[0] != Q->ne[2])) || !positions_ok ||
+                (mask != nullptr && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) ||
+                    mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
+                    mask->ne[0] != K->ne[1] + K_hot->ne[1] || mask->ne[1] != Q->ne[1] ||
+                    Q->ne[2] % mask->ne[2] != 0 ||
+                    Q->ne[3] % mask->ne[3] != 0))) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_HYBRID;
+    }
+
+    const bool has_turbo4_kv = K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0;
+    if (has_turbo4_kv) {
+        // TQ4 stays quantized through the direct vector kernel. Returning NONE
+        // for unsupported shapes prevents the generic F16-cache fallbacks.
+        if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
+                K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
+                (Q->ne[0] != 128 && Q->ne[0] != 256) ||
+                Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] ||
+                K->ne[1] <= 0 || K->ne[1] % FATTN_KQ_STRIDE != 0 ||
+                Q->ne[2] <= 0 || K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 ||
+                (mask != nullptr && (mask->type != GGML_TYPE_F16 ||
+                    Q->ne[2] % mask->ne[2] != 0 || Q->ne[3] % mask->ne[3] != 0))) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -580,6 +647,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_HYBRID:
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -603,6 +672,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_HYBRID:
+            ggml_cuda_flash_attn_ext_hybrid(ctx, dst);
             break;
     }
 }

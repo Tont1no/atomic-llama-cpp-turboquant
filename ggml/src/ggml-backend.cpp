@@ -1623,6 +1623,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (input->buffer == NULL || input_cpy == NULL || input_cpy->buffer == NULL) {
+                // Name the offending graph leaf instead of failing inside a buffer getter
+                // with no tensor context (a bare GGML_ASSERT(buffer) in ggml-backend.cpp).
+                const struct ggml_tensor * src = input->view_src ? input->view_src : input;
+                GGML_LOG_ERROR("%s: split %d input %d '%s' (op %s, flags %d, view of '%s') has no backend buffer "
+                    "(copy %s); a graph leaf references released or never-allocated storage\n",
+                    __func__, split_id, input_id, ggml_get_name(input), ggml_op_desc(input), input->flags,
+                    input->view_src ? ggml_get_name(src) : "-",
+                    input_cpy == NULL ? "missing" : (input_cpy->buffer == NULL ? "unallocated" : "ok"));
+                GGML_ABORT("graph input without backend buffer");
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done

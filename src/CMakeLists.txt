@@ -36,6 +36,7 @@ add_library(llama
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
+            llama-pyramidkv-c1.cpp
             llama-quant.cpp
             llama-sampler.cpp
             llama-vocab.cpp
@@ -55,6 +56,10 @@ target_compile_definitions(llama PRIVATE
     LLAMA_VERSION="${LLAMA_VERSION}"
     LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
+
+option(LLAMA_PYRAMIDKV_C1_PHASE_TIMING "Measure C1 host wall-time phases in diagnostic builds" OFF)
+target_compile_definitions(llama PRIVATE
+    LLAMA_PYRAMIDKV_C1_PHASE_TIMING=$<BOOL:${LLAMA_PYRAMIDKV_C1_PHASE_TIMING}>)
 
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)

@@ -18,6 +18,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -51,7 +53,7 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, int64_t logical_n0 = -1) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
@@ -62,7 +64,8 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             thread_local std::default_random_engine gen(std::random_device{}());
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
+                data[i] = logical_n0 >= 0 && i % tensor->ne[0] >= (size_t) logical_n0
+                    ? 0.0f : distribution(gen);
             }
         };
 
@@ -7206,6 +7209,408 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with cold TQ4 and a protected hot F16 window.
+// A dense F32 attention built from the dequantized rows is compared with the
+// split op; CUDA must preserve one softmax state across both key segments.
+struct test_flash_attn_ext_hybrid : public test_case {
+    const int64_t logical_d;
+    const int64_t nh;
+    const int64_t nkv;
+    const int64_t nq;
+    const int64_t n_cold;
+    const int64_t n_hot;
+    const int64_t nseq;
+    const bool positions;
+    const bool all_masked;
+    const bool cold_masked;
+    const float max_bias;
+    const float logit_softcap;
+    const bool sinks;
+    ggml_tensor * dense_ref = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR13(logical_d, nh, nkv, nq, n_cold, n_hot, nseq, positions, all_masked, cold_masked, max_bias, logit_softcap, sinks);
+    }
+
+    double max_nmse_err() override {
+        return 2e-3;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return INFINITY;
+            }
+            if (all_masked) {
+                if (a[i] != 0.0f || b[i] != 0.0f) {
+                    return INFINITY;
+                }
+            } else {
+                // The graph output is split - dense. Check each backend's
+                // delta against zero so two identically wrong paths cannot
+                // hide behind backend-to-backend agreement.
+                max_abs = std::max(max_abs, (double) fabsf(a[i]));
+                max_abs = std::max(max_abs, (double) fabsf(b[i]));
+            }
+        }
+        return max_abs;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        const int64_t storage_d = logical_d == 64 ? 128 : logical_d;
+        return 2*nh*nq*(n_cold + n_hot)*storage_d*nseq;
+    }
+
+    test_flash_attn_ext_hybrid(
+            int64_t logical_d = 128,
+            int64_t nh = 4,
+            int64_t nkv = 2,
+            int64_t nq = 2,
+            int64_t n_cold = 5,
+            int64_t n_hot = 3,
+            int64_t nseq = 1,
+            bool positions = true,
+            bool all_masked = false,
+            bool cold_masked = false,
+            float max_bias = 0.0f,
+            float logit_softcap = 0.0f,
+            bool sinks = false)
+        : logical_d(logical_d), nh(nh), nkv(nkv), nq(nq), n_cold(n_cold), n_hot(n_hot), nseq(nseq),
+          positions(positions), all_masked(all_masked), cold_masked(cold_masked),
+          max_bias(max_bias), logit_softcap(logit_softcap), sinks(sinks) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t storage_d = logical_d == 64 ? 128 : logical_d;
+        const int64_t n_keys = n_cold + n_hot;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, storage_d, nq, nh, nseq);
+        ggml_set_name(q, "hy_q");
+        ggml_tensor * k_cold = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO4_0, storage_d, n_cold, nkv, nseq);
+        ggml_set_name(k_cold, "hy_k_cold");
+        ggml_tensor * v_cold = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO4_0, storage_d, n_cold, nkv, nseq);
+        ggml_set_name(v_cold, "hy_v_cold");
+        ggml_tensor * k_hot = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, storage_d, n_hot, nkv, nseq);
+        ggml_set_name(k_hot, "hy_k_hot");
+        ggml_tensor * v_hot = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, storage_d, n_hot, nkv, nseq);
+        ggml_set_name(v_hot, "hy_v_hot");
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_keys, nq, 1, nseq);
+        ggml_set_name(mask, "hy_mask");
+
+        ggml_tensor * q_positions = nullptr;
+        ggml_tensor * k_positions = nullptr;
+        if (positions) {
+            q_positions = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, nq, nh, nseq, 1);
+            ggml_set_name(q_positions, "hy_q_positions");
+            k_positions = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_keys, nkv, nseq, 1);
+            ggml_set_name(k_positions, "hy_k_positions");
+        }
+
+        ggml_tensor * split = ggml_flash_attn_ext_hybrid(ctx, q, k_cold, v_cold, k_hot, v_hot, mask,
+            q_positions, k_positions, 1.0f/sqrtf((float) logical_d), max_bias, logit_softcap);
+        ggml_set_name(split, "hy_split");
+
+        ggml_tensor * sink_values = nullptr;
+        if (sinks) {
+            sink_values = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(sink_values, "hy_sinks");
+        }
+        ggml_flash_attn_ext_add_sinks(split, sink_values);
+
+        // Dense attention is computed once on a private CPU context during
+        // initialization. Keeping only the F32 reference input here avoids
+        // sending an expanded per-head mask through CUDA FA's mask-ne2==1
+        // selector while the final graph still checks split - dense.
+        dense_ref = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, storage_d, nh, nq, nseq);
+        ggml_set_name(dense_ref, "hy_dense_ref");
+
+        ggml_tensor * out = ggml_sub(ctx, split, dense_ref);
+        ggml_set_name(out, "hy_out");
+        return out;
+    }
+
+    void build_cpu_reference(ggml_context * ctx) {
+        auto find_tensor = [&](const char * name) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, name) == 0) {
+                    return t;
+                }
+            }
+            return (ggml_tensor *) nullptr;
+        };
+
+        ggml_tensor * q = find_tensor("hy_q");
+        ggml_tensor * k_cold = find_tensor("hy_k_cold");
+        ggml_tensor * v_cold = find_tensor("hy_v_cold");
+        ggml_tensor * k_hot = find_tensor("hy_k_hot");
+        ggml_tensor * v_hot = find_tensor("hy_v_hot");
+        ggml_tensor * mask = find_tensor("hy_mask");
+        ggml_tensor * q_positions = positions ? find_tensor("hy_q_positions") : nullptr;
+        ggml_tensor * k_positions = positions ? find_tensor("hy_k_positions") : nullptr;
+        ggml_tensor * sink_values = sinks ? find_tensor("hy_sinks") : nullptr;
+        GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && mask && dense_ref);
+        GGML_ASSERT(!sinks || sink_values);
+
+        auto get_bytes = [](const ggml_tensor * t) {
+            std::vector<uint8_t> bytes(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+            return bytes;
+        };
+        const std::vector<uint8_t> q_bytes = get_bytes(q);
+        const std::vector<uint8_t> k_cold_bytes = get_bytes(k_cold);
+        const std::vector<uint8_t> v_cold_bytes = get_bytes(v_cold);
+        const std::vector<uint8_t> k_hot_bytes = get_bytes(k_hot);
+        const std::vector<uint8_t> v_hot_bytes = get_bytes(v_hot);
+        const std::vector<uint8_t> mask_bytes = get_bytes(mask);
+        const std::vector<uint8_t> q_position_bytes = q_positions ? get_bytes(q_positions) : std::vector<uint8_t>();
+        const std::vector<uint8_t> k_position_bytes = k_positions ? get_bytes(k_positions) : std::vector<uint8_t>();
+        const std::vector<uint8_t> sink_bytes = sink_values ? get_bytes(sink_values) : std::vector<uint8_t>();
+
+        const int64_t n_keys = n_cold + n_hot;
+        const int64_t mask_heads = positions ? nh : 1;
+        std::vector<uint8_t> reference_mask_bytes;
+        if (!positions) {
+            reference_mask_bytes = mask_bytes;
+        } else {
+            std::vector<float> reference_mask_f32(n_keys*nq*nh*nseq);
+            auto read_f16 = [](const std::vector<uint8_t> & bytes, size_t offset) {
+                ggml_fp16_t value;
+                memcpy(&value, bytes.data() + offset, sizeof(value));
+                return ggml_fp16_to_fp32(value);
+            };
+            auto read_i32 = [](const std::vector<uint8_t> & bytes, size_t offset) {
+                int32_t value;
+                memcpy(&value, bytes.data() + offset, sizeof(value));
+                return value;
+            };
+            for (int64_t seq = 0; seq < nseq; ++seq) {
+                for (int64_t head = 0; head < nh; ++head) {
+                    const int64_t kv_head = head/(nh/nkv);
+                    const int64_t q_head_pos = q_positions->ne[1] == 1 ? 0 : head;
+                    const int64_t q_seq_pos = q_positions->ne[2] == 1 ? 0 : seq;
+                    for (int64_t query = 0; query < nq; ++query) {
+                        const int32_t q_position = read_i32(q_position_bytes,
+                            query*q_positions->nb[0] + q_head_pos*q_positions->nb[1] + q_seq_pos*q_positions->nb[2]);
+                        for (int64_t key = 0; key < n_keys; ++key) {
+                            const float base = read_f16(mask_bytes,
+                                key*mask->nb[0] + query*mask->nb[1] + seq*mask->nb[3]);
+                            const int64_t key_seq_pos = k_positions->ne[2] == 1 ? 0 : seq;
+                            const int32_t key_position = read_i32(k_position_bytes,
+                                key*k_positions->nb[0] + kv_head*k_positions->nb[1] + key_seq_pos*k_positions->nb[2]);
+                            const bool masked = base == -INFINITY || key_position < 0 || q_position < key_position;
+                            const float value = masked ? -INFINITY : base;
+                            reference_mask_f32[key + n_keys*(query + nq*(head + nh*seq))] = value;
+                        }
+                    }
+                }
+            }
+            std::vector<ggml_fp16_t> reference_mask(reference_mask_f32.size());
+            ggml_fp32_to_fp16_row(reference_mask_f32.data(), reference_mask.data(), reference_mask_f32.size());
+            reference_mask_bytes.resize(reference_mask.size()*sizeof(ggml_fp16_t));
+            memcpy(reference_mask_bytes.data(), reference_mask.data(), reference_mask_bytes.size());
+        }
+
+        ggml_init_params ref_params = {
+            /* .mem_size   = */ ggml_tensor_overhead()*64 + ggml_graph_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context_ptr ref_ctx(ggml_init(ref_params));
+        GGML_ASSERT(ref_ctx);
+
+        auto make_like = [&](ggml_type type, const ggml_tensor * src) {
+            return ::ggml_new_tensor_4d(ref_ctx.get(), type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
+        };
+        ggml_tensor * rq = make_like(GGML_TYPE_F32, q);
+        ggml_tensor * rkc = make_like(GGML_TYPE_TURBO4_0, k_cold);
+        ggml_tensor * rvc = make_like(GGML_TYPE_TURBO4_0, v_cold);
+        ggml_tensor * rkh = make_like(GGML_TYPE_F16, k_hot);
+        ggml_tensor * rvh = make_like(GGML_TYPE_F16, v_hot);
+        ggml_tensor * rmask = ::ggml_new_tensor_4d(ref_ctx.get(), GGML_TYPE_F16, n_keys, nq, mask_heads, nseq);
+        ggml_tensor * rsinks = sink_values ? ::ggml_new_tensor_1d(ref_ctx.get(), GGML_TYPE_F32, nh) : nullptr;
+
+        ggml_tensor * rkc_f32 = ggml_cast(ref_ctx.get(), rkc, GGML_TYPE_F32);
+        ggml_tensor * rvc_f32 = ggml_cast(ref_ctx.get(), rvc, GGML_TYPE_F32);
+        ggml_tensor * rkh_f32 = ggml_cast(ref_ctx.get(), rkh, GGML_TYPE_F32);
+        ggml_tensor * rvh_f32 = ggml_cast(ref_ctx.get(), rvh, GGML_TYPE_F32);
+        ggml_tensor * rk = ggml_concat(ref_ctx.get(), rkc_f32, rkh_f32, 1);
+        ggml_tensor * rv = ggml_concat(ref_ctx.get(), rvc_f32, rvh_f32, 1);
+        ggml_tensor * reference = ggml_flash_attn_ext(ref_ctx.get(), rq, rk, rv, rmask,
+            1.0f/sqrtf((float) logical_d), max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(reference, rsinks);
+        ggml_cgraph * ref_graph = ::ggml_new_graph(ref_ctx.get());
+        ggml_build_forward_expand(ref_graph, reference);
+
+        ggml_backend_ptr ref_backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+        GGML_ASSERT(ref_backend);
+        ggml_backend_buffer_ptr ref_buffer(ggml_backend_alloc_ctx_tensors(ref_ctx.get(), ref_backend.get()));
+        GGML_ASSERT(ref_buffer);
+
+        ggml_backend_tensor_set(rq, q_bytes.data(), 0, q_bytes.size());
+        ggml_backend_tensor_set(rkc, k_cold_bytes.data(), 0, k_cold_bytes.size());
+        ggml_backend_tensor_set(rvc, v_cold_bytes.data(), 0, v_cold_bytes.size());
+        ggml_backend_tensor_set(rkh, k_hot_bytes.data(), 0, k_hot_bytes.size());
+        ggml_backend_tensor_set(rvh, v_hot_bytes.data(), 0, v_hot_bytes.size());
+        ggml_backend_tensor_set(rmask, reference_mask_bytes.data(), 0, reference_mask_bytes.size());
+        if (rsinks) {
+            ggml_backend_tensor_set(rsinks, sink_bytes.data(), 0, sink_bytes.size());
+        }
+
+        GGML_ASSERT(ggml_backend_graph_compute(ref_backend.get(), ref_graph) == GGML_STATUS_SUCCESS);
+        std::vector<float> reference_values(ggml_nelements(reference));
+        ggml_backend_tensor_get(reference, reference_values.data(), 0, reference_values.size()*sizeof(float));
+        ggml_backend_tensor_set(dense_ref, reference_values.data(), 0, reference_values.size()*sizeof(float));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_keys = n_cold + n_hot;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hy_mask") == 0) {
+                const size_t n = ggml_nelements(t);
+                std::vector<float> values(n, 0.0f);
+                for (int64_t seq = 0; seq < nseq; ++seq) {
+                    for (int64_t query = 0; query < nq; ++query) {
+                        for (int64_t key = 0; key < n_keys; ++key) {
+                            const bool masked = all_masked || (cold_masked && key < n_cold);
+                            values[key + n_keys*(query + nq*seq)] = masked ? -INFINITY : 0.0f;
+                        }
+                    }
+                }
+                std::vector<ggml_fp16_t> values_f16(n);
+                ggml_fp32_to_fp16_row(values.data(), values_f16.data(), n);
+                ggml_backend_tensor_set(t, values_f16.data(), 0, values_f16.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "hy_q_positions") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (int64_t seq = 0; seq < nseq; ++seq) {
+                    for (int64_t head = 0; head < nh; ++head) {
+                        for (int64_t query = 0; query < nq; ++query) {
+                            values[query + nq*(head + nh*seq)] = n_cold + n_hot - 1 + query + (head & 1);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "hy_k_positions") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (int64_t seq = 0; seq < nseq; ++seq) {
+                    for (int64_t head = 0; head < nkv; ++head) {
+                        for (int64_t key = 0; key < n_keys; ++key) {
+                            int32_t position = (int32_t) key;
+                            if (head == 1 && key == 0) {
+                                position = -1; // explicit invalid-key sentinel
+                            }
+                            if (head == 1 && key >= n_cold) {
+                                position += 1; // ragged per-KV-head positions
+                            }
+                            values[key + n_keys*(head + nkv*seq)] = position;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "hy_sinks") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "hy_out") != 0 && strcmp(t->name, "hy_dense_ref") != 0) {
+                const bool hybrid_d64 = logical_d == 64 &&
+                    (!strcmp(t->name, "hy_q") || !strcmp(t->name, "hy_k_cold") ||
+                     !strcmp(t->name, "hy_v_cold") || !strcmp(t->name, "hy_k_hot") ||
+                     !strcmp(t->name, "hy_v_hot"));
+                init_tensor_uniform(t, -1.0f, 1.0f, hybrid_d64 ? logical_d : -1);
+            }
+        }
+
+        build_cpu_reference(ctx);
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
+// Direct hybrid FA performance root.  The correctness cases above retain the
+// dense CPU reference and SUB output; this case returns hy_split itself so the
+// measured graph contains only the hybrid attention op.
+struct test_flash_attn_ext_hybrid_perf : public test_flash_attn_ext_hybrid {
+    static constexpr uint32_t input_seed = 0x54413450u;
+
+    test_flash_attn_ext_hybrid_perf()
+        : test_flash_attn_ext_hybrid(128, 16, 2, 1, 1024, 96, 1, true, false, false, 0.0f, 0.0f, false) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_hybrid::vars() + ",seed=" + std::to_string(input_seed);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        test_flash_attn_ext_hybrid::build_graph(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hy_split") == 0) {
+                return t;
+            }
+        }
+        GGML_ABORT("hybrid perf split tensor missing");
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        fprintf(stderr, "hybrid_perf_input seed=%" PRIu32 " logical_d=128 nh=16 nkv=2 nq=1 n_cold=1024 n_hot=96\n", input_seed);
+
+        auto fill_values = [&](ggml_tensor * t, uint32_t salt) {
+            const size_t n = ggml_nelements(t);
+            std::vector<float> values(n);
+            uint32_t state = input_seed ^ salt;
+            for (size_t i = 0; i < n; ++i) {
+                state = state*1664525u + 1013904223u;
+                values[i] = 2.0f*((float) ((state >> 8) & 0x00ffffffu)/16777215.0f) - 1.0f;
+            }
+
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, values.data(), 0, n*sizeof(float));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> values_f16(n);
+                ggml_fp32_to_fp16_row(values.data(), values_f16.data(), n);
+                ggml_backend_tensor_set(t, values_f16.data(), 0, values_f16.size()*sizeof(ggml_fp16_t));
+            } else if (t->type == GGML_TYPE_TURBO4_0) {
+                const size_t block_size = ggml_blck_size(t->type);
+                GGML_ASSERT(n % block_size == 0);
+                std::vector<uint8_t> values_q(ggml_row_size(t->type, n));
+                ggml_quantize_chunk(t->type, values.data(), values_q.data(), 0, n/block_size, block_size, nullptr);
+                ggml_backend_tensor_set(t, values_q.data(), 0, values_q.size());
+            } else {
+                GGML_ABORT("unexpected hybrid perf input type");
+            }
+        };
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hy_q") == 0) {
+                fill_values(t, 1);
+            } else if (strcmp(t->name, "hy_k_cold") == 0) {
+                fill_values(t, 2);
+            } else if (strcmp(t->name, "hy_v_cold") == 0) {
+                fill_values(t, 3);
+            } else if (strcmp(t->name, "hy_k_hot") == 0) {
+                fill_values(t, 4);
+            } else if (strcmp(t->name, "hy_v_hot") == 0) {
+                fill_values(t, 5);
+            } else if (strcmp(t->name, "hy_mask") == 0) {
+                std::vector<ggml_fp16_t> zeros(ggml_nelements(t), 0);
+                ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "hy_q_positions") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t), 1024 + 96 - 1);
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "hy_k_positions") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (int64_t key = 0; key < n_cold + n_hot; ++key) {
+                    for (int64_t head = 0; head < nkv; ++head) {
+                        values[key + (n_cold + n_hot)*(head + nkv*0)] = (int32_t) key;
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9984,6 +10389,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
 
+    // Direct symmetric TURBO4_0 VEC isolation: D128, QHeads=16, KVHeads=2,
+    // NQ=1, with the two required KV lengths. CPU uses the existing TQ4
+    // vec-dot/dequant reference implementation for the backend comparison.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+
+    // Hybrid PyramidKV contract: D64 is padded to D128, one softmax spans
+    // TQ4 cold rows and F16 hot rows, and position metadata is per KV head.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(64, 4, 1, 2, 3, 2, 2, true,  false, false));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 8, 2, 3, 5, 3, 2, true,  false, false, 8.0f, 30.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 4, 2, 2, 4, 1, 1, true,  true,  false));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 4, 2, 2, 3, 2, 1, true,  false, false));
+    // The cold row is fully masked to exercise a short effective all-hot path
+    // while retaining a rectangular TQ4 input tensor for the operator API.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 2, 1, 1, 1, 2, 1, false, false, true));
+    // NQ=1 long-split matrix: both storage widths, a fully masked cold
+    // segment with valid hot rows, all-masked output, and sinks/softcap/ALiBi
+    // with positions on the same D128 case.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 1, 1024, 96, 1, true,  false, false, 8.0f, 30.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 1, 1024, 96, 1, true,  false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 16, 2, 1, 1024, 96, 1, true,  false, false, 0.0f, 10.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 16, 2, 1, 1024, 96, 1, true,  true,  false));
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -10167,6 +10595,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Direct NQ=1 PyramidKV hybrid attention: measured graph root is
+    // FLASH_ATTN_EXT itself; inputs are deterministic per process.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf());
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

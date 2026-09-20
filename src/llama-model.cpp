@@ -370,6 +370,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_k3(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_K2_HORIZON:
+            return new llama_model_k2_horizon(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2302,6 +2304,86 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // Qwen35 has recurrent layers interleaved with dense attention layers.
+    // Keep this opt-in lane narrow until the attention-only cache contract is
+    // proven for this exact model geometry; recurrent state must remain on its
+    // existing path.
+    const bool qwen35_c1_geometry = [&]() {
+        if (arch != LLM_ARCH_QWEN35 || hparams.n_layer() != 64) {
+            return false;
+        }
+
+        uint32_t n_attention_layers = 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il)) {
+                continue;
+            }
+
+            ++n_attention_layers;
+            const uint32_t n_head = hparams.n_head(il);
+            const uint32_t n_head_kv = hparams.n_head_kv(il);
+            if (hparams.n_embd_head_k(il) != 256 ||
+                    hparams.n_embd_head_v(il) != 256 ||
+                    n_head_kv == 0 || n_head < n_head_kv ||
+                    n_head % n_head_kv != 0) {
+                return false;
+            }
+        }
+
+        return n_attention_layers == 16;
+    }();
+    const bool c1_arch_supported = arch == LLM_ARCH_QWEN2 || qwen35_c1_geometry;
+
+    if (params.pyramidkv_c1.enabled &&
+            (!c1_arch_supported ||
+             params.type_k != GGML_TYPE_TURBO4_0 ||
+             params.type_v != GGML_TYPE_TURBO4_0 ||
+             !cparams.flash_attn || !cparams.causal_attn ||
+             cparams.n_seq_max != 1 || cparams.n_rs_seq != 0 ||
+             cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+             params.kv_buffer_type == nullptr || params.mem_other != nullptr ||
+             hparams.is_swa_any() || cparams.embeddings)) {
+        throw std::runtime_error(
+            "PyramidKV C1 memory requires dense Qwen2 or target Qwen35-27B hybrid geometry, "
+            "symmetric TQ4 K/V, causal FlashAttention, "
+            "one sequence, explicit KV buffer, no SWA/shared/speculative context, and embeddings=false");
+    }
+
+    if (params.kv_buffer_type != nullptr) {
+        const char * reason = nullptr;
+
+        if (params.mem_other != nullptr) {
+            reason = "memory sharing via mem_other";
+        } else if (llm_arch_is_recurrent(arch)) {
+            reason = "recurrent memory";
+        } else if (hparams.is_mla()) {
+            reason = "MLA/DSA memory";
+        } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            reason = "sliding-window memory";
+        } else if (llm_arch_is_hybrid(arch) &&
+                arch != LLM_ARCH_QWEN3NEXT && arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
+            reason = "unsupported hybrid memory";
+        } else {
+            switch (arch) {
+                case LLM_ARCH_MINIMAX_M3:
+                case LLM_ARCH_GLM_DSA:
+                case LLM_ARCH_DEEPSEEK32:
+                case LLM_ARCH_DOTS3NOTE:
+                case LLM_ARCH_DEEPSEEK4:
+                case LLM_ARCH_DFLASH:
+                case LLM_ARCH_GEMMA4_ASSISTANT:
+                    reason = "specialized memory";
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        if (reason != nullptr) {
+            throw std::runtime_error("kv_buffer_type is unsupported for " + arch_name() + ": " + reason);
+        }
+    }
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2602,7 +2684,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv_buffer_type    */ params.kv_buffer_type,
+                            /* pyramidkv_c1      */ params.pyramidkv_c1);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2704,7 +2788,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                params.kv_buffer_type,
+                                params.pyramidkv_c1,
+                                params.tq4_key_center);
                     }
                 }
             }
@@ -2996,6 +3083,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_TALKIE:
+        case LLM_ARCH_K2_HORIZON:
         case LLM_ARCH_MELLUM:
             return LLAMA_ROPE_TYPE_NEOX;
 

@@ -191,6 +191,7 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    void pyramidkv_c1_phase_timing_print() const;
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -263,9 +264,14 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                              bool pyramidkv_observer = true) const;
 
     llm_graph_cb graph_get_cb() const;
+
+    bool extract_pyramidkv_scores(
+            const llm_graph_result * res,
+            const llama_ubatch & ubatch);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -384,6 +390,10 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // Replaced on every completed C1 graph.  memory_update() consumes it at
+    // the synchronized point before reserving the next graph.
+    std::vector<llama_pyramidkv_c1_layer_selection> pyramidkv_c1_pending;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -408,4 +418,6 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    mutable llama_pyramidkv_c1_phase_timing pyramidkv_c1_phase_timing_stats;
 };

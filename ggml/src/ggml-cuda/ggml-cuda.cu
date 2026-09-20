@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/turbo4-cuda.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -91,6 +92,10 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 11020
+#define GGML_CUDA_KV_POOL_NATIVE
+#endif
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -722,6 +727,227 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
 }
 
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+struct ggml_cuda_kv_pool {
+    int physical_device;
+    cudaMemPool_t pool = nullptr;
+    cudaStream_t stream = nullptr;
+    std::mutex mutex;
+
+    explicit ggml_cuda_kv_pool(int physical_device) : physical_device(physical_device) {
+    }
+
+    ~ggml_cuda_kv_pool() {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (stream != nullptr) {
+            (void) cudaSetDevice(physical_device);
+            (void) cudaDeviceSynchronize();
+            (void) cudaStreamSynchronize(stream);
+        }
+
+        if (pool != nullptr) {
+            (void) cudaMemPoolTrimTo(pool, 0);
+            (void) cudaMemPoolDestroy(pool);
+        }
+
+        if (stream != nullptr) {
+            (void) cudaStreamDestroy(stream);
+        }
+    }
+
+    static bool check(cudaError_t err, int device, const char * operation) {
+        if (err == cudaSuccess) {
+            return true;
+        }
+
+        GGML_LOG_ERROR("CUDA KV memory pool on device %d: %s failed: %s\n",
+                device, operation, cudaGetErrorString(err));
+        return false;
+    }
+
+    bool init() {
+        int supported = 0;
+        if (!check(cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported, physical_device),
+                physical_device, "cudaDeviceGetAttribute(cudaDevAttrMemoryPoolsSupported)")) {
+            return false;
+        }
+        if (!supported) {
+            GGML_LOG_ERROR("CUDA KV memory pool is unsupported on device %d\n", physical_device);
+            return false;
+        }
+
+        if (!check(cudaSetDevice(physical_device), physical_device, "cudaSetDevice")) {
+            return false;
+        }
+
+        cudaMemPoolProps props = {};
+        props.allocType = cudaMemAllocationTypePinned;
+        props.handleTypes = cudaMemHandleTypeNone;
+        props.location.type = cudaMemLocationTypeDevice;
+        props.location.id = physical_device;
+
+        if (!check(cudaMemPoolCreate(&pool, &props), physical_device, "cudaMemPoolCreate")) {
+            pool = nullptr;
+            return false;
+        }
+
+        if (!check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), physical_device, "cudaStreamCreateWithFlags")) {
+            (void) cudaMemPoolDestroy(pool);
+            pool = nullptr;
+            stream = nullptr;
+            return false;
+        }
+
+        // Keep released pages until explicit trim so reuse and physical reclaim stay observable.
+        uint64_t release_threshold = std::numeric_limits<uint64_t>::max();
+        if (!check(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold,
+                        (void *) &release_threshold), physical_device, "cudaMemPoolSetAttribute")) {
+            (void) cudaStreamDestroy(stream);
+            (void) cudaMemPoolDestroy(pool);
+            pool = nullptr;
+            stream = nullptr;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool allocate(size_t size, void ** ptr) {
+        *ptr = nullptr;
+        if (size == 0) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pool == nullptr || stream == nullptr) {
+            return false;
+        }
+
+        if (!check(cudaSetDevice(physical_device), physical_device, "cudaSetDevice")) {
+            return false;
+        }
+        if (!check(cudaMallocFromPoolAsync(ptr, size, pool, stream), physical_device, "cudaMallocFromPoolAsync")) {
+            *ptr = nullptr;
+            return false;
+        }
+        if (!check(cudaStreamSynchronize(stream), physical_device, "cudaStreamSynchronize(allocate)")) {
+            const bool free_queued = check(cudaFreeAsync(*ptr, stream), physical_device, "cudaFreeAsync(allocate cleanup)");
+            const bool free_completed = free_queued && check(cudaStreamSynchronize(stream), physical_device, "cudaStreamSynchronize(allocate cleanup)");
+            if (!free_completed) {
+                GGML_ABORT("failed to release CUDA KV allocation after allocation failure");
+            }
+            *ptr = nullptr;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool release(void * ptr) {
+        if (ptr == nullptr) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pool == nullptr || stream == nullptr) {
+            return false;
+        }
+
+        if (!check(cudaSetDevice(physical_device), physical_device, "cudaSetDevice")) {
+            return false;
+        }
+
+        // Buffer API has no completion-event argument. Device sync makes free safe for every backend stream.
+        if (!check(cudaDeviceSynchronize(), physical_device, "cudaDeviceSynchronize(release)")) {
+            return false;
+        }
+        if (!check(cudaFreeAsync(ptr, stream), physical_device, "cudaFreeAsync")) {
+            return false;
+        }
+        return check(cudaStreamSynchronize(stream), physical_device, "cudaStreamSynchronize(release)");
+    }
+
+    bool trim(size_t min_reserved_bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pool == nullptr || stream == nullptr) {
+            return false;
+        }
+
+        if (!check(cudaSetDevice(physical_device), physical_device, "cudaSetDevice")) {
+            return false;
+        }
+        if (!check(cudaDeviceSynchronize(), physical_device, "cudaDeviceSynchronize(trim)")) {
+            return false;
+        }
+        if (!check(cudaStreamSynchronize(stream), physical_device, "cudaStreamSynchronize(trim)")) {
+            return false;
+        }
+        return check(cudaMemPoolTrimTo(pool, min_reserved_bytes), physical_device, "cudaMemPoolTrimTo");
+    }
+
+    bool stats(ggml_backend_cuda_kv_pool_stats * result) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (pool == nullptr || stream == nullptr) {
+            return false;
+        }
+
+        if (!check(cudaSetDevice(physical_device), physical_device, "cudaSetDevice")) {
+            return false;
+        }
+
+        uint64_t used = 0;
+        uint64_t reserved = 0;
+        if (!check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used),
+                physical_device, "cudaMemPoolGetAttribute(used)")) {
+            return false;
+        }
+        if (!check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved),
+                physical_device, "cudaMemPoolGetAttribute(reserved)")) {
+            return false;
+        }
+
+        result->supported = true;
+        result->physical_device = physical_device;
+        result->used_mem_current = (size_t) used;
+        result->reserved_mem_current = (size_t) reserved;
+        return true;
+    }
+};
+
+static std::mutex ggml_cuda_kv_pool_registry_mutex;
+static std::array<std::shared_ptr<ggml_cuda_kv_pool>, GGML_CUDA_MAX_DEVICES> ggml_cuda_kv_pools;
+
+static std::shared_ptr<ggml_cuda_kv_pool> ggml_cuda_kv_pool_for_device(int device) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    const int physical_device = ggml_cuda_get_physical_device(device);
+    if (physical_device < 0 || physical_device >= GGML_CUDA_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_kv_pool_registry_mutex);
+    std::shared_ptr<ggml_cuda_kv_pool> & pool = ggml_cuda_kv_pools[physical_device];
+    if (pool == nullptr) {
+        std::shared_ptr<ggml_cuda_kv_pool> candidate = std::make_shared<ggml_cuda_kv_pool>(physical_device);
+        if (!candidate->init()) {
+            return nullptr;
+        }
+        pool = std::move(candidate);
+    }
+    return pool;
+}
+#else
+struct ggml_cuda_kv_pool;
+
+static std::shared_ptr<ggml_cuda_kv_pool> ggml_cuda_kv_pool_for_device(int device) {
+    GGML_UNUSED(device);
+    return nullptr;
+}
+#endif // defined(GGML_CUDA_KV_POOL_NATIVE)
+
 
 // cuda buffer
 
@@ -729,14 +955,37 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+    std::shared_ptr<ggml_cuda_kv_pool> kv_pool;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+    ggml_backend_cuda_buffer_context(int device, void * dev_ptr, std::shared_ptr<ggml_cuda_kv_pool> kv_pool) :
+        device(device), dev_ptr(dev_ptr),
+        name(GGML_CUDA_NAME + std::string("-KV") + std::to_string(device)),
+        kv_pool(std::move(kv_pool)) {
+    }
+#endif
+
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+        if (kv_pool != nullptr) {
+            if (!kv_pool->release(dev_ptr)) {
+                GGML_ABORT("failed to release CUDA KV buffer");
+            }
+            dev_ptr = nullptr;
+            return;
+        }
+#endif
+
+        if (dev_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -823,6 +1072,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        ggml_cuda_set_device(dst_ctx->device);
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
@@ -870,6 +1120,7 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    bool is_kv = false;
 };
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -882,12 +1133,43 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
+static bool ggml_backend_cuda_buft_is_device(ggml_backend_buffer_type_t buft, int device) {
+    if (!ggml_backend_buft_is_cuda(buft)) {
+        return false;
+    }
+
+    ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    return ctx->device == device;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
+    void * dev_ptr;
+    if (buft_ctx->is_kv) {
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+        std::shared_ptr<ggml_cuda_kv_pool> pool = ggml_cuda_kv_pool_for_device(buft_ctx->device);
+        if (pool == nullptr) {
+            GGML_LOG_ERROR("%s: native CUDA KV memory pool unavailable on device %d\n", __func__, buft_ctx->device);
+            return nullptr;
+        }
+        if (!pool->allocate(size, &dev_ptr)) {
+            GGML_LOG_ERROR("%s: CUDA KV pool allocation failed on device %d\n", __func__, buft_ctx->device);
+            return nullptr;
+        }
+
+        ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(
+            buft_ctx->device, dev_ptr, std::move(pool));
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+#else
+        GGML_LOG_ERROR("%s: native CUDA KV memory pools unavailable for this backend\n", __func__);
+        GGML_UNUSED(size);
+        return nullptr;
+#endif
+    }
+
     ggml_cuda_set_device(buft_ctx->device);
 
-    void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
@@ -958,6 +1240,75 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_kv_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    if (ggml_cuda_kv_pool_for_device(device) == nullptr) {
+        GGML_LOG_ERROR("%s: native CUDA KV memory pool unavailable on device %d\n", __func__, device);
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_kv_buffer_types[GGML_CUDA_MAX_DEVICES];
+    static std::unique_ptr<ggml_backend_cuda_buffer_type_context> contexts[GGML_CUDA_MAX_DEVICES];
+    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+
+    if (!initialized[device]) {
+        contexts[device] = std::make_unique<ggml_backend_cuda_buffer_type_context>(
+            ggml_backend_cuda_buffer_type_context {
+                device,
+                GGML_CUDA_NAME + std::string("-KV") + std::to_string(device),
+                true,
+            });
+        ggml_backend_cuda_kv_buffer_types[device] = {
+            /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ contexts[device].get(),
+        };
+        initialized[device] = true;
+    }
+
+    return &ggml_backend_cuda_kv_buffer_types[device];
+}
+
+bool ggml_backend_cuda_kv_pool_supported(int device) {
+    return ggml_cuda_kv_pool_for_device(device) != nullptr;
+}
+
+bool ggml_backend_cuda_kv_pool_get_stats(int device, ggml_backend_cuda_kv_pool_stats * stats) {
+    if (stats == nullptr) {
+        return false;
+    }
+
+    stats->supported = false;
+    stats->physical_device = -1;
+    stats->used_mem_current = 0;
+    stats->reserved_mem_current = 0;
+
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+    std::shared_ptr<ggml_cuda_kv_pool> pool = ggml_cuda_kv_pool_for_device(device);
+    return pool != nullptr && pool->stats(stats);
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif
+}
+
+bool ggml_backend_cuda_kv_pool_trim(int device, size_t min_reserved_bytes) {
+#if defined(GGML_CUDA_KV_POOL_NATIVE)
+    std::shared_ptr<ggml_cuda_kv_pool> pool = ggml_cuda_kv_pool_for_device(device);
+    return pool != nullptr && pool->trim(min_reserved_bytes);
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(min_reserved_bytes);
+    return false;
+#endif
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -1406,6 +1757,10 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+static bool ggml_cuda_mul_mat_requires_f32(const ggml_tensor * dst) {
+    return ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -1531,6 +1886,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         }
     }
 
+    bool use_pedantic_f32 = false;
+    cublasGemmAlgo_t cu_algorithm = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    use_pedantic_f32 = compute_type == GGML_TYPE_F32 && ggml_cuda_mul_mat_requires_f32(dst);
+    if (use_pedantic_f32) {
+        // Sgemm inherits the handle's TF32 math mode, and the legacy TENSOR_OP
+        // algorithm may down-convert inputs even with a nominal F32 compute type.
+        cu_compute_type = CUBLAS_COMPUTE_32F_PEDANTIC;
+        cu_algorithm = CUBLAS_GEMM_DEFAULT;
+    }
+#endif
+
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);
 
@@ -1541,7 +1908,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && !use_pedantic_f32) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
@@ -1556,7 +1923,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    cu_algorithm));
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
@@ -1572,7 +1939,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,   dst_ptr, cu_data_type,   ne0, ne1*ne0, // strideC
                 ne12*ne13,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                cu_algorithm));
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
@@ -1610,7 +1977,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
                 ne23,
                 cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                cu_algorithm));
     }
 
     // Convert output back to F32 if needed
@@ -1627,10 +1994,6 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
     }
-    if (dst->op_params[0] == GGML_PREC_F32) {
-        compute_type = GGML_TYPE_F32;
-    }
-
     const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
     if (env_c != nullptr) {
         std::string env_cpp = env_c;
@@ -1646,6 +2009,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         } else if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
+    }
+
+    // A backend-wide preference must not weaken an operation's explicit precision.
+    if (ggml_cuda_mul_mat_requires_f32(dst)) {
+        compute_type = GGML_TYPE_F32;
     }
 
     switch (compute_type) {
@@ -1858,6 +2226,8 @@ static bool ggml_cuda_should_fuse_blackwell_batched_swiglu(
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    const bool requires_f32 = ggml_cuda_mul_mat_requires_f32(dst);
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
@@ -1896,7 +2266,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (!requires_f32 && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1935,7 +2305,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
-    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+    if (!ggml_cuda_mul_mat_requires_f32(dst) &&
+            ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
 
@@ -1977,7 +2348,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!ggml_cuda_mul_mat_requires_f32(dst) &&
+                ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2478,7 +2850,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_cuda_buft_is_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2487,7 +2859,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_cuda_buft_is_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2497,7 +2869,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_cuda_buft_is_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -2508,7 +2880,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_cuda_buft_is_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -4215,12 +4587,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                assert(ggml_backend_cuda_buft_is_device(node->buffer->buft, cuda_ctx->device) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                        assert(ggml_backend_cuda_buft_is_device(node->src[j]->buffer->buft, cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -4927,6 +5299,49 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
+    // TQ4 is deliberately kept out of the generic CUDA operation families.
+    // Its rotated representation must only be written by the explicit encoder
+    // paths below and must not pass through a decode/modify/re-encode sequence.
+    bool has_turbo4 = op->type == GGML_TYPE_TURBO4_0;
+    for (int i = 0; i < GGML_MAX_SRC && !has_turbo4; i++) {
+        has_turbo4 = op->src[i] && op->src[i]->type == GGML_TYPE_TURBO4_0;
+    }
+    if (has_turbo4) {
+        switch (op->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                return op->type == GGML_TYPE_TURBO4_0;
+            case GGML_OP_CPY: {
+                const ggml_type src0_type = op->src[0]->type;
+                const ggml_type src1_type = op->src[1]->type;
+                const bool rows_aligned = op->src[0]->ne[0] % GGML_TURBO4_QK == 0 &&
+                                          op->src[1]->ne[0] % GGML_TURBO4_QK == 0;
+                return rows_aligned &&
+                       ((src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TURBO4_0) ||
+                        (src0_type == GGML_TYPE_TURBO4_0 && src1_type == GGML_TYPE_F32) ||
+                        (src0_type == GGML_TYPE_TURBO4_0 && src1_type == GGML_TYPE_TURBO4_0 &&
+                         ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])));
+            }
+            case GGML_OP_DUP:
+            case GGML_OP_CONT:
+                return op->type == GGML_TYPE_TURBO4_0 &&
+                       op->src[0] && op->src[0]->type == GGML_TYPE_TURBO4_0 &&
+                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+            case GGML_OP_SET_ROWS:
+                return op->type == GGML_TYPE_TURBO4_0 &&
+                       op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[0]->ne[0] % GGML_TURBO4_QK == 0 && op->ne[0] % GGML_TURBO4_QK == 0 &&
+                       op->src[1] && (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64);
+            case GGML_OP_FLASH_ATTN_EXT:
+                return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+            default:
+                return false;
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -5584,6 +5999,18 @@ static int ggml_backend_cuda_tensor_copy_2d_v1(const ggml_tensor * src, ggml_ten
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_kv_buffer_type") == 0) {
+        return (void *) ggml_backend_cuda_kv_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_pool_supported") == 0) {
+        return (void *) ggml_backend_cuda_kv_pool_supported;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_pool_get_stats") == 0) {
+        return (void *) ggml_backend_cuda_kv_pool_get_stats;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_pool_trim") == 0) {
+        return (void *) ggml_backend_cuda_kv_pool_trim;
+    }
     if (strcmp(name, "ggml_backend_kq_mask_v1") == 0) {
         return (void *) ggml_backend_cuda_kq_mask_v1;
     }

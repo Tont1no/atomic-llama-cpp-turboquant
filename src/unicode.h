@@ -98,6 +98,10 @@ std::vector<uint32_t> unicode_cpts_from_utf8(const std::string & utf8);
 
 std::vector<uint32_t> unicode_cpts_normalize_nfd(const std::vector<uint32_t> & cpts);
 
+// Unicode 9.0.0 NFC matching HF tokenizers 0.22.1 for K2 text fragments.
+// This remains separate from the legacy one-code-point NFD helper above.
+std::vector<uint32_t> unicode_cpts_normalize_nfc(const std::vector<uint32_t> & cpts);
+
 unicode_cpt_flags unicode_cpt_flags_from_cpt (uint32_t cpt);
 unicode_cpt_flags unicode_cpt_flags_from_utf8(const std::string & utf8);
 

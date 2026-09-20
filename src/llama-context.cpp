@@ -9,19 +9,47 @@
 #include "llama-io.h"
 #include "llama-state-snapshot.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include "../ggml/src/ggml-turbo4.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
+static bool llama_context_type_is_turbo4(ggml_type type) {
+    return type == GGML_TYPE_TURBO4_0;
+}
+
+static uint32_t llama_context_turbo4_padded_head(uint32_t head_dim) {
+    if (head_dim == 64 || head_dim == 128) {
+        return GGML_TURBO4_QK;
+    }
+    if (head_dim == 256) {
+        return 2*GGML_TURBO4_QK;
+    }
+    return 0;
+}
+
+static llama_kv_cache * llama_context_attention_cache(llama_memory_i * memory) {
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
+        return kv;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
+        return hybrid->get_mem_attn();
+    }
+    return nullptr;
+}
 //
 // llama_context
 //
@@ -81,6 +109,97 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+static ggml_backend_buffer_type_t llama_graph_tensor_buft(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+
+    return tensor != nullptr && tensor->buffer != nullptr ?
+        ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
+}
+
+static ggml_backend_t llama_backend_for_device(
+        const std::vector<ggml_backend_ptr> & backends,
+        ggml_backend_dev_t                    device) {
+    if (device == nullptr) {
+        return nullptr;
+    }
+
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == device) {
+            return backend.get();
+        }
+    }
+
+    return nullptr;
+}
+
+// Explicit KV storage must drive the operations that read or write that storage.
+// Keep this limited to the real FA path and cache SET_ROWS stores.
+static bool llama_bind_explicit_kv_backend(
+        ggml_backend_sched_t       sched,
+        ggml_cgraph *              graph,
+        ggml_backend_t             backend,
+        ggml_backend_buffer_type_t kv_buft) {
+    if (kv_buft == nullptr) {
+        return true;
+    }
+
+    if (sched == nullptr || graph == nullptr || backend == nullptr) {
+        LLAMA_LOG_ERROR("%s: explicit KV backend is not available\n", __func__);
+        return false;
+    }
+
+    bool bound_flash_attn = false;
+
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            // ggml_flash_attn_ext sources are Q, K, V, mask. Only bind FA
+            // nodes whose K/V input belongs to the explicit KV buffer.
+            const bool uses_kv_buft =
+                llama_graph_tensor_buft(node->src[1]) == kv_buft ||
+                llama_graph_tensor_buft(node->src[2]) == kv_buft;
+
+            if (!uses_kv_buft) {
+                continue;
+            }
+
+            if (!ggml_backend_supports_op(backend, node)) {
+                LLAMA_LOG_ERROR("%s: target KV backend %s does not support FLASH_ATTN_EXT\n",
+                        __func__, ggml_backend_name(backend));
+                return false;
+            }
+
+            ggml_backend_sched_set_tensor_backend(sched, node, backend);
+            bound_flash_attn = true;
+            continue;
+        }
+
+        // ggml_set_rows has the legacy order src[0]=values, src[1]=indices,
+        // src[2]=the destination cache tensor.
+        if (node->op == GGML_OP_SET_ROWS && llama_graph_tensor_buft(node->src[2]) == kv_buft) {
+            if (!ggml_backend_supports_op(backend, node)) {
+                LLAMA_LOG_ERROR("%s: target KV backend %s does not support SET_ROWS\n",
+                        __func__, ggml_backend_name(backend));
+                return false;
+            }
+
+            // The destination is the preallocated K/V tensor. Pinning this
+            // node prevents scheduler fallback that would copy the full cache.
+            ggml_backend_sched_set_tensor_backend(sched, node, backend);
+        }
+    }
+
+    if (!bound_flash_attn) {
+        LLAMA_LOG_ERROR("%s: explicit KV buffer requires FLASH_ATTN_EXT using that buffer\n", __func__);
+        return false;
+    }
+
+    return true;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -144,6 +263,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    cparams.kv_buffer_type = params.kv_buffer_type;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -233,6 +353,14 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    if (cparams.kv_buffer_type != nullptr && !cparams.flash_attn) {
+        throw std::runtime_error("explicit kv_buffer_type currently requires Flash Attention");
+    }
+
+    if (cparams.kv_buffer_type != nullptr && !cparams.offload_kqv) {
+        LLAMA_LOG_INFO("%s: explicit KV backend pins cache stores and Flash Attention; offload_kqv=false only affects other graph nodes\n", __func__);
+    }
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
@@ -249,6 +377,60 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    std::string c1_config_error;
+    size_t c1_attention_layers = 0;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        c1_attention_layers += !hparams.is_recr(il);
+    }
+    if (!llama_pyramidkv_c1_make_config(params.pyramidkv_c1, c1_attention_layers,
+            std::max<std::size_t>(1, cparams.n_ubatch), cparams.pyramidkv_c1,
+            c1_config_error)) {
+        throw std::runtime_error(c1_config_error);
+    }
+    if (cparams.pyramidkv_c1.enabled) {
+        const bool supported =
+            (model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN35) &&
+            params.type_k == GGML_TYPE_TURBO4_0 &&
+            params.type_v == GGML_TYPE_TURBO4_0 &&
+            cparams.flash_attn && cparams.causal_attn &&
+            cparams.n_seq_max == 1 && cparams.n_rs_seq == 0 &&
+            params.n_rs_seq == 0 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            cparams.kv_buffer_type != nullptr &&
+            params.ctx_other == nullptr && cparams.ctx_other == nullptr &&
+            !cparams.embeddings && !hparams.is_swa_any();
+        if (!supported) {
+            throw std::runtime_error(
+                "PyramidKV C1 requires Qwen2 or Qwen35 attention, symmetric TQ4 K/V, causal FlashAttention, "
+                "one sequence, explicit KV buffer, no SWA/shared/speculative context, and embeddings=false");
+        }
+    }
+
+    cparams.tq4_key_center = params.tq4_key_center;
+    if (cparams.tq4_key_center) {
+        const bool supported =
+            model.arch == LLM_ARCH_QWEN2 && !hparams.is_swa_any() &&
+            !hparams.attn_soft_cap && !hparams.use_alibi && hparams.f_max_alibi_bias == 0.0f &&
+            params.type_k == params.type_v &&
+            (params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_F16) &&
+            cparams.flash_attn && cparams.causal_attn && params.kv_unified &&
+            cparams.n_seq_max == 1 && params.n_seq_max == 1 &&
+            cparams.n_rs_seq == 0 && params.n_rs_seq == 0 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            params.ctx_other == nullptr && cparams.ctx_other == nullptr &&
+            cparams.kv_buffer_type != nullptr && !cparams.embeddings &&
+            params.cb_eval == nullptr && params.n_samplers == 0;
+        if (!supported) {
+            throw std::runtime_error("native TQ4 key centering requires dense Qwen2, symmetric F16 or TQ4, causal FlashAttention, one unified sequence, an explicit KV device, and no callbacks, softcap, sinks, SWA or shared/speculative state");
+        }
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (hparams.n_embd_head_k(il) != 128 || hparams.n_head_kv(il) == 0 ||
+                    model.layers[il].attn_sinks != nullptr) {
+                throw std::runtime_error("native TQ4 key centering requires D128 keys without attention sinks in every layer");
+            }
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -353,7 +535,38 @@ llama_context::llama_context(
             }
         }
 
-        // add CPU backend
+        // A caller-provided KV buffer type may belong to a device that does not
+        // hold any model weights. Keep that device in the scheduler backend set.
+        if (cparams.kv_buffer_type != nullptr) {
+            ggml_backend_dev_t kv_dev = ggml_backend_buft_get_device(cparams.kv_buffer_type);
+            if (kv_dev == nullptr) {
+                throw std::runtime_error("kv_buffer_type has no backend device");
+            }
+            if (!ggml_backend_dev_supports_buft(kv_dev, cparams.kv_buffer_type)) {
+                throw std::runtime_error(format("kv_buffer_type %s is not supported by device %s",
+                    ggml_backend_buft_name(cparams.kv_buffer_type), ggml_backend_dev_name(kv_dev)));
+            }
+
+            if (ggml_backend_dev_type(kv_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                bool found = false;
+                for (auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == kv_dev) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    ggml_backend_t backend = ggml_backend_dev_init(kv_dev, nullptr);
+                    if (backend == nullptr) {
+                        throw std::runtime_error(format("failed to initialize KV backend %s", ggml_backend_dev_name(kv_dev)));
+                    }
+                    backends.emplace_back(backend);
+                }
+            }
+        }
+
+        // Keep CPU last: ggml_backend_sched assumes the final backend is CPU.
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (backend_cpu == nullptr) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -391,9 +604,12 @@ llama_context::llama_context(
         llama_memory_params params_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
+            /*.kv_buffer_type =*/ cparams.kv_buffer_type,
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.pyramidkv_c1 =*/ cparams.pyramidkv_c1,
+            /*.tq4_key_center =*/ cparams.tq4_key_center,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -485,6 +701,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    // The cache is still alive here; emit the cumulative diagnostic snapshot before
+    // member destruction.  llama_perf_context_print() remains an explicit hook.
+    pyramidkv_c1_phase_timing_print();
+#endif
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -530,9 +751,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // An explicit KV buffer owns the FA placement even when its device
+            // differs from the layer that holds the projection weights.
+            ggml_backend_dev_t device_layer =
+                cparams.kv_buffer_type != nullptr && probe.op == LLM_FUSED_OP_FLASH_ATTN ?
+                    ggml_backend_buft_get_device(cparams.kv_buffer_type) : model.dev_layer(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -583,6 +806,24 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 }
 
 void llama_context::sched_reserve() {
+    auto * c1_kv = llama_context_attention_cache(memory.get());
+    if (c1_kv != nullptr) {
+        std::string reset_error;
+        if (c1_kv->pyramidkv_c1_reset_failed(reset_error)) {
+            pyramidkv_c1_pending.clear();
+            sched_need_reserve = true;
+            LLAMA_LOG_ERROR("%s: refusing graph reserve while PyramidKV C1 reset is failed: %s\n",
+                    __func__, reset_error.c_str());
+            return;
+        }
+        if (c1_kv->pyramidkv_c1_graph_reset_pending()) {
+            // A partial seq_rm can remove rows that were not selected by the
+            // observer. Reuse of its pending selection is therefore invalid.
+            pyramidkv_c1_pending.clear();
+            sched_need_reserve = true;
+        }
+    }
+
     if (!sched_need_reserve) {
         return;
     }
@@ -606,6 +847,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (c1_kv != nullptr) {
+        c1_kv->pyramidkv_c1_graph_reset_complete();
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -702,12 +946,33 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    if (cparams.pyramidkv_c1.enabled) {
+        ++pyramidkv_c1_phase_timing_stats.sched_reserve_calls;
+        pyramidkv_c1_phase_timing_stats.sched_reserve_us +=
+            static_cast<uint64_t>(t_end_us - t_start_us);
+    }
+#endif
+
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
 void llama_context::synchronize() {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    const bool phase_timing_enabled = cparams.pyramidkv_c1.enabled;
+    const int64_t phase_start_us = phase_timing_enabled ? ggml_time_us() : 0;
+    if (phase_timing_enabled) {
+        ++pyramidkv_c1_phase_timing_stats.synchronize_calls;
+    }
+#endif
     if (!sched) {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        if (phase_timing_enabled) {
+            pyramidkv_c1_phase_timing_stats.synchronize_us +=
+                static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+        }
+#endif
         return;
     }
 
@@ -738,6 +1003,13 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    if (phase_timing_enabled) {
+        pyramidkv_c1_phase_timing_stats.synchronize_us +=
+            static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+    }
+#endif
 }
 
 const llama_model & llama_context::get_model() const {
@@ -789,6 +1061,45 @@ bool llama_context::memory_update(bool optimize) {
         return false;
     }
 
+    if (auto * c1_kv = llama_context_attention_cache(memory.get())) {
+        std::string reset_error;
+        if (c1_kv->pyramidkv_c1_reset_failed(reset_error)) {
+            pyramidkv_c1_pending.clear();
+            throw std::runtime_error("PyramidKV C1 reset failed: " + reset_error);
+        }
+        if (c1_kv->pyramidkv_c1_graph_reset_pending()) {
+            pyramidkv_c1_pending.clear();
+            sched_reserve();
+        }
+    }
+
+    bool pyramidkv_c1_applied = false;
+    if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending.empty()) {
+        auto * kv = llama_context_attention_cache(memory.get());
+        if (kv == nullptr) {
+            LLAMA_LOG_ERROR("%s: C1 selection has no attention cache\n", __func__);
+            pyramidkv_c1_pending.clear();
+            return false;
+        }
+
+        std::string error;
+        // Drop graph handles before compaction synchronizes and replaces the KV buffers.
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+        try {
+            if (!kv->pyramidkv_c1_compact(this, pyramidkv_c1_pending, error)) {
+                throw std::runtime_error("PyramidKV C1 compaction failed: " + error);
+            }
+        } catch (const std::exception & ex) {
+            LLAMA_LOG_ERROR("%s: C1 cache compaction rejected: %s\n", __func__, ex.what());
+            kv->pyramidkv_c1_fail_transition(ex.what());
+            pyramidkv_c1_pending.clear();
+            throw;
+        }
+        pyramidkv_c1_pending.clear();
+        pyramidkv_c1_applied = true;
+    }
+
     {
         const auto mctx = memory->init_update(this, optimize);
         switch (mctx->get_status()) {
@@ -799,8 +1110,10 @@ bool llama_context::memory_update(bool optimize) {
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
                     // no updates need to be performed
-                    return false;
-                }
+                    if (!pyramidkv_c1_applied) {
+                        return false;
+                    }
+                } break;
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
@@ -816,6 +1129,7 @@ bool llama_context::memory_update(bool optimize) {
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+            return false;
         }
     }
 
@@ -831,7 +1145,17 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const int64_t phase_start_us = pyramidkv_c1_applied ? ggml_time_us() : 0;
+#endif
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        if (pyramidkv_c1_applied) {
+            ++pyramidkv_c1_phase_timing_stats.post_compaction_reserve_calls;
+            pyramidkv_c1_phase_timing_stats.post_compaction_reserve_us +=
+                static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+        }
+#endif
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -1394,20 +1718,98 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    auto * key_center_kv = cparams.tq4_key_center ? dynamic_cast<llama_kv_cache *>(memory.get()) : nullptr;
+    struct key_center_compute_guard {
+        llama_kv_cache * kv;
+        bool complete = false;
+        ~key_center_compute_guard() { if (kv && !complete) { kv->tq4_key_center_fail(); } }
+    } key_center_guard { key_center_kv };
+    if (cparams.tq4_key_center && (key_center_kv == nullptr || mctx == nullptr ||
+            gtype != LLM_GRAPH_TYPE_DEFAULT || !cparams.flash_attn || !cparams.causal_attn ||
+            cparams.embeddings || cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+        LLAMA_LOG_ERROR("%s: native key centering requires a dense default decode graph with causal FlashAttention\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    if (auto * c1_kv = llama_context_attention_cache(memory.get())) {
+        std::string reset_error;
+        if (c1_kv->pyramidkv_c1_reset_failed(reset_error)) {
+            LLAMA_LOG_ERROR("%s: refusing graph execution while PyramidKV C1 reset is failed: %s\n",
+                    __func__, reset_error.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (c1_kv->pyramidkv_c1_graph_reset_pending()) {
+            sched_reserve();
+        }
+    }
+
+    // Commit the previous observation before a later ubatch can overwrite
+    // hot rows, including ubatches inside the same long decode call.
+    if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending.empty()) {
+        if (!memory_update(false)) {
+            if (auto * kv = llama_context_attention_cache(memory.get())) {
+                kv->pyramidkv_c1_fail_transition("PyramidKV C1 pending update did not complete");
+            }
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+
+    if (key_center_kv) {
+        std::string anchor_error;
+        if (!key_center_kv->tq4_key_center_prepare(ubatch, anchor_error)) {
+            LLAMA_LOG_ERROR("%s: native key center preparation failed: %s\n", __func__, anchor_error.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+    const bool key_center_capture = key_center_kv && key_center_kv->tq4_key_center_capture();
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    // Only the final prompt ubatch needs scores. Decode maintenance retains all rows.
+    bool pyramidkv_observer = true;
+    if (cparams.pyramidkv_c1.enabled) {
+        if (auto * c1_kv = llama_context_attention_cache(memory.get())) {
+            pyramidkv_observer = !c1_kv->pyramidkv_c1_is_compacted() &&
+                ubatch.output != nullptr &&
+                std::any_of(ubatch.output, ubatch.output + ubatch.n_tokens,
+                    [](int8_t output) { return output != 0; });
+        }
+    }
+
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    if (cparams.pyramidkv_c1.enabled) {
+        if (pyramidkv_observer) {
+            ++pyramidkv_c1_phase_timing_stats.process_ubatch_observer_calls;
+        } else {
+            ++pyramidkv_c1_phase_timing_stats.process_ubatch_nonobserver_calls;
+        }
+    }
+#endif
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, pyramidkv_observer);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        if (cparams.pyramidkv_c1.enabled) {
+            if (pyramidkv_observer) {
+                ++pyramidkv_c1_phase_timing_stats.graph_reuse_observer_calls;
+            } else {
+                ++pyramidkv_c1_phase_timing_stats.graph_reuse_nonobserver_calls;
+            }
+        }
+#endif
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1419,6 +1821,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const bool phase_timing_enabled = cparams.pyramidkv_c1.enabled;
+        const int64_t graph_build_start_us = phase_timing_enabled ? ggml_time_us() : 0;
+        if (phase_timing_enabled) {
+            if (pyramidkv_observer) {
+                ++pyramidkv_c1_phase_timing_stats.graph_build_observer_calls;
+            } else {
+                ++pyramidkv_c1_phase_timing_stats.graph_build_nonobserver_calls;
+            }
+        }
+#endif
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1428,6 +1841,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf = model.build_graph(gparams);
 
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        if (phase_timing_enabled) {
+            ++pyramidkv_c1_phase_timing_stats.graph_build_calls;
+            pyramidkv_c1_phase_timing_stats.graph_build_us +=
+                static_cast<uint64_t>(ggml_time_us() - graph_build_start_us);
+        }
+#endif
+
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
@@ -1436,7 +1857,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        if (cparams.kv_buffer_type != nullptr) {
+            const auto kv_device = ggml_backend_buft_get_device(cparams.kv_buffer_type);
+            const auto kv_backend = llama_backend_for_device(backends, kv_device);
+            if (!llama_bind_explicit_kv_backend(sched.get(), gf, kv_backend, cparams.kv_buffer_type)) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const int64_t graph_alloc_start_us = phase_timing_enabled ? ggml_time_us() : 0;
+#endif
+        const bool graph_alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        if (phase_timing_enabled) {
+            ++pyramidkv_c1_phase_timing_stats.graph_alloc_calls;
+            pyramidkv_c1_phase_timing_stats.graph_alloc_us +=
+                static_cast<uint64_t>(ggml_time_us() - graph_alloc_start_us);
+        }
+#endif
+        if (!graph_alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1448,18 +1889,57 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const bool phase_timing_enabled = cparams.pyramidkv_c1.enabled;
+        const int64_t graph_set_inputs_start_us = phase_timing_enabled ? ggml_time_us() : 0;
+#endif
         res->set_inputs(&ubatch);
+
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        if (phase_timing_enabled) {
+            ++pyramidkv_c1_phase_timing_stats.graph_set_inputs_calls;
+            pyramidkv_c1_phase_timing_stats.graph_set_inputs_us +=
+                static_cast<uint64_t>(ggml_time_us() - graph_set_inputs_start_us);
+        }
+#endif
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    const bool phase_timing_enabled = cparams.pyramidkv_c1.enabled;
+    const int64_t graph_compute_submit_start_us = phase_timing_enabled ? ggml_time_us() : 0;
+#endif
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    if (phase_timing_enabled) {
+        ++pyramidkv_c1_phase_timing_stats.graph_compute_submit_calls;
+        pyramidkv_c1_phase_timing_stats.graph_compute_submit_us +=
+            static_cast<uint64_t>(ggml_time_us() - graph_compute_submit_start_us);
+    }
+#endif
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        if (cparams.pyramidkv_c1.enabled) {
+            if (auto * kv = llama_context_attention_cache(memory.get())) {
+                kv->pyramidkv_c1_fail_transition("PyramidKV graph execution failed");
+            }
+            pyramidkv_c1_pending.clear();
+        }
         ret = status;
         return nullptr;
     }
 
+    if (!extract_pyramidkv_scores(res, ubatch)) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    if (key_center_capture) {
+        ggml_backend_sched_synchronize(sched.get());
+        key_center_kv->tq4_key_center_commit_capture();
+    }
+    key_center_guard.complete = true;
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2489,6 +2969,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    if (cparams.pyramidkv_c1.enabled) {
+        const auto & config = cparams.pyramidkv_c1;
+        const uint64_t observed = std::min<uint64_t>(n_tokens, config.observation_window);
+        const uint64_t chunks = (observed + config.observer_chunk - 1) / config.observer_chunk;
+        // Include observer tiles, their views, hot writes and rotation nodes.
+        const uint64_t nodes = res + (48 + 32 * chunks) * config.layer_count;
+        if (nodes > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("PyramidKV graph node budget overflows");
+        }
+        res = static_cast<uint32_t>(nodes);
+    }
     return res;
 }
 
@@ -2555,6 +3046,17 @@ static void ubatch_prepare_reserve(
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    auto * c1_kv = llama_context_attention_cache(memory.get());
+    if (c1_kv != nullptr) {
+        std::string reset_error;
+        if (c1_kv->pyramidkv_c1_reset_failed(reset_error)) {
+            pyramidkv_c1_pending.clear();
+            sched_need_reserve = true;
+            LLAMA_LOG_ERROR("%s: refusing graph build while PyramidKV C1 reset is failed: %s\n",
+                    __func__, reset_error.c_str());
+            return nullptr;
+        }
+    }
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
@@ -2563,10 +3065,17 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
+    if (c1_kv != nullptr && c1_kv->pyramidkv_c1_graph_reset_pending()) {
+        synchronize();
+    }
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+    if (c1_kv != nullptr) {
+        pyramidkv_c1_pending.clear();
+        c1_kv->pyramidkv_c1_graph_reset_complete();
+    }
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2581,13 +3090,23 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    // Reserve with the observer enabled as the runtime worst case.
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), true);
 
     res->reset();
 
     auto * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
+
+    if (cparams.kv_buffer_type != nullptr) {
+        const auto kv_device = ggml_backend_buft_get_device(cparams.kv_buffer_type);
+        const auto kv_backend = llama_backend_for_device(backends, kv_device);
+        if (!llama_bind_explicit_kv_backend(sched.get(), gf, kv_backend, cparams.kv_buffer_type)) {
+            sched_need_reserve = true;
+            return nullptr;
+        }
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -2609,7 +3128,9 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                              bool pyramidkv_observer) const {
+    const auto * key_center_kv = cparams.tq4_key_center ? dynamic_cast<const llama_kv_cache *>(memory.get()) : nullptr;
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2624,6 +3145,8 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.pyramidkv_observer =*/ pyramidkv_observer,
+        /*.tq4_key_center_capture =*/ key_center_kv && key_center_kv->tq4_key_center_capture(),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -2685,6 +3208,183 @@ llm_graph_cb llama_context::graph_get_cb() const {
     };
 }
 
+bool llama_context::extract_pyramidkv_scores(
+        const llm_graph_result * res,
+        const llama_ubatch & ubatch) {
+    if (!cparams.pyramidkv_c1.enabled) {
+        return true;
+    }
+
+    const char * func = __func__;
+    auto fail = [&](const std::string & message) {
+        LLAMA_LOG_ERROR("%s: %s\n", func, message.c_str());
+        if (auto * kv = llama_context_attention_cache(memory.get())) {
+            kv->pyramidkv_c1_fail_transition(message);
+        }
+        pyramidkv_c1_pending.clear();
+        return false;
+    };
+
+    if (res == nullptr || (model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_QWEN35) ||
+        !cparams.flash_attn || !cparams.causal_attn || cparams.n_seq_max != 1 ||
+        cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+        cparams.n_rs_seq != 0 || cparams.nextn_layer_offset != 0 ||
+        cparams.embeddings_nextn || cparams.embeddings_nextn_masked ||
+        model.hparams.is_swa_any()) {
+        return fail("C1 requires Qwen2 or Qwen35 attention without SWA or speculative contexts");
+    }
+    // Qwen35 text broadcasts each position across its four M-RoPE axes.
+    // Image positions and unsupported memory layouts remain rejected.
+    if (ubatch.n_tokens == 0 || ubatch.n_pos == 0 ||
+            (ubatch.n_pos != 1 && !(model.arch == LLM_ARCH_QWEN35 && ubatch.token && ubatch.n_pos == 4)) ||
+            ubatch.n_seqs_unq != 1 || ubatch.pos == nullptr ||
+            ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return fail("C1 requires one active sequence with one-dimensional positions");
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr ||
+                ubatch.seq_id[i][0] != 0 || ubatch.pos[i] < 0 ||
+                (i != 0 && ubatch.pos[i] <= ubatch.pos[i - 1])) {
+            return fail("C1 requires strictly increasing positions for sequence 0");
+        }
+        for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
+            if (ubatch.pos[axis * ubatch.n_tokens + i] != ubatch.pos[i]) {
+                return fail("C1 only accepts broadcast text positions for Qwen35 M-RoPE");
+            }
+        }
+    }
+
+    auto * kv = llama_context_attention_cache(memory.get());
+    if (kv == nullptr) {
+        return fail("C1 requires an attention KV cache");
+    }
+
+    std::string error;
+    if (!kv->pyramidkv_c1_supported(error)) {
+        return fail(error);
+    }
+    const bool has_output = ubatch.output != nullptr &&
+        std::any_of(ubatch.output, ubatch.output + ubatch.n_tokens,
+            [](int8_t output) { return output != 0; });
+    if (kv->pyramidkv_c1_is_compacted()) {
+        pyramidkv_c1_pending.clear();
+        if (kv->pyramidkv_c1_should_maintain(ubatch.n_tokens, cparams.n_ubatch) &&
+                !kv->pyramidkv_c1_keep_all(pyramidkv_c1_pending, error)) {
+            return fail(error);
+        }
+        return true;
+    }
+    if (!has_output) {
+        // The Engine requests logits only on the final prompt token. Do not
+        // evict earlier facts using the queries of an incomplete prompt.
+        pyramidkv_c1_pending.clear();
+        return true;
+    }
+    // The immutable, validated context profile is the only configuration source.
+    // Keep a local value copy because selection annotates the layer index.
+    auto config = cparams.pyramidkv_c1;
+
+    const auto & score_nodes = res->get_pyramidkv_scores();
+    if (score_nodes.empty()) {
+        return fail("the attention graph produced no score observer outputs");
+    }
+
+    // The observer is a diagnostic side graph.  Synchronize before reading
+    // it, and before the next memory_update is allowed to compact storage.
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    ++pyramidkv_c1_phase_timing_stats.observer_events;
+    const int64_t observer_sync_start_us = ggml_time_us();
+#endif
+    synchronize();
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    pyramidkv_c1_phase_timing_stats.observer_sync_us +=
+        static_cast<uint64_t>(ggml_time_us() - observer_sync_start_us);
+#endif
+
+    const auto attention_layers = kv->get_layer_ids();
+    std::vector<llama_pyramidkv_c1_layer_selection> selections;
+    selections.reserve(score_nodes.size());
+    for (const auto & node : score_nodes) {
+        const auto layer = std::find(attention_layers.begin(), attention_layers.end(), node.il);
+        if (node.tensor == nullptr || node.il < 0 || layer == attention_layers.end() ||
+            node.tensor->type != GGML_TYPE_F32 || node.tensor->ne[0] != (int64_t) node.key_stride ||
+            node.tensor->ne[1] != (int64_t) node.kv_heads ||
+            node.tensor->ne[2] != 1 || node.tensor->ne[3] != 1 ||
+            node.key_stride < node.key_tokens || node.key_stride == 0 ||
+            node.kv_heads == 0 || node.query_heads == 0 ||
+            node.query_heads % node.kv_heads != 0 || node.query_tokens == 0 ||
+            node.query_start > ubatch.n_tokens ||
+            node.query_tokens > ubatch.n_tokens - node.query_start) {
+            return fail("score observer tensor geometry is not the reduced native C1 layout");
+        }
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+        if (backend == nullptr) {
+            return fail("score observer tensor has no scheduled backend");
+        }
+
+        const size_t n_elements = ggml_nelements(node.tensor);
+        if (n_elements == 0 || n_elements > config.observer_max_bytes / sizeof(float)) {
+            return fail("score observer tensor exceeds the bounded host extraction limit");
+        }
+
+        llama_pyramidkv_c1_score score;
+        score.il = node.il;
+        score.query_heads = node.query_heads;
+        score.kv_heads = node.kv_heads;
+        score.query_tokens = node.query_tokens;
+        score.key_stride = node.key_stride;
+        score.observation_window = config.observation_window;
+        score.head_scores.resize(n_elements);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const size_t readback_bytes = score.head_scores.size() * sizeof(float);
+        const int64_t readback_start_us = ggml_time_us();
+#endif
+        ggml_backend_tensor_get(node.tensor, score.head_scores.data(), 0,
+            score.head_scores.size() * sizeof(float));
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        ++pyramidkv_c1_phase_timing_stats.observer_readback_calls;
+        pyramidkv_c1_phase_timing_stats.observer_readback_bytes += readback_bytes;
+        pyramidkv_c1_phase_timing_stats.observer_readback_us +=
+            static_cast<uint64_t>(ggml_time_us() - readback_start_us);
+#endif
+
+        uint32_t active_tokens = 0;
+        if (!kv->pyramidkv_c1_key_positions(node.il, static_cast<uint32_t>(node.key_tokens),
+                score.key_positions_per_head, score.key_cells_per_head,
+                score.key_score_slots_per_head, active_tokens, error)) {
+            return fail(error);
+        }
+        score.key_tokens = 0;
+        for (const auto & head_positions : score.key_positions_per_head) {
+            score.key_tokens = std::max(score.key_tokens, head_positions.size());
+        }
+        score.logical_key_tokens = active_tokens;
+        score.query_positions.resize(score.query_tokens);
+        for (size_t i = 0; i < score.query_tokens; ++i) {
+            score.query_positions[i] = ubatch.pos[node.query_start + i];
+        }
+
+        config.layer_index = static_cast<std::size_t>(layer - attention_layers.begin());
+        llama_pyramidkv_c1_layer_selection selection;
+        if (!llama_pyramidkv_c1_select(score, config, selection, error)) {
+            return fail(error);
+        }
+        selections.push_back(std::move(selection));
+    }
+
+    if (selections.size() != attention_layers.size()) {
+        return fail("C1 did not observe every cached attention layer");
+    }
+
+    const bool any_would_compact = std::any_of(selections.begin(), selections.end(),
+        [](const llama_pyramidkv_c1_layer_selection & selection) { return selection.would_compact; });
+    LLAMA_LOG_INFO("%s: PyramidKV fixed-prefill selection; prompt_positions=%d observed_queries=%zu attention_layers=%zu pruned=%d\n",
+        func, ubatch.pos[ubatch.n_tokens - 1] + 1,
+        score_nodes.front().query_tokens, attention_layers.size(), any_would_compact ? 1 : 0);
+    pyramidkv_c1_pending = std::move(selections);
+    return true;
+}
 //
 // state save/load
 //
@@ -2901,7 +3601,9 @@ public:
         for (const auto & winfo : winfos) {
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
-            const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
+            // Quantized element_size is the packed block size; views use logical elements.
+            GGML_ASSERT(winfo.size % ggml_element_size(winfo.tensor) == 0);
+            const int64_t n = (winfo.size/ggml_element_size(winfo.tensor))*ggml_blck_size(winfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3032,7 +3734,8 @@ public:
         for (const auto & rinfo : rinfos) {
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
-            const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
+            GGML_ASSERT(rinfo.size % ggml_element_size(rinfo.tensor) == 0);
+            const int64_t n = (rinfo.size/ggml_element_size(rinfo.tensor))*ggml_blck_size(rinfo.tensor->type);
 
             auto & mbuf = mbufs_new[buft];
 
@@ -3422,6 +4125,74 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    pyramidkv_c1_phase_timing_stats = {};
+    if (auto * kv = llama_context_attention_cache(memory.get())) {
+        kv->pyramidkv_c1_reset_phase_timing();
+    }
+#endif
+}
+
+void llama_context::pyramidkv_c1_phase_timing_print() const {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    if (!cparams.pyramidkv_c1.enabled) {
+        return;
+    }
+    const auto * kv = llama_context_attention_cache(memory.get());
+    if (kv == nullptr) {
+        return;
+    }
+
+    const auto & cache = kv->pyramidkv_c1_get_phase_timing();
+    const auto & context = pyramidkv_c1_phase_timing_stats;
+    LLAMA_LOG_INFO("%s: C1 host-wall map_us=%" PRIu64 " calls=%" PRIu64
+        " read=%" PRIu64 " hot_read=%" PRIu64 " write=%" PRIu64
+        " hot_write=%" PRIu64 " pos=%" PRIu64 " mask=%" PRIu64 "\n",
+        __func__, cache.input_map_us, cache.input_map_calls,
+        cache.input_map_read_elems, cache.input_map_hot_read_elems,
+        cache.input_map_write_elems, cache.input_map_hot_write_elems,
+        cache.input_map_position_elems, cache.input_map_mask_elems);
+    LLAMA_LOG_INFO("%s: C1 host-wall observer_events=%" PRIu64
+        " sync_us=%" PRIu64 " readback_us=%" PRIu64 " readbacks=%" PRIu64
+        " bytes=%" PRIu64 "\n",
+        __func__, context.observer_events, context.observer_sync_us,
+        context.observer_readback_us, context.observer_readback_calls,
+        context.observer_readback_bytes);
+    LLAMA_LOG_INFO("%s: C1 host-wall synchronize_us=%" PRIu64
+        " calls=%" PRIu64 " (observer_sync_us is a subset)\n",
+        __func__, context.synchronize_us, context.synchronize_calls);
+    LLAMA_LOG_INFO("%s: C1 host-wall graph_build_us=%" PRIu64
+        " calls=%" PRIu64 " alloc_us=%" PRIu64 " calls=%" PRIu64
+        " set_inputs_us=%" PRIu64 " calls=%" PRIu64
+        " compute_submit_us=%" PRIu64 " calls=%" PRIu64 "\n",
+        __func__, context.graph_build_us, context.graph_build_calls,
+        context.graph_alloc_us, context.graph_alloc_calls,
+        context.graph_set_inputs_us, context.graph_set_inputs_calls,
+        context.graph_compute_submit_us, context.graph_compute_submit_calls);
+    LLAMA_LOG_INFO("%s: C1 graph ubatches_observer=%" PRIu64
+        " ubatches_nonobserver=%" PRIu64 " builds_observer=%" PRIu64
+        " builds_nonobserver=%" PRIu64 " reuses_observer=%" PRIu64
+        " reuses_nonobserver=%" PRIu64 "\n",
+        __func__, context.process_ubatch_observer_calls,
+        context.process_ubatch_nonobserver_calls,
+        context.graph_build_observer_calls, context.graph_build_nonobserver_calls,
+        context.graph_reuse_observer_calls, context.graph_reuse_nonobserver_calls);
+    LLAMA_LOG_INFO("%s: C1 host-wall compactions=%" PRIu64
+        " cold_us=%" PRIu64 " cold_calls=%" PRIu64 " cold_bytes=%" PRIu64
+        " hot_us=%" PRIu64 " hot_calls=%" PRIu64 " hot_bytes=%" PRIu64 "\n",
+        __func__, cache.compaction_calls, cache.cold_copy_us,
+        cache.cold_copy_calls, cache.cold_copy_bytes, cache.hot_copy_us,
+        cache.hot_copy_calls, cache.hot_copy_bytes);
+    LLAMA_LOG_INFO("%s: C1 host-wall promotion_us=%" PRIu64
+        " promotion_calls=%" PRIu64 " rows=%" PRIu64 " syncs=%" PRIu64
+        " post_compact_reserve_us=%" PRIu64 " calls=%" PRIu64
+        " sched_reserve_us=%" PRIu64 " calls=%" PRIu64 "\n",
+        __func__, cache.promotion_us, cache.promotion_calls,
+        cache.promotion_rows, cache.promotion_syncs,
+        context.post_compaction_reserve_us,
+        context.post_compaction_reserve_calls, context.sched_reserve_us,
+        context.sched_reserve_calls);
+#endif
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
@@ -3583,6 +4354,15 @@ void llama_context::opt_epoch_iter(
 
             auto * gf = model.build_graph(gparams);
 
+            if (cparams.kv_buffer_type != nullptr) {
+                const auto kv_device = ggml_backend_buft_get_device(cparams.kv_buffer_type);
+                const auto kv_backend = llama_backend_for_device(backends, kv_device);
+                if (!llama_bind_explicit_kv_backend(sched.get(), gf, kv_backend, cparams.kv_buffer_type)) {
+                    LLAMA_LOG_ERROR("%s: explicit KV backend cannot bind the training graph\n", __func__);
+                    return;
+                }
+            }
+
             struct ggml_context * ctx_compute_opt;
             {
                 const size_t size_gf = ggml_graph_size(gf);
@@ -3711,6 +4491,20 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_buffer_type              =*/ nullptr,
+        /*.pyramidkv_c1               =*/ {
+            /*.enabled                 =*/ false,
+            /*.max_capacity_prompt    =*/ 4096,
+            /*.beta                   =*/ 20,
+            /*.observation_window     =*/ 64,
+            /*.recent_window          =*/ 128,
+            /*.pooling_kernel         =*/ 3,
+            /*.observer_max_bytes     =*/ 64u*1024u*1024u,
+            /*.observer_chunk         =*/ 1,
+            /*.transition_max_bytes  =*/ 8ull*1024ull*1024ull*1024ull,
+            /*.hot_capacity           =*/ 384,
+        },
+        /*.tq4_key_center             =*/ false,
     };
 
     return result;
@@ -3755,6 +4549,106 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    const bool turbo4_k = llama_context_type_is_turbo4(params.type_k);
+    const bool turbo4_v = llama_context_type_is_turbo4(params.type_v);
+    if (turbo4_k != turbo4_v) {
+        LLAMA_LOG_ERROR("%s: TurboQuant4 requires symmetric K/V cache types\n", __func__);
+        return nullptr;
+    }
+
+    const auto is_turbo4_attention_layer = [&](uint32_t il) {
+        if (il >= model->hparams.n_layer_all || !model->hparams.has_kv(il)) {
+            return false;
+        }
+
+        const bool mtp_on_hybrid_qwen =
+            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            (model->arch == LLM_ARCH_QWEN3NEXT || model->arch == LLM_ARCH_QWEN35 ||
+             model->arch == LLM_ARCH_QWEN35MOE || model->arch == LLM_ARCH_BAILINGMOE3);
+
+        const bool mtp_on_hybrid_nemotron =
+            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model->arch == LLM_ARCH_NEMOTRON_H_MOE;
+
+        if (llm_arch_is_recurrent(model->arch)) {
+            return false;
+        }
+
+        if (llm_arch_is_hybrid(model->arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
+            if (model->arch == LLM_ARCH_FALCON_H1) {
+                return true;
+            }
+            if (model->arch == LLM_ARCH_NEMOTRON_H || model->arch == LLM_ARCH_NEMOTRON_H_MOE) {
+                return !model->hparams.is_recr(il) && model->hparams.n_ff(il) == 0;
+            }
+            if (model->arch == LLM_ARCH_QWEN3NEXT || model->arch == LLM_ARCH_QWEN35 ||
+                model->arch == LLM_ARCH_QWEN35MOE || model->arch == LLM_ARCH_MINIMAX_01) {
+                return il < model->hparams.n_layer() && !model->hparams.is_recr(il);
+            }
+
+            // llama_memory_hybrid's default attention filter.
+            return !model->hparams.is_recr(il);
+        }
+
+        if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
+            return il >= model->hparams.n_layer();
+        }
+
+        if ((model->arch == LLM_ARCH_STEP35 || model->arch == LLM_ARCH_HY_V3 ||
+             model->arch == LLM_ARCH_GLM_DSA || model->arch == LLM_ARCH_MIMO2 ||
+             model->arch == LLM_ARCH_DEEPSEEK32) && model->hparams.n_layer_nextn > 0) {
+            return params.ctx_type == LLAMA_CONTEXT_TYPE_MTP ?
+                il >= model->hparams.n_layer() : il < model->hparams.n_layer();
+        }
+
+        return true;
+    };
+
+    if (turbo4_k) {
+        if (model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 ||
+            model->arch == LLM_ARCH_DEEPSEEK32 || model->arch == LLM_ARCH_GLM_DSA ||
+            model->arch == LLM_ARCH_DOTS3NOTE || model->hparams.dsv4_hc_mult > 0) {
+            LLAMA_LOG_ERROR("%s: TurboQuant4 KV cache is unsupported for MLA/DSA attention\n", __func__);
+            return nullptr;
+        }
+
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn for TurboQuant4 KV cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: TurboQuant4 KV cache requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+
+        uint32_t n_attention_layers = 0;
+        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+            if (!is_turbo4_attention_layer(il)) {
+                continue;
+            }
+            ++n_attention_layers;
+
+            const uint32_t head_k = model->hparams.n_embd_head_k(il);
+            const uint32_t head_v = model->hparams.n_embd_head_v(il);
+            const uint32_t n_head_kv = model->hparams.n_head_kv(il);
+            const uint32_t n_head = model->hparams.n_head(il);
+
+            if (llama_context_turbo4_padded_head(head_k) == 0 ||
+                llama_context_turbo4_padded_head(head_v) == 0 ||
+                head_k != head_v || n_head_kv == 0 || n_head % n_head_kv != 0 ||
+                model->hparams.n_embd_k_gqa(il) != n_head_kv*head_k ||
+                model->hparams.n_embd_v_gqa(il) != n_head_kv*head_v) {
+                LLAMA_LOG_ERROR("%s: unsupported TurboQuant4 head geometry at layer %u (heads=%u/%u, dim=%u/%u)\n",
+                    __func__, il, n_head, n_head_kv, head_k, head_v);
+                return nullptr;
+            }
+        }
+
+        if (n_attention_layers == 0) {
+            LLAMA_LOG_ERROR("%s: TurboQuant4 requires at least one attention KV layer in this context\n", __func__);
+            return nullptr;
+        }
+    }
+
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
@@ -3768,10 +4662,15 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
+        const uint32_t n_layers = turbo4_k ? model->hparams.n_layer_all : model->hparams.n_layer();
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            if (turbo4_k && !is_turbo4_attention_layer(il)) {
+                continue;
+            }
+            const uint32_t head_dim = turbo4_k ? llama_context_turbo4_padded_head(model->hparams.n_embd_head_k(il)) : model->hparams.n_embd_head_k(il);
+            if (head_dim == 0 || head_dim % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                    __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
+                    __func__, ggml_type_name(params.type_k), blck_size, head_dim);
                 return nullptr;
             }
         }
@@ -3779,10 +4678,15 @@ llama_context * llama_init_from_model(
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
+        const uint32_t n_layers = turbo4_v ? model->hparams.n_layer_all : model->hparams.n_layer();
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            if (turbo4_v && !is_turbo4_attention_layer(il)) {
+                continue;
+            }
+            const uint32_t head_dim = turbo4_v ? llama_context_turbo4_padded_head(model->hparams.n_embd_head_v(il)) : model->hparams.n_embd_head_v(il);
+            if (head_dim == 0 || head_dim % blck_size != 0) {
                 LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
-                    __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
+                    __func__, ggml_type_name(params.type_v), blck_size, head_dim);
                 return nullptr;
             }
         }
@@ -3849,6 +4753,11 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
 
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
+}
+
+bool llama_tq4_key_center_is_ready(const llama_context * ctx) {
+    const auto * kv = ctx ? dynamic_cast<const llama_kv_cache *>(ctx->get_memory()) : nullptr;
+    return kv && kv->tq4_key_center_ready();
 }
 
 enum llama_pooling_type llama_pooling_type(const llama_context * ctx) {
@@ -4357,12 +5266,19 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->decode(batch);
-    if (ret != 0 && ret != 1) {
-        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
-    }
+    try {
+        const int ret = ctx->decode(batch);
+        if (ret != 0 && ret != 1) {
+            LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+        }
 
-    return ret;
+        return ret;
+    } catch (const std::exception & err) {
+        // Explicit KV backend validation can fail while reserving a graph.
+        // Keep the public C API exception-free and report a normal decode error.
+        LLAMA_LOG_ERROR("%s: exception while decoding: %s\n", __func__, err.what());
+        return -1;
+    }
 }
 
 //
@@ -4393,6 +5309,9 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    ctx->pyramidkv_c1_phase_timing_print();
+#endif
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

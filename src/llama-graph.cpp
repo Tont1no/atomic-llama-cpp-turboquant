@@ -16,14 +16,101 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include "../ggml/src/ggml-turbo4.h"
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
+
+static bool llama_graph_type_is_turbo4(ggml_type type) {
+    return type == GGML_TYPE_TURBO4_0;
+}
+
+static ggml_backend_t llama_graph_backend_for_buft(
+        ggml_backend_sched_t sched,
+        ggml_backend_buffer_type_t buft) {
+    if (sched == nullptr || buft == nullptr) {
+        return nullptr;
+    }
+
+    const ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    if (device == nullptr) {
+        return nullptr;
+    }
+
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (backend != nullptr && ggml_backend_get_device(backend) == device) {
+            return backend;
+        }
+    }
+
+    return nullptr;
+}
+
+static int64_t llama_graph_turbo4_padded_head(int64_t head_dim) {
+    if (head_dim == 64 || head_dim == GGML_TURBO4_QK) {
+        return GGML_TURBO4_QK;
+    }
+    if (head_dim == 2*GGML_TURBO4_QK) {
+        return 2*GGML_TURBO4_QK;
+    }
+    return 0;
+}
+
+static ggml_tensor * llama_graph_turbo4_rotate(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * rotation) {
+    if (rotation == nullptr || rotation->ne[0] != GGML_TURBO4_QK || rotation->ne[1] != GGML_TURBO4_QK) {
+        throw std::runtime_error("TurboQuant4 graph rotation matrix is unavailable");
+    }
+
+    const int64_t ne0 = cur->ne[0];
+    const int64_t ne1 = cur->ne[1];
+    const int64_t ne2 = cur->ne[2];
+    const int64_t ne3 = cur->ne[3];
+    const int64_t n = ggml_nelements(cur);
+    if (n % GGML_TURBO4_QK != 0) {
+        throw std::runtime_error("TurboQuant4 graph rotation requires 128-value groups");
+    }
+
+    ggml_tensor * flat = ggml_is_contiguous(cur) ?
+        ggml_reshape_2d(ctx, cur, GGML_TURBO4_QK, n/GGML_TURBO4_QK) :
+        ggml_cont_2d(ctx, cur, GGML_TURBO4_QK, n/GGML_TURBO4_QK);
+
+    ggml_tensor * rotated = ggml_mul_mat(ctx, rotation, flat);
+    // Preserve the orthogonal transform in single-token CUDA matrix-vector kernels.
+    ggml_mul_mat_set_prec(rotated, GGML_PREC_F32);
+    return ggml_reshape_4d(ctx, rotated, ne0, ne1, ne2, ne3);
+}
+
+static ggml_tensor * llama_graph_turbo4_pad_head(ggml_context * ctx, ggml_tensor * cur, int64_t padded_head) {
+    if (padded_head == 0 || cur->ne[0] > padded_head) {
+        throw std::runtime_error("TurboQuant4 graph head dimension is unsupported");
+    }
+    return cur->ne[0] == padded_head ? cur : ggml_pad(ctx, cur, padded_head - cur->ne[0], 0, 0, 0);
+}
+
+static ggml_tensor * llama_graph_turbo4_cut_v(ggml_context * ctx, ggml_tensor * cur,
+        int64_t logical_head, int64_t padded_head, int64_t n_heads) {
+    if (logical_head == padded_head) {
+        return cur;
+    }
+    if (logical_head <= 0 || padded_head <= logical_head || cur->ne[0] != padded_head*n_heads) {
+        throw std::runtime_error("TurboQuant4 graph V output shape is unsupported");
+    }
+
+    const int64_t n_tokens = cur->ne[1];
+    cur = ggml_reshape_3d(ctx, cur, padded_head, n_heads, n_tokens);
+    cur = ggml_view_3d(ctx, cur, logical_head, n_heads, n_tokens, cur->nb[1], cur->nb[2], 0);
+    cur = ggml_cont(ctx, cur);
+    return ggml_reshape_2d(ctx, cur, logical_head*n_heads, n_tokens);
+}
 
 // dedup helpers
 
@@ -66,6 +153,9 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
+    if (kq_mask == nullptr) {
+        return true;
+    }
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
@@ -487,9 +577,29 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_attn_kv::llm_graph_input_attn_kv(
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * mctx) :
+    hparams(hparams), cparams(cparams), mctx(mctx) {
+    // A full memory context is reused across graph reservations of different sizes.
+    // Its input tensors belong to the newly built graph, not the previous one.
+    if (mctx != nullptr) {
+        mctx->pyramidkv_inputs.clear();
+    }
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    pyramidkv_inputs = mctx->pyramidkv_inputs;
+    // Compacted PyramidKV writes only its head-local hot ring. The ordinary
+    // cold-store indices then have no graph consumers and stay unallocated.
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
+    mctx->set_input_pyramidkv_indices(ubatch);
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -507,9 +617,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
+    const auto * next_mctx = static_cast<const llama_kv_cache_context *>(params.mctx);
 
-    this->mctx = mctx;
+    // The previous batch's memory context may already have been destroyed.
+    next_mctx->pyramidkv_inputs = pyramidkv_inputs;
+    this->mctx = next_mctx;
 
     bool res = true;
 
@@ -1104,18 +1216,15 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
-    mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
-    mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
-
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
-
-    if (inp_attn->self_k_rot) {
-        mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
-    }
-
-    if (inp_attn->self_v_rot) {
-        mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
-    }
+    // The attention half owns the PyramidKV C1 index/position inputs and the
+    // guards for tensors that stay unallocated once C1 has compacted: the
+    // cold-store indices and the logical KQ mask then have no graph consumers.
+    // Calling the raw setters here asserted on those unallocated buffers for
+    // the Qwen35 hybrid lane (GGML_ASSERT(buffer) after the first compaction)
+    // and never filled the C1 inputs at all. Route through the attention
+    // input's own set_input, exactly like the dense path.
+    inp_attn->mctx = mctx->get_attn();
+    inp_attn->set_input(ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1134,6 +1243,11 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_hybrid_context *>(params.mctx);
 
     this->mctx = mctx;
+    // Keep the attention half's memory context and its PyramidKV input list in
+    // step with the reused graph, as llm_graph_input_attn_kv::can_reuse does;
+    // the previous batch's attention context may already be destroyed.
+    mctx->get_attn()->pyramidkv_inputs = inp_attn->pyramidkv_inputs;
+    inp_attn->mctx = mctx->get_attn();
 
     bool res = true;
 
@@ -1356,6 +1470,9 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    pyramidkv_scores.clear();
+    pyramidkv_observer_bytes = 0;
+    pyramidkv_observer_output_bytes = 0;
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1418,6 +1535,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(tensor);
         }
     }
+    for (const auto & score : pyramidkv_scores) {
+        if (score.tensor != nullptr) {
+            ggml_set_output(score.tensor);
+        }
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1461,6 +1583,10 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
 }
 
+void llm_graph_result::add_pyramidkv_score(llm_graph_pyramidkv_score result) {
+    pyramidkv_scores.push_back(result);
+}
+
 void llm_graph_result::set_params(const llm_graph_params & params) {
     this->params = params;
 }
@@ -1474,6 +1600,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
+    pyramidkv_observer_enabled(params.pyramidkv_observer),
+    tq4_key_center_capture_enabled(params.tq4_key_center_capture),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),
@@ -2558,6 +2686,298 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+void llm_graph_context::build_pyramidkv_observer(
+        ggml_tensor * q,
+        ggml_tensor * k_cold,
+        ggml_tensor * k_hot,
+        ggml_tensor * observer_mask,
+              float   kq_scale,
+        ggml_tensor * sinks,
+                int   il) const {
+    const auto & observer_config = cparams.pyramidkv_c1;
+    if (q == nullptr || k_cold == nullptr || q->ne[0] != k_cold->ne[0] ||
+            q->ne[3] != k_cold->ne[3]) {
+        throw std::runtime_error("PyramidKV C1 observer has incompatible Q/K shapes");
+    }
+    if (k_hot != nullptr && (k_hot->ne[0] != k_cold->ne[0] ||
+            k_hot->ne[2] != k_cold->ne[2] || k_hot->ne[3] != k_cold->ne[3])) {
+        throw std::runtime_error("PyramidKV C1 hybrid observer has incompatible cold/hot shapes");
+    }
+
+    const std::size_t cold_tokens = static_cast<std::size_t>(k_cold->ne[1]);
+    const std::size_t hot_tokens = k_hot == nullptr ? 0 : static_cast<std::size_t>(k_hot->ne[1]);
+    if (hot_tokens > std::numeric_limits<std::size_t>::max() - cold_tokens) {
+        throw std::runtime_error("PyramidKV C1 observer key shape overflows");
+    }
+    const std::size_t key_tokens = cold_tokens + hot_tokens;
+    const std::size_t query_tokens_all = static_cast<std::size_t>(q->ne[1]);
+    const std::size_t query_heads = static_cast<std::size_t>(q->ne[2]);
+    const std::size_t kv_heads = static_cast<std::size_t>(k_cold->ne[2]);
+    if (key_tokens == 0 || query_tokens_all == 0 || query_heads == 0 || kv_heads == 0 ||
+            query_heads % kv_heads != 0) {
+        throw std::runtime_error("PyramidKV C1 observer has invalid GQA geometry");
+    }
+    if (k_hot != nullptr) {
+        if (observer_mask == nullptr || observer_mask->type != GGML_TYPE_F32 ||
+                observer_mask->ne[0] != static_cast<int64_t>(key_tokens) ||
+                observer_mask->ne[1] != static_cast<int64_t>(query_tokens_all) ||
+                observer_mask->ne[2] != static_cast<int64_t>(query_heads) ||
+                observer_mask->ne[3] != q->ne[3]) {
+            throw std::runtime_error(
+                "PyramidKV C1 hybrid observer requires a per-query-head F32 mask");
+        }
+    }
+
+    const ggml_tensor * cache_root = k_cold;
+    while (cache_root->view_src != nullptr) {
+        cache_root = cache_root->view_src;
+    }
+    if (cache_root->buffer == nullptr || ggml_backend_buffer_is_host(cache_root->buffer)) {
+        throw std::runtime_error("PyramidKV C1 observer requires allocated GPU KV storage");
+    }
+    const auto kv_device = ggml_backend_buft_get_device(
+        ggml_backend_buffer_get_type(cache_root->buffer));
+    ggml_backend_t observer_backend = nullptr;
+    for (int index = 0; index < ggml_backend_sched_get_n_backends(sched); ++index) {
+        auto candidate = ggml_backend_sched_get_backend(sched, index);
+        if (ggml_backend_get_device(candidate) == kv_device) {
+            observer_backend = candidate;
+            break;
+        }
+    }
+    if (observer_backend == nullptr) {
+        throw std::runtime_error("PyramidKV C1 observer has no backend for its KV device");
+    }
+
+    const size_t alignment = std::max<size_t>(1, ggml_backend_buft_get_alignment(
+        ggml_backend_get_default_buffer_type(observer_backend)));
+    // Budget model: the graph allocator frees every observer intermediate once
+    // its consumer ran and reuses that memory for the next layer, so the live
+    // set is one layer's intermediates (charged twice here as a scratch
+    // margin) plus the small per-layer [key, kv_head] score outputs that must
+    // survive until extraction. Summing all layers, as before, grew linearly
+    // with the layer count and made 32K+ contexts fail the budget on a 27B
+    // hybrid although the real allocation never exceeded one layer.
+    std::size_t layer_bytes = 0;
+    const auto charge_observer = [&](size_t bytes) {
+        const size_t remainder = bytes % alignment;
+        const size_t padding = remainder == 0 ? 0 : alignment - remainder;
+        if (bytes > std::numeric_limits<size_t>::max() - padding) {
+            throw std::runtime_error("PyramidKV observer byte count overflows");
+        }
+        bytes += padding;
+        const size_t retained = res->pyramidkv_observer_output_bytes;
+        if (retained > observer_config.observer_max_bytes ||
+                layer_bytes > observer_config.observer_max_bytes - retained ||
+                bytes > observer_config.observer_max_bytes - retained - layer_bytes) {
+            throw std::runtime_error("PyramidKV observer graph exceeds its per-layer byte budget: layer=" +
+                std::to_string(il) + " layer_charged=" + std::to_string(layer_bytes) +
+                " retained_outputs=" + std::to_string(retained) +
+                " next=" + std::to_string(bytes) + " limit=" + std::to_string(observer_config.observer_max_bytes));
+        }
+        layer_bytes += bytes;
+    };
+    const auto observer_op = [&](ggml_tensor * node) {
+        if (!ggml_backend_supports_op(observer_backend, node)) {
+            throw std::runtime_error(std::string("PyramidKV KV-device observer does not support ") +
+                ggml_op_desc(node));
+        }
+        // Charge every intermediate twice (allocation plus a scratch copy)
+        // within this layer. This deliberately overcounts graph reuse.
+        charge_observer(ggml_nbytes(node));
+        charge_observer(ggml_nbytes(node));
+        ggml_format_name(node, "pyramidkv_observer_l%d_%s", il, ggml_op_name(node->op));
+        ggml_backend_sched_set_tensor_backend(sched, node, observer_backend);
+        return node;
+    };
+
+    if (observer_mask != nullptr) {
+        charge_observer(ggml_nbytes(observer_mask));
+    }
+    charge_observer(ggml_nbytes(q));
+
+    // Decode tile for the cold-only path: the observer never needs the whole
+    // cache as one F32 tensor. Rows are decoded in bounded tiles and scored
+    // against the query window; a 27B Qwen layer at 256K cells would otherwise
+    // materialize a 1 GiB F32 copy per layer.
+    constexpr std::size_t observer_decode_tile_bytes = 64ULL * 1024 * 1024;
+    const std::size_t decode_row_bytes =
+        static_cast<std::size_t>(k_cold->ne[0]) * kv_heads * sizeof(float);
+    const std::size_t key_tile = (k_hot == nullptr && k_cold->type != GGML_TYPE_F32 &&
+            decode_row_bytes > 0)
+        ? std::max<std::size_t>(256, std::min(key_tokens, observer_decode_tile_bytes / decode_row_bytes))
+        : key_tokens;
+
+    ggml_tensor * observer_k = nullptr;
+    if (k_hot != nullptr) {
+        // Cold TQ4 and rotated F16 hot rows are both decoded on the KV device
+        // before one common score path. The hot rows are never scored through
+        // a host copy or a second attention implementation.
+        ggml_tensor * cold_f32 = k_cold->type == GGML_TYPE_F32 ? k_cold :
+            observer_op(ggml_cast(ctx0, k_cold, GGML_TYPE_F32));
+        ggml_tensor * hot_f32 = k_hot->type == GGML_TYPE_F32 ? k_hot :
+            observer_op(ggml_cast(ctx0, k_hot, GGML_TYPE_F32));
+        observer_k = observer_op(ggml_concat(ctx0, cold_f32, hot_f32, 1));
+    } else if (k_cold->type == GGML_TYPE_F32 || key_tile >= key_tokens) {
+        // Small caches keep the original single F32 decode.
+        observer_k = k_cold->type == GGML_TYPE_F32 ? k_cold :
+            observer_op(ggml_cast(ctx0, k_cold, GGML_TYPE_F32));
+    }
+    // observer_k == nullptr: score per decoded key tile below.
+
+    const std::size_t query_start = query_tokens_all > observer_config.observation_window
+        ? query_tokens_all - observer_config.observation_window : 0;
+    const std::size_t query_tokens = query_tokens_all - query_start;
+    bool observer_size_ok = true;
+    const std::size_t per_query_bytes =
+        key_tokens > std::numeric_limits<std::size_t>::max() / query_heads ?
+            0 : key_tokens * query_heads;
+    const std::size_t per_query_bytes_f32 = per_query_bytes >
+            std::numeric_limits<std::size_t>::max() / sizeof(float) ?
+        0 : per_query_bytes * sizeof(float);
+    if (per_query_bytes_f32 == 0) {
+        observer_size_ok = false;
+    }
+    const std::size_t max_chunk_by_bytes = observer_size_ok
+        ? observer_config.observer_max_bytes / per_query_bytes_f32 : 0;
+    if (!observer_size_ok || max_chunk_by_bytes == 0) {
+        throw std::runtime_error(
+            "PyramidKV C1 observer byte budget cannot hold one query row");
+    }
+    const std::size_t chunk = std::min({
+        query_tokens,
+        observer_config.observer_chunk,
+        max_chunk_by_bytes,
+    });
+
+    // Reduce each bounded query tile over queries and GQA groups before
+    // exposing it as a graph output. The graph retains only [key, kv_head]
+    // per layer and never allocates the complete query/key score matrix.
+    ggml_tensor * reduced = nullptr;
+    // Query tiles run one after another; everything a tile allocates except its
+    // [key, kv_head] contribution to `reduced` is dead before the next tile
+    // starts, so the layer budget holds the largest tile, not the sum of tiles.
+    std::size_t chunk_peak_bytes = 0;
+    for (std::size_t query_offset = 0; query_offset < query_tokens;
+            query_offset += chunk) {
+        const std::size_t chunk_base_bytes = layer_bytes;
+        const std::size_t tile_tokens = std::min(chunk, query_tokens - query_offset);
+        const size_t q_offset = (query_start + query_offset) * q->nb[1];
+        ggml_tensor * q_tile = ggml_view_4d(ctx0, q, q->ne[0], tile_tokens,
+            q->ne[2], q->ne[3], q->nb[1], q->nb[2], q->nb[3], q_offset);
+        ggml_tensor * mask_tile = observer_mask;
+        if (observer_mask != nullptr) {
+            const size_t mask_offset = (query_start + query_offset) * observer_mask->nb[1];
+            mask_tile = ggml_view_4d(ctx0, observer_mask, observer_mask->ne[0], tile_tokens,
+                observer_mask->ne[2], observer_mask->ne[3], observer_mask->nb[1],
+                observer_mask->nb[2], observer_mask->nb[3], mask_offset);
+            if (!ggml_is_contiguous(mask_tile)) {
+                mask_tile = observer_op(ggml_cont(ctx0, mask_tile));
+            }
+        }
+
+        ggml_tensor * tile_scores = nullptr;
+        if (observer_k != nullptr) {
+            tile_scores = observer_op(ggml_mul_mat(ctx0, observer_k, q_tile));
+            ggml_mul_mat_set_prec(tile_scores, GGML_PREC_F32);
+        } else {
+            // [key_tile, tile_query, query_head] pieces are concatenated along
+            // the key axis so the softmax below still spans every key. Each
+            // decoded tile and each partial concatenation is dead after its
+            // consumer and is reused by the allocator, so the budget charges
+            // the live set once: one decoded tile, one piece, and the running
+            // plus the new concatenation (each doubled as scratch margin).
+            const auto place_only = [&](ggml_tensor * node) {
+                if (!ggml_backend_supports_op(observer_backend, node)) {
+                    throw std::runtime_error(std::string("PyramidKV KV-device observer does not support ") +
+                        ggml_op_desc(node));
+                }
+                ggml_format_name(node, "pyramidkv_observer_l%d_%s", il, ggml_op_name(node->op));
+                ggml_backend_sched_set_tensor_backend(sched, node, observer_backend);
+                return node;
+            };
+            const std::size_t first_rows = std::min(key_tile, key_tokens);
+            const std::size_t tile_decode_bytes = first_rows * decode_row_bytes;
+            const std::size_t piece_bytes = first_rows * tile_tokens * query_heads * sizeof(float);
+            const std::size_t full_bytes = key_tokens * tile_tokens * query_heads * sizeof(float);
+            for (int scratch = 0; scratch < 2; ++scratch) {
+                charge_observer(tile_decode_bytes);
+                charge_observer(piece_bytes);
+                charge_observer(full_bytes);
+                charge_observer(full_bytes);
+            }
+            for (std::size_t key_offset = 0; key_offset < key_tokens; key_offset += key_tile) {
+                const std::size_t rows = std::min(key_tile, key_tokens - key_offset);
+                ggml_tensor * k_rows = ggml_view_4d(ctx0, k_cold, k_cold->ne[0], rows,
+                    k_cold->ne[2], k_cold->ne[3], k_cold->nb[1], k_cold->nb[2], k_cold->nb[3],
+                    key_offset * k_cold->nb[1]);
+                ggml_tensor * k_rows_f32 = place_only(ggml_cast(ctx0, k_rows, GGML_TYPE_F32));
+                ggml_tensor * piece = place_only(ggml_mul_mat(ctx0, k_rows_f32, q_tile));
+                ggml_mul_mat_set_prec(piece, GGML_PREC_F32);
+                tile_scores = tile_scores == nullptr ? piece :
+                    place_only(ggml_concat(ctx0, tile_scores, piece, 0));
+            }
+        }
+
+        float observer_scale = kq_scale;
+        if (hparams.attn_soft_cap) {
+            tile_scores = observer_op(ggml_scale(ctx0, tile_scores,
+                kq_scale / hparams.f_attn_logit_softcapping));
+            tile_scores = observer_op(ggml_tanh(ctx0, tile_scores));
+            tile_scores = observer_op(ggml_scale(ctx0, tile_scores,
+                hparams.f_attn_logit_softcapping));
+            observer_scale = 1.0f;
+        }
+
+        tile_scores = observer_op(ggml_soft_max_ext(ctx0, tile_scores, mask_tile,
+            observer_scale, hparams.f_max_alibi_bias));
+        ggml_soft_max_add_sinks(tile_scores, sinks);
+        if (tile_scores->type != GGML_TYPE_F32) {
+            tile_scores = observer_op(ggml_cast(ctx0, tile_scores, GGML_TYPE_F32));
+        }
+
+        // [key, tile_query, query_head] -> [1, key, query_head],
+        // then reshape query heads as [group, kv_head] and reduce the GQA
+        // group. Scale by group size to match the reference.
+        ggml_tensor * by_query = ggml_permute(ctx0, tile_scores, 1, 0, 2, 3);
+        by_query = observer_op(ggml_cont(ctx0, by_query));
+        by_query = observer_op(ggml_sum_rows(ctx0, by_query));
+        by_query = observer_op(ggml_cont(ctx0, by_query));
+        by_query = ggml_reshape_4d(ctx0, by_query, 1, key_tokens,
+            query_heads / kv_heads, kv_heads);
+        by_query = ggml_permute(ctx0, by_query, 2, 1, 0, 3);
+        by_query = observer_op(ggml_cont(ctx0, by_query));
+        by_query = observer_op(ggml_sum_rows(ctx0, by_query));
+        by_query = observer_op(ggml_scale(ctx0, by_query,
+            1.0f / static_cast<float>(query_heads / kv_heads)));
+        // SUM_ROWS and SCALE are contiguous [1, key, 1, kv_head].
+        // The key/head order is already correct; only remove singleton axes.
+        by_query = ggml_reshape_2d(ctx0, by_query, key_tokens, kv_heads);
+
+        reduced = reduced == nullptr ? by_query : observer_op(ggml_add(ctx0, reduced, by_query));
+        chunk_peak_bytes = std::max(chunk_peak_bytes, layer_bytes - chunk_base_bytes);
+        layer_bytes = chunk_base_bytes + chunk_peak_bytes;
+    }
+
+    reduced = observer_op(ggml_cont(ctx0, reduced));
+    // The reduced scores of every layer stay allocated until extraction.
+    res->pyramidkv_observer_output_bytes += ggml_nbytes(reduced);
+    res->pyramidkv_observer_bytes = std::max(res->pyramidkv_observer_bytes,
+        layer_bytes + res->pyramidkv_observer_output_bytes);
+    res->add_pyramidkv_score({
+        /*.tensor              =*/ reduced,
+        /*.il                  =*/ il,
+        /*.query_heads         =*/ query_heads,
+        /*.kv_heads            =*/ kv_heads,
+        /*.query_tokens        =*/ query_tokens,
+        /*.query_start         =*/ query_start,
+        /*.key_tokens          =*/ key_tokens,
+        /*.key_stride          =*/ key_tokens,
+        /*.observation_window  =*/ observer_config.observation_window,
+    });
+    ggml_build_forward_expand(gf, reduced);
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -2582,6 +3002,28 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_pyramidkv_c1 = cparams.pyramidkv_c1.enabled;
+    const bool c1_dense_types =
+        (k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0) ||
+        ((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) &&
+         (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32));
+    const bool qwen35_c1_geometry = use_pyramidkv_c1 &&
+        arch == LLM_ARCH_QWEN35 && hparams.n_layer() == 64 &&
+        il >= 0 && static_cast<uint32_t>(il) < hparams.n_layer() && !hparams.is_recr(il) &&
+        !hparams.is_swa(il) && hparams.n_embd_head_k(il) == 256 &&
+        hparams.n_embd_head_v(il) == 256 && hparams.n_head_kv(il) > 0 &&
+        hparams.n_head(il) >= hparams.n_head_kv(il) &&
+        hparams.n_head(il) % hparams.n_head_kv(il) == 0;
+    if (use_pyramidkv_c1 && ((arch != LLM_ARCH_QWEN2 && !qwen35_c1_geometry) ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || !cparams.causal_attn ||
+            !use_flash_attn ||
+            n_stream != 1 || v_trans || !c1_dense_types)) {
+        throw std::runtime_error(
+            "PyramidKV C1 requires a single-stream Qwen2 or target Qwen35 dense FlashAttention graph");
+    }
+    if ((llama_graph_type_is_turbo4(k->type) || llama_graph_type_is_turbo4(v->type)) && !use_flash_attn) {
+        throw std::runtime_error("TurboQuant4 requires FlashAttention without a separate KQ bias tensor");
+    }
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2601,6 +3043,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+        if (use_pyramidkv_c1 && pyramidkv_observer_enabled) {
+            build_pyramidkv_observer(q, k, nullptr, kq_mask, kq_scale, sinks, il);
+        }
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
@@ -2718,6 +3164,10 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     return (llm_graph_input_attn_no_cache *) res->add_input(std::move(inp));
 }
 
+ggml_tensor * llm_graph_input_attn_kv::get_kq_mask(ggml_context * ctx, int32_t il) const {
+    return mctx->get_kq_mask(ctx, self_kq_mask_cnv, il);
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_no_cache * inp,
         ggml_tensor * wo,
@@ -2786,7 +3236,11 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, sched);
+        // The compacted hybrid operator applies causal and validity checks
+        // from original q/k positions. Building the old logical mask here
+        // would allocate against the full logical context again.
+        inp->self_kq_mask = mctx_cur->pyramidkv_c1_compacted()
+            ? nullptr : build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, sched);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -2819,13 +3273,92 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
+    const auto * mctx_cur = inp->mctx;
+    const bool turbo4_k = llama_graph_type_is_turbo4(mctx_cur->type_k());
+    const bool turbo4_v = llama_graph_type_is_turbo4(mctx_cur->type_v());
+    bool turbo4_q_rotated = false;
+    ggml_tensor * k_hot_cur = nullptr;
+    ggml_tensor * v_hot_cur = nullptr;
+    if (turbo4_k != turbo4_v) {
+        throw std::runtime_error("TurboQuant4 requires symmetric K/V cache types");
+    }
+
+    if (inp->self_k_rot && !turbo4_k) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
-    if (inp->self_v_rot) {
+    if (inp->self_v_rot && !turbo4_v) {
         v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    if (cparams.tq4_key_center) {
+        if (cparams.kv_buffer_type == nullptr) {
+            throw std::runtime_error("native TQ4 key centering requires an explicit KV buffer");
+        }
+        if (k_cur == nullptr || k_cur->type != GGML_TYPE_F32 ||
+                k_cur->ne[0] <= 0 || k_cur->ne[1] <= 0 || k_cur->ne[2] <= 0 || k_cur->ne[3] != 1 ||
+                k_cur->nb[0] != sizeof(float)) {
+            throw std::runtime_error("native TQ4 key centering requires F32 post-RoPE K with scalar stride");
+        }
+
+        ggml_tensor * anchor = mctx_cur->get_tq4_key_anchor(il);
+        if (anchor == nullptr || anchor->type != GGML_TYPE_F32 ||
+                anchor->ne[0] != k_cur->ne[0] || anchor->ne[1] != k_cur->ne[1] ||
+                anchor->ne[2] != 1 || anchor->ne[3] != 1 || anchor->nb[0] != sizeof(float)) {
+            throw std::runtime_error("native TQ4 key centering anchor shape or type is invalid");
+        }
+
+        ggml_tensor * anchor_source = anchor;
+        ggml_backend_t kv_backend = llama_graph_backend_for_buft(sched, cparams.kv_buffer_type);
+        if (kv_backend == nullptr) {
+            throw std::runtime_error("native TQ4 key centering has no backend for the explicit KV device");
+        }
+        if (tq4_key_center_capture_enabled) {
+            // Capture first token, all KV heads. The CPY result remains the
+            // SUB source, so graph dependencies force capture before center.
+            ggml_tensor * k0 = ggml_view_2d(ctx0, k_cur,
+                k_cur->ne[0], k_cur->ne[1], k_cur->nb[1], 0);
+            ggml_format_name(k0, "tq4_key_capture_source_l%d", il);
+            anchor_source = ggml_cpy(ctx0, k0, anchor);
+            ggml_format_name(anchor_source, "tq4_key_anchor_capture_l%d", il);
+
+            if (!ggml_backend_supports_op(kv_backend, anchor_source)) {
+                throw std::runtime_error(std::string("explicit KV backend does not support native TQ4 key anchor CPY: ") +
+                    ggml_backend_name(kv_backend));
+            }
+            ggml_backend_sched_set_tensor_backend(sched, anchor_source, kv_backend);
+        }
+
+        // Anchor is [D, KVHeads]. Reshape only changes metadata; SUB broadcasts
+        // it over token and sequence dimensions of K [D, KVHeads, N, 1].
+        ggml_tensor * anchor_3d = ggml_reshape_3d(ctx0, anchor_source,
+            anchor->ne[0], anchor->ne[1], 1);
+        k_cur = ggml_sub(ctx0, k_cur, anchor_3d);
+        ggml_format_name(k_cur, "tq4_key_centered_l%d", il);
+
+        if (!ggml_backend_supports_op(kv_backend, k_cur)) {
+            throw std::runtime_error(std::string("explicit KV backend does not support native TQ4 key SUB: ") +
+                ggml_backend_name(kv_backend));
+        }
+        ggml_backend_sched_set_tensor_backend(sched, k_cur, kv_backend);
+    }
+
+    if (turbo4_k && cparams.pyramidkv_c1.enabled) {
+        const int64_t q_head = llama_graph_turbo4_padded_head(q_cur->ne[0]);
+        const int64_t k_head = llama_graph_turbo4_padded_head(k_cur->ne[0]);
+        const int64_t v_head = llama_graph_turbo4_padded_head(v_cur->ne[0]);
+        if (q_head == 0 || k_head == 0 || v_head == 0 || q_head != k_head || q_head != v_head) {
+            throw std::runtime_error("PyramidKV C1 requires one shared padded TQ4 head dimension");
+        }
+        q_cur = llama_graph_turbo4_pad_head(ctx0, q_cur, q_head);
+        k_cur = llama_graph_turbo4_pad_head(ctx0, k_cur, k_head);
+        v_cur = llama_graph_turbo4_pad_head(ctx0, v_cur, v_head);
+        q_cur = llama_graph_turbo4_rotate(ctx0, q_cur, mctx_cur->get_turbo_rotation());
+        // TQ4 SET_ROWS rotates internally. Only the F16 hot copy needs explicit rotation.
+        k_hot_cur = llama_graph_turbo4_rotate(ctx0, k_cur, mctx_cur->get_turbo_rotation());
+        v_hot_cur = llama_graph_turbo4_rotate(ctx0, v_cur, mctx_cur->get_turbo_rotation());
+        turbo4_q_rotated = true;
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2835,27 +3368,95 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
-    const auto * mctx_cur = inp->mctx;
+    const bool use_pyramidkv_c1 = cparams.pyramidkv_c1.enabled;
+    const bool use_pyramidkv_hybrid = use_pyramidkv_c1 &&
+        mctx_cur->pyramidkv_hybrid_ready(il);
 
-    // store to KV cache
-    {
+    // Before the first observation the bounded cold cache is populated by
+    // the normal SET_ROWS path. Once per-head compaction commits, cold rows
+    // are immutable; writing new tokens to one scratch row would alias an
+    // entire ubatch. Continuations therefore write only the hot ring.
+    if (!use_pyramidkv_hybrid) {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
-
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
+    if (use_pyramidkv_c1) {
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k_hot(ctx0, k_hot_cur, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v_hot(ctx0, v_hot_cur, il));
+    }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    if (use_pyramidkv_hybrid) {
+        const bool qwen35_c1_geometry =
+            arch == LLM_ARCH_QWEN35 && hparams.n_layer() == 64 &&
+            il >= 0 && static_cast<uint32_t>(il) < hparams.n_layer() && !hparams.is_recr(il) &&
+            !hparams.is_swa(il) && hparams.n_embd_head_k(il) == 256 &&
+            hparams.n_embd_head_v(il) == 256 && hparams.n_head_kv(il) > 0 &&
+            hparams.n_head(il) >= hparams.n_head_kv(il) &&
+            hparams.n_head(il) % hparams.n_head_kv(il) == 0;
+        if ((arch != LLM_ARCH_QWEN2 && !qwen35_c1_geometry) ||
+                cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+                !cparams.flash_attn || !cparams.causal_attn ||
+                kq_b != nullptr || sinks != nullptr || inp->self_k_rot != nullptr ||
+                inp->self_v_rot != nullptr) {
+            throw std::runtime_error("PyramidKV C1 hybrid lane requires dense causal Qwen2 or target Qwen35-27B FlashAttention without bias, sinks, or a second rotation");
+        }
+    }
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = use_pyramidkv_hybrid
+        ? mctx_cur->get_k_hybrid(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = use_pyramidkv_hybrid
+        ? mctx_cur->get_v_hybrid(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * kq_mask = use_pyramidkv_hybrid
+        ? nullptr : inp->get_kq_mask(ctx0, il);
+
+    if (turbo4_k && !turbo4_q_rotated) {
+        const int64_t q_head = llama_graph_turbo4_padded_head(q_cur->ne[0]);
+        if (q_head == 0 || q_head != k->ne[0]) {
+            throw std::runtime_error("TurboQuant4 Q/K head dimensions do not match");
+        }
+        q = llama_graph_turbo4_pad_head(ctx0, q, q_head);
+        q = llama_graph_turbo4_rotate(ctx0, q, mctx_cur->get_turbo_rotation());
+    }
+
+    ggml_tensor * cur = nullptr;
+    if (use_pyramidkv_hybrid) {
+        // The hybrid operator consumes [D, rows, KVHeads, seq].  The Q path
+        // uses the same signed-WHT basis as the already encoded TQ4 cold rows;
+        // hot rows were rotated before their F16 cache writes and are read
+        // directly by the operator.
+        ggml_tensor * q_hybrid = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        ggml_tensor * k_cold = mctx_cur->get_k_hybrid(ctx0, il);
+        ggml_tensor * v_cold = mctx_cur->get_v_hybrid(ctx0, il);
+        ggml_tensor * k_hot = mctx_cur->get_k_hot(ctx0, il);
+        ggml_tensor * v_hot = mctx_cur->get_v_hot(ctx0, il);
+        cur = ggml_flash_attn_ext_hybrid(ctx0, q_hybrid, k_cold, v_cold,
+            k_hot, v_hot, nullptr, mctx_cur->get_q_positions(ctx0, il, ubatch.n_tokens),
+            mctx_cur->get_k_positions(ctx0, il), kq_scale,
+            hparams.f_max_alibi_bias,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        if (pyramidkv_observer_enabled) {
+            build_pyramidkv_observer(q_hybrid, k_cold, k_hot,
+                mctx_cur->get_pyramidkv_observer_mask(ctx0, il, ubatch.n_tokens),
+                kq_scale, sinks, il);
+        }
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
+    if (turbo4_v) {
+        const int64_t logical_v_head = hparams.n_embd_head_v(il);
+        const int64_t padded_v_head = v->ne[0];
+        cur = llama_graph_turbo4_rotate(ctx0, cur, mctx_cur->get_turbo_rotation_inv());
+        cur = llama_graph_turbo4_cut_v(ctx0, cur, logical_v_head, padded_v_head, hparams.n_head(il));
+    } else if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
@@ -2930,6 +3531,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
+    if (llama_graph_type_is_turbo4(mctx_cur->type_k())) {
+        throw std::runtime_error("TurboQuant4 KV cache does not support MLA/K-only attention");
+    }
 
     // store to KV cache
     {
@@ -2989,6 +3593,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx->get_mla();
+    if (llama_graph_type_is_turbo4(mctx_cur->type_k())) {
+        throw std::runtime_error("TurboQuant4 KV cache does not support DSA/MLA attention");
+    }
 
     // store to KV cache
     {
@@ -3058,16 +3665,24 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
 
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    const bool turbo4_k = llama_graph_type_is_turbo4(mctx_cur->type_k());
+    const bool turbo4_v = llama_graph_type_is_turbo4(mctx_cur->type_v());
+    if (turbo4_k != turbo4_v) {
+        throw std::runtime_error("TurboQuant4 requires symmetric K/V cache types");
+    }
+
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
     auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
 
-    if (k_rot) {
+    if (k_rot && !turbo4_k) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
             k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
         }
     }
-    if (v_rot) {
+    if (v_rot && !turbo4_v) {
         if (v_cur) {
             v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
         }
@@ -3084,10 +3699,6 @@ ggml_tensor * llm_graph_context::build_attn(
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
     }
-
-    const auto * mctx_iswa = inp->mctx;
-
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
     if (k_cur) {
@@ -3108,10 +3719,24 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    if (turbo4_k) {
+        const int64_t q_head = llama_graph_turbo4_padded_head(q_cur->ne[0]);
+        if (q_head == 0 || q_head != k->ne[0]) {
+            throw std::runtime_error("TurboQuant4 Q/K head dimensions do not match");
+        }
+        q = llama_graph_turbo4_pad_head(ctx0, q, q_head);
+        q = llama_graph_turbo4_rotate(ctx0, q, mctx_cur->get_turbo_rotation());
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (v_rot) {
+    if (turbo4_v) {
+        const int64_t logical_v_head = hparams.n_embd_head_v(il);
+        const int64_t padded_v_head = v->ne[0];
+        cur = llama_graph_turbo4_rotate(ctx0, cur, mctx_cur->get_turbo_rotation_inv());
+        cur = llama_graph_turbo4_cut_v(ctx0, cur, logical_v_head, padded_v_head, hparams.n_head(il));
+    } else if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
@@ -3147,6 +3772,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
 
+    const auto * mctx_iswa = inp->mctx;
+    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    if (llama_graph_type_is_turbo4(mctx_cur->type_k())) {
+        throw std::runtime_error("TurboQuant4 KV cache does not support MLA/K-only attention");
+    }
+
     if (k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
         if (k_cur) {
@@ -3161,9 +3792,6 @@ ggml_tensor * llm_graph_context::build_attn(
     if (k_cur) {
         ggml_build_forward_expand(gf, k_cur);
     }
-
-    const auto * mctx_iswa = inp->mctx;
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
     if (k_cur) {

@@ -724,6 +724,10 @@ llama_model_loader::llama_model_loader(
 
             enum ggml_type type = tensor->type;
 
+            if (type == GGML_TYPE_TURBO4_0) {
+                throw std::runtime_error("turbo4_0 is a rotated KV-cache format, not a model-weight format");
+            }
+
             n_type[type]++;
 
             if (n_type_max < n_type[type]) {

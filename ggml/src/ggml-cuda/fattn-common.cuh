@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "turbo4-cuda.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -358,6 +359,46 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
+        const char * __restrict__ K_c, const void * __restrict__ Q_v,
+        const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_turbo4_0 * K = (const block_turbo4_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb/sizeof(float);
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int i0 = 0; i0 < D/2; i0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int i1 = 0; i1 < cpy_ne; ++i1) {
+            const int pair = i0 + (threadIdx.x % nthreads)*cpy_ne + i1;
+            const int element = pair*2;
+            const int block_index = element/GGML_TURBO4_QK;
+            const int offset = element%GGML_TURBO4_QK;
+            const uint8_t packed = K[block_index].qs[offset/2];
+            const uint8_t code0 = packed & 0x0f;
+            const uint8_t code1 = (packed >> 4) & 0x0f;
+            const float norm = __half2float(K[block_index].norm);
+            const float2 kv = make_float2(
+                ggml_cuda_turbo4_centroid(code0)*norm,
+                ggml_cuda_turbo4_centroid(code1)*norm);
+
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[i0/nthreads + i1];
+            ggml_cuda_mad(sum, kv, __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[i0/nthreads + i1];
+            sum += kv.x*qv.x + kv.y*qv.y;
+#endif
+        }
+    }
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -647,6 +688,31 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const int64_t block_index = i0/GGML_TURBO4_QK;
+    const int offset = i0%GGML_TURBO4_QK;
+    const float norm = __half2float(x[block_index].norm);
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+#pragma unroll
+    for (int i = 0; i < ne; ++i) {
+        const float value = ggml_cuda_turbo4_dequant_element(&x[block_index], offset + i, norm);
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same<T, half>::value) {
+            ((half *) dst)[i] = __float2half(value);
+        } else
+#endif
+        if constexpr (std::is_same<T, float>::value) {
+            ((float *) dst)[i] = value;
+        } else {
+            static_assert(std::is_same<T, void>::value, "unsupported type");
+        }
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -663,6 +729,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -685,6 +753,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
+        return dequantize_V_turbo4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -694,7 +764,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33,
+        const int64_t ne33) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -703,7 +774,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
 
-    mask += sequence*s33 + jt*ncols1*s31;
+    mask += (sequence % ne33)*s33 + jt*ncols1*s31;
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -1121,7 +1192,8 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (mask && mask->ne[2] == 1 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+            (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1134,7 +1206,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, mask->ne[3]);
         CUDA_CHECK(cudaGetLastError());
     }
 

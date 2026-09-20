@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -2435,6 +2436,28 @@ extern "C" {
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
             struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // Hybrid KV attention. src[1]/src[2] hold cold TurboQuant4 K/V rows.
+    // The hot rows stay in F16 and are read from src[5]/src[6]. K/V and Q
+    // use the same signed-WHT rotated coordinate basis. The mask covers
+    // [cold, hot], and scale is one shared softmax scale (1/sqrt(logical D)).
+    // A logical D64 head uses zero-padded D128 storage for every row.
+    // q_positions is I32 [n_q, n_q_heads or 1, n_seq, 1]. k_positions is
+    // I32 [n_cold+n_hot, n_kv_heads, n_seq, 1], so compacted positions may
+    // differ by KV head. Both tensors are optional as a pair.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_hybrid(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_cold,
+            struct ggml_tensor  * v_cold,
+            struct ggml_tensor  * k_hot,
+            struct ggml_tensor  * v_hot,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * q_positions,
+            struct ggml_tensor  * k_positions,
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);

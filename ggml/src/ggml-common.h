@@ -83,6 +83,8 @@ typedef sycl::half2 ggml_half2;
 #endif
 #endif // __cplusplus
 
+#include "ggml-turbo4.h"
+
 // QK = number of values after dequantization
 // QK_K = super-block size
 
@@ -286,6 +288,14 @@ typedef struct {
     ggml_half d;
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+
+// TurboQuant4: rotated 128-value block with a half precision norm.
+typedef struct {
+    ggml_half norm;
+    ggml_half rnorm;
+    uint8_t qs[GGML_TURBO4_PACKED_BYTES];
+} block_turbo4_0;
+static_assert(sizeof(block_turbo4_0) == GGML_TURBO4_BLOCK_BYTES, "wrong turbo4_0 block size/padding");
 
 //
 // Super-block quantization structures

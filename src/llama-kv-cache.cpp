@@ -5,17 +5,37 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "../ggml/src/ggml-turbo4.h"
+
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
+#include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+static bool llama_kv_type_is_turbo4(ggml_type type) {
+    return type == GGML_TYPE_TURBO4_0;
+}
+
+static uint32_t llama_turbo4_padded_head(uint32_t head_dim) {
+    if (head_dim == 64 || head_dim == GGML_TURBO4_QK) {
+        return GGML_TURBO4_QK;
+    }
+    if (head_dim == 2*GGML_TURBO4_QK) {
+        return 2*GGML_TURBO4_QK;
+    }
+    return 0;
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -75,15 +95,34 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
-           llama_memory_t   mem_other,
+    llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+    ggml_backend_buffer_type_t kv_buffer_type,
+    llama_pyramidkv_c1_config pyramidkv_c1,
+    bool tq4_key_center) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl),
+    kv_buffer_type(kv_buffer_type),
+    pyramidkv_c1_config(std::move(pyramidkv_c1)),
+    tq4_key_center_enabled_flag(tq4_key_center) {
+
+    if (kv_buffer_type != nullptr) {
+        if (mem_other != nullptr) {
+            throw std::runtime_error("kv_buffer_type cannot be combined with a shared KV cache");
+        }
+        ggml_backend_dev_t kv_dev = ggml_backend_buft_get_device(kv_buffer_type);
+        if (kv_dev == nullptr) {
+            throw std::runtime_error("kv_buffer_type has no backend device");
+        }
+        if (!ggml_backend_dev_supports_buft(kv_dev, kv_buffer_type)) {
+            throw std::runtime_error("kv_buffer_type is not supported by its backend device");
+        }
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -99,6 +138,54 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
+    const bool has_turbo4 = llama_kv_type_is_turbo4(type_k) || llama_kv_type_is_turbo4(type_v);
+    const auto & c1_config = pyramidkv_c1_config;
+
+    if (tq4_key_center_enabled_flag) {
+        ggml_backend_dev_t kv_dev = kv_buffer_type == nullptr ? nullptr : ggml_backend_buft_get_device(kv_buffer_type);
+        if (kv_dev == nullptr || ggml_backend_dev_type(kv_dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            throw std::runtime_error("TQ4 key center requires an explicit GPU KV buffer");
+        }
+        if (mem_other != nullptr || filter || reuse || share) {
+            throw std::runtime_error("TQ4 key center rejects shared, filtered, reused, or aliased KV caches");
+        }
+        if (!unified || n_seq_max != 1 || n_stream != 1 || n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+            throw std::runtime_error("TQ4 key center requires one unified non-SWA sequence");
+        }
+        if (model.arch != LLM_ARCH_QWEN2) {
+            throw std::runtime_error("TQ4 key center is limited to dense Qwen2");
+        }
+        if (hparams.no_alloc) {
+            throw std::runtime_error("TQ4 key center requires allocated KV tensors");
+        }
+        if (type_k != type_v || (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_TURBO4_0)) {
+            throw std::runtime_error("TQ4 key center requires symmetric F16 or TQ4 K/V");
+        }
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (!hparams.has_kv(il)) {
+                continue;
+            }
+            if (hparams.n_embd_head_k(il) != GGML_TURBO4_QK ||
+                    hparams.n_embd_head_v(il) != GGML_TURBO4_QK ||
+                    hparams.n_head_kv(il) == 0) {
+                throw std::runtime_error("TQ4 key center requires D128 KV heads on every dense layer");
+            }
+        }
+    }
+
+    if (pyramidkv_c1_config.enabled) {
+        if (type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0) {
+            throw std::runtime_error("PyramidKV C1 requires symmetric TQ4 cold K/V");
+        }
+        // Preserve the full prompt until its first requested output. Earlier
+        // chunks cannot score facts against a question that has not arrived.
+        // Compaction releases this full TQ4 allocation after prompt completion.
+        pyramidkv_c1_initial_capacity = kv_size;
+        if (pyramidkv_c1_initial_capacity == 0) {
+            throw std::runtime_error("PyramidKV C1 initial physical capacity is empty");
+        }
+        pyramidkv_c1_hot_enabled = true;
+    }
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -113,7 +200,8 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((pyramidkv_c1_hot_enabled ? 4u : 2u)*(1 + n_stream)*n_layer*ggml_tensor_overhead() +
+                    (has_turbo4 ? 2u : 0u)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -205,14 +293,29 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // [TAG_V_CACHE_VARIABLE]
-        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
-        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+        const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
+        const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
+        const uint32_t n_head_kv     = hparams.n_head_kv(il);
+
+        const uint32_t n_embd_k_gqa = llama_kv_type_is_turbo4(type_k) ?
+            n_head_kv * llama_turbo4_padded_head(n_embd_head_k) : hparams.n_embd_k_gqa(il);
+        const uint32_t n_embd_v_gqa = llama_kv_type_is_turbo4(type_v) ?
+            n_head_kv * llama_turbo4_padded_head(n_embd_head_v) :
+            (!v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max());
+
+        if ((llama_kv_type_is_turbo4(type_k) && llama_turbo4_padded_head(n_embd_head_k) == 0) ||
+            (llama_kv_type_is_turbo4(type_v) && llama_turbo4_padded_head(n_embd_head_v) == 0)) {
+            throw std::runtime_error("TurboQuant4 requires per-head dimensions 64, 128, or 256");
+        }
 
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
-        if (offload) {
+        if (kv_buffer_type != nullptr) {
+            buft = kv_buffer_type;
+            dev_name = ggml_backend_dev_name(ggml_backend_buft_get_device(kv_buffer_type));
+        } else if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
@@ -229,23 +332,60 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        const uint32_t physical_kv_size = pyramidkv_c1_hot_enabled ?
+            pyramidkv_c1_initial_capacity : kv_size;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa,
+            physical_kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa,
+            physical_kv_size, n_stream) : nullptr;
+        ggml_tensor * k_hot = nullptr;
+        ggml_tensor * v_hot = nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_hot_stream;
+        std::vector<ggml_tensor *> v_hot_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa,
+                physical_kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa,
+                physical_kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+        }
+
+        if (pyramidkv_c1_hot_enabled) {
+            const uint32_t hot_k_head = llama_turbo4_padded_head(n_embd_head_k);
+            const uint32_t hot_v_head = llama_turbo4_padded_head(n_embd_head_v);
+            if (hot_k_head == 0 || hot_v_head == 0 ||
+                    c1_config.hot_capacity > std::numeric_limits<uint32_t>::max() / n_head_kv) {
+                throw std::runtime_error("PyramidKV C1 hot-row geometry is unsupported");
+            }
+            const uint32_t hot_rows = static_cast<uint32_t>(c1_config.hot_capacity * n_head_kv);
+            k_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hot_k_head, hot_rows, n_stream);
+            v_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hot_v_head, hot_rows, n_stream);
+            ggml_format_name(k_hot, "cache_k_hot_l%d", il);
+            ggml_format_name(v_hot, "cache_v_hot_l%d", il);
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                k_hot_stream.push_back(ggml_view_2d(ctx, k_hot, hot_k_head, hot_rows,
+                    k_hot->nb[1], s*k_hot->nb[2]));
+                v_hot_stream.push_back(ggml_view_2d(ctx, v_hot, hot_v_head, hot_rows,
+                    v_hot->nb[1], s*v_hot->nb[2]));
+            }
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, k_hot, v_hot, k_hot_stream, v_hot_stream });
+
+        if (!other && has_turbo4 && turbo_rotation == nullptr) {
+            turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, GGML_TURBO4_QK, GGML_TURBO4_QK);
+            ggml_format_name(turbo_rotation, "turbo4_rotation");
+            turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, GGML_TURBO4_QK, GGML_TURBO4_QK);
+            ggml_format_name(turbo_rotation_inv, "turbo4_rotation_inv");
+        }
     }
 
     if (reuse) {
@@ -272,6 +412,22 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    pyramidkv_c1_layers.resize(layers.size());
+    if (pyramidkv_c1_hot_enabled) {
+        for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+            auto & state = pyramidkv_c1_layers[layer_index];
+            state.kv_heads = hparams.n_head_kv(layers[layer_index].il);
+            state.hot_row_capacity = static_cast<uint32_t>(c1_config.hot_capacity);
+            state.hot_recent = static_cast<uint32_t>(c1_config.recent_window);
+            state.hot_heads.resize(state.kv_heads);
+            for (auto & head : state.hot_heads) {
+                head.row_capacity = state.hot_row_capacity;
+                head.logical_to_physical.assign(kv_size, pyramidkv_c1_invalid_cell);
+                head.physical_to_logical.assign(state.hot_row_capacity, pyramidkv_c1_invalid_cell);
+            }
+        }
+    }
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -290,7 +446,52 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+
+        if (turbo_rotation != nullptr && turbo_rotation->buffer == buf && !model.hparams.no_alloc) {
+            std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation;
+            std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation_inv;
+            ggml_turbo4_rotation_matrix(rotation.data(), false);
+            ggml_turbo4_rotation_matrix(rotation_inv.data(), true);
+
+            ggml_backend_tensor_set(turbo_rotation, rotation.data(), 0, rotation.size()*sizeof(float));
+            ggml_backend_tensor_set(turbo_rotation_inv, rotation_inv.data(), 0, rotation_inv.size()*sizeof(float));
+        }
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (tq4_key_center_enabled_flag) {
+        if (layers.empty()) {
+            throw std::runtime_error("TQ4 key center found no dense KV layers");
+        }
+        ggml_init_params anchor_params = {
+            /*.mem_size   =*/ (layers.size() + 1)*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        tq4_key_anchor_ctx.reset(ggml_init(anchor_params));
+        if (!tq4_key_anchor_ctx) {
+            throw std::runtime_error("failed to create TQ4 key-center anchor context");
+        }
+
+        tq4_key_anchors.reserve(layers.size());
+        for (const auto & layer : layers) {
+            const uint32_t n_head_kv = hparams.n_head_kv(layer.il);
+            ggml_tensor * anchor = ggml_new_tensor_2d(
+                    tq4_key_anchor_ctx.get(), GGML_TYPE_F32, GGML_TURBO4_QK, n_head_kv);
+            if (anchor == nullptr) {
+                throw std::runtime_error("failed to create TQ4 key-center anchor tensor");
+            }
+            ggml_format_name(anchor, "tq4_key_anchor_l%d", layer.il);
+            tq4_key_anchors.push_back(anchor);
+        }
+
+        tq4_key_anchor_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(
+                tq4_key_anchor_ctx.get(), kv_buffer_type));
+        if (!tq4_key_anchor_buf) {
+            throw std::runtime_error("failed to allocate TQ4 key-center anchor buffer");
+        }
+        ggml_backend_buffer_clear(tq4_key_anchor_buf.get(), 0);
     }
 
     {
@@ -310,6 +511,15 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+        turbo_rotation = other->turbo_rotation;
+        turbo_rotation_inv = other->turbo_rotation_inv;
+        if (has_turbo4) {
+            attn_rot_k = false;
+            attn_rot_v = false;
+            if (turbo_rotation == nullptr || turbo_rotation_inv == nullptr) {
+                throw std::runtime_error("TurboQuant4 shared KV cache has no rotation matrices");
+            }
+        }
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
@@ -319,6 +529,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k =
             !attn_rot_disable &&
+            !llama_kv_type_is_turbo4(type_k) &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
             hparams.n_embd_head_k() % 64 == 0;
@@ -326,12 +537,14 @@ llama_kv_cache::llama_kv_cache(
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
-                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+                hparams.n_embd_head_k_full == hparams.indexer_head_size &&
+                !llama_kv_type_is_turbo4(type_k)) {
             attn_rot_k = true;
         }
 
         attn_rot_v =
             !attn_rot_disable &&
+            !llama_kv_type_is_turbo4(type_v) &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
             hparams.n_embd_head_v() % 64 == 0;
@@ -365,17 +578,458 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+bool llama_kv_cache::tq4_key_center_enabled() const {
+    return tq4_key_center_enabled_flag;
+}
+
+bool llama_kv_cache::tq4_key_center_capture() const {
+    return tq4_key_center_enabled_flag && !tq4_key_center_valid_flag;
+}
+
+bool llama_kv_cache::tq4_key_center_ready() const {
+    return tq4_key_center_enabled_flag && tq4_key_center_valid_flag && !tq4_key_center_failed_flag;
+}
+
+ggml_tensor * llama_kv_cache::get_tq4_key_anchor(int32_t il) const {
+    if (!tq4_key_center_enabled_flag) {
+        return nullptr;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end() || it->second < 0 ||
+            static_cast<size_t>(it->second) >= tq4_key_anchors.size()) {
+        return nullptr;
+    }
+    return tq4_key_anchors[it->second];
+}
+
+bool llama_kv_cache::tq4_key_center_cache_empty() const {
+    for (const auto & cells : v_cells) {
+        if (cells.get_used() != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::tq4_key_center_invalidate() noexcept {
+    if (!tq4_key_center_enabled_flag) {
+        return;
+    }
+    tq4_key_center_valid_flag = false;
+    tq4_key_center_capture_pending = false;
+}
+
+bool llama_kv_cache::tq4_key_center_prepare(const llama_ubatch & ubatch, std::string & error) {
+    if (!tq4_key_center_enabled_flag) {
+        return true;
+    }
+    if (tq4_key_center_failed_flag) {
+        error = "TQ4 key-center capture is failed and requires a full clear";
+        return false;
+    }
+    if (tq4_key_center_capture_pending) {
+        error = "TQ4 key-center capture is already pending device completion";
+        return false;
+    }
+    if (ubatch.n_tokens == 0 || ubatch.n_pos != 1 || ubatch.n_seqs_unq != 1 ||
+            ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        error = "TQ4 key center requires one dense sequence with one position per token";
+        return false;
+    }
+    if (layers.empty() || tq4_key_anchors.size() != layers.size()) {
+        error = "TQ4 key center has no complete per-layer anchor allocation";
+        return false;
+    }
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const ggml_tensor * anchor = tq4_key_anchors[i];
+        if (anchor == nullptr || anchor->type != GGML_TYPE_F32 ||
+                anchor->ne[0] != GGML_TURBO4_QK ||
+                anchor->ne[1] != hparams.n_head_kv(layers[i].il)) {
+            error = "TQ4 key center anchor geometry is invalid";
+            return false;
+        }
+    }
+
+    llama_pos previous = -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr ||
+                ubatch.seq_id[i][0] != 0 || ubatch.pos[i] < 0 ||
+                (i != 0 && ubatch.pos[i] <= previous)) {
+            error = "TQ4 key center requires strictly increasing sequence-0 positions";
+            return false;
+        }
+        previous = ubatch.pos[i];
+    }
+
+    if (tq4_key_center_capture()) {
+        if (!tq4_key_center_cache_empty()) {
+            error = "TQ4 key center capture requires an empty cache history";
+            return false;
+        }
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.pos[i] != static_cast<llama_pos>(i)) {
+                error = "TQ4 key center capture requires positions starting at zero without gaps";
+                return false;
+            }
+        }
+        tq4_key_center_capture_pending = true;
+    }
+
+    return true;
+}
+
+void llama_kv_cache::tq4_key_center_commit_capture() {
+    if (!tq4_key_center_enabled_flag || tq4_key_center_failed_flag ||
+            !tq4_key_center_capture_pending) {
+        return;
+    }
+    tq4_key_center_capture_pending = false;
+    tq4_key_center_valid_flag = true;
+}
+
+void llama_kv_cache::tq4_key_center_fail() {
+    if (!tq4_key_center_enabled_flag) {
+        return;
+    }
+    tq4_key_center_capture_pending = false;
+    tq4_key_center_valid_flag = false;
+    tq4_key_center_failed_flag = true;
+}
+
+bool llama_kv_cache::pyramidkv_c1_reinitialize(std::string & error) {
+    try {
+    if (!pyramidkv_c1_hot_enabled || !pyramidkv_c1_compacted) {
+        error = "PyramidKV C1 reset requires an active compacted layout";
+        return false;
+    }
+    if (kv_buffer_type == nullptr || model.hparams.no_alloc || n_stream != 1 || layers.empty()) {
+        error = "PyramidKV C1 reset requires one allocated explicit KV pool";
+        return false;
+    }
+    if (pyramidkv_c1_initial_capacity == 0 || v_cells.empty() ||
+            pyramidkv_c1_initial_capacity > v_cells[0].size() ||
+            pyramidkv_c1_layers.size() != layers.size()) {
+        error = "PyramidKV C1 reset has no valid initial physical capacity or layer state";
+        return false;
+    }
+
+    const auto & config = pyramidkv_c1_config;
+
+    size_t tensor_count = layers.size();
+    if (tensor_count > std::numeric_limits<size_t>::max() / (4u * (1u + n_stream))) {
+        error = "PyramidKV C1 reset tensor count overflows";
+        return false;
+    }
+    tensor_count *= 4u * (1u + n_stream);
+    if (turbo_rotation != nullptr && tensor_count > std::numeric_limits<size_t>::max() - 2u) {
+        error = "PyramidKV C1 reset rotation tensor count overflows";
+        return false;
+    }
+    tensor_count += turbo_rotation != nullptr ? 2u : 0u;
+    if (tensor_count > std::numeric_limits<size_t>::max() / ggml_tensor_overhead()) {
+        error = "PyramidKV C1 reset context size overflows";
+        return false;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ tensor_count * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr new_ctx(ggml_init(params));
+    if (!new_ctx) {
+        error = "PyramidKV C1 reset failed to create ggml context";
+        return false;
+    }
+
+    std::vector<kv_layer> new_layers;
+    new_layers.reserve(layers.size());
+    for (const auto & old_layer : layers) {
+        const uint32_t kv_heads = hparams.n_head_kv(old_layer.il);
+        if (kv_heads == 0 || old_layer.k == nullptr || old_layer.v == nullptr ||
+                old_layer.k_hot == nullptr || old_layer.v_hot == nullptr ||
+                old_layer.k->ne[0] == 0 || old_layer.v->ne[0] == 0 ||
+                old_layer.k->ne[0] > std::numeric_limits<uint32_t>::max() / kv_heads ||
+                old_layer.v->ne[0] > std::numeric_limits<uint32_t>::max() / kv_heads ||
+                old_layer.k_hot->ne[1] > std::numeric_limits<uint32_t>::max() ||
+                old_layer.v_hot->ne[1] > std::numeric_limits<uint32_t>::max() ||
+                old_layer.k_hot->ne[1] % kv_heads != 0 ||
+                old_layer.v_hot->ne[1] % kv_heads != 0) {
+            error = "PyramidKV C1 reset found invalid compacted layer geometry";
+            return false;
+        }
+
+        const uint32_t cold_k_width = static_cast<uint32_t>(old_layer.k->ne[0]) * kv_heads;
+        const uint32_t cold_v_width = static_cast<uint32_t>(old_layer.v->ne[0]) * kv_heads;
+        const uint32_t hot_k_rows = static_cast<uint32_t>(old_layer.k_hot->ne[1]);
+        const uint32_t hot_v_rows = static_cast<uint32_t>(old_layer.v_hot->ne[1]);
+        ggml_tensor * k = ggml_new_tensor_3d(new_ctx.get(), old_layer.k->type,
+                cold_k_width, pyramidkv_c1_initial_capacity, n_stream);
+        ggml_tensor * v = ggml_new_tensor_3d(new_ctx.get(), old_layer.v->type,
+                cold_v_width, pyramidkv_c1_initial_capacity, n_stream);
+        ggml_tensor * k_hot = ggml_new_tensor_3d(new_ctx.get(), GGML_TYPE_F16,
+                old_layer.k_hot->ne[0], hot_k_rows, n_stream);
+        ggml_tensor * v_hot = ggml_new_tensor_3d(new_ctx.get(), GGML_TYPE_F16,
+                old_layer.v_hot->ne[0], hot_v_rows, n_stream);
+        if (k == nullptr || v == nullptr || k_hot == nullptr || v_hot == nullptr) {
+            error = "PyramidKV C1 reset failed to create cache tensors";
+            return false;
+        }
+        ggml_format_name(k, "cache_k_l%d", old_layer.il);
+        ggml_format_name(v, "cache_v_l%d", old_layer.il);
+        ggml_format_name(k_hot, "cache_k_hot_l%d", old_layer.il);
+        ggml_format_name(v_hot, "cache_v_hot_l%d", old_layer.il);
+
+        std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_hot_stream;
+        std::vector<ggml_tensor *> v_hot_stream;
+        for (uint32_t stream = 0; stream < n_stream; ++stream) {
+            k_stream.push_back(ggml_view_2d(new_ctx.get(), k, k->ne[0], k->ne[1],
+                    k->nb[1], stream * k->nb[2]));
+            v_stream.push_back(ggml_view_2d(new_ctx.get(), v, v->ne[0], v->ne[1],
+                    v->nb[1], stream * v->nb[2]));
+            k_hot_stream.push_back(ggml_view_2d(new_ctx.get(), k_hot, k_hot->ne[0], k_hot->ne[1],
+                    k_hot->nb[1], stream * k_hot->nb[2]));
+            v_hot_stream.push_back(ggml_view_2d(new_ctx.get(), v_hot, v_hot->ne[0], v_hot->ne[1],
+                    v_hot->nb[1], stream * v_hot->nb[2]));
+        }
+        new_layers.push_back({ old_layer.il, k, v, k_stream, v_stream,
+                k_hot, v_hot, k_hot_stream, v_hot_stream });
+    }
+
+    ggml_tensor * new_rotation = nullptr;
+    ggml_tensor * new_rotation_inv = nullptr;
+    if (turbo_rotation != nullptr) {
+        new_rotation = ggml_new_tensor_2d(new_ctx.get(), GGML_TYPE_F32,
+                GGML_TURBO4_QK, GGML_TURBO4_QK);
+        new_rotation_inv = ggml_new_tensor_2d(new_ctx.get(), GGML_TYPE_F32,
+                GGML_TURBO4_QK, GGML_TURBO4_QK);
+        if (new_rotation == nullptr || new_rotation_inv == nullptr) {
+            error = "PyramidKV C1 reset failed to create rotation tensors";
+            return false;
+        }
+        ggml_format_name(new_rotation, "turbo4_rotation");
+        ggml_format_name(new_rotation_inv, "turbo4_rotation_inv");
+    }
+
+    const size_t new_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(new_ctx.get(), kv_buffer_type);
+    size_t old_bytes = total_size();
+    for (const auto & [_, retired_buf] : pyramidkv_c1_retired_ctxs_bufs) {
+        const size_t retired_bytes = ggml_backend_buffer_get_size(retired_buf.get());
+        if (old_bytes > std::numeric_limits<size_t>::max() - retired_bytes) {
+            error = "PyramidKV C1 reset old-buffer size overflows";
+            return false;
+        }
+        old_bytes += retired_bytes;
+    }
+    size_t transition_bytes = old_bytes;
+    const auto charge_reset = [&](size_t count, size_t element_size) {
+        if (element_size != 0 && count > std::numeric_limits<size_t>::max() / element_size) {
+            return false;
+        }
+        const size_t bytes = count * element_size;
+        if (transition_bytes > config.transition_max_bytes ||
+                bytes > config.transition_max_bytes - transition_bytes) {
+            return false;
+        }
+        transition_bytes += bytes;
+        return true;
+    };
+    // Match compaction's bounded observer/scratch allowance. Old and new map
+    // payloads coexist until commit; count retained vector capacities too.
+    bool reset_fits = charge_reset(new_bytes, 1) &&
+        charge_reset(config.observer_max_bytes, 1) &&
+        charge_reset(config.observer_max_bytes, 1) &&
+        charge_reset(pyramidkv_c1_layers.capacity(), sizeof(pyramidkv_c1_layer_state)) &&
+        charge_reset(layers.size(), sizeof(pyramidkv_c1_layer_state));
+    for (const auto & state : pyramidkv_c1_layers) {
+        reset_fits = reset_fits &&
+            charge_reset(state.hot_heads.capacity(), sizeof(pyramidkv_c1_head_state)) &&
+            charge_reset(state.cold_heads.capacity(), sizeof(pyramidkv_c1_head_state)) &&
+            charge_reset(state.kv_heads, sizeof(pyramidkv_c1_head_state));
+        for (const auto * maps : { &state.hot_heads, &state.cold_heads }) {
+            for (const auto & map : *maps) {
+                reset_fits = reset_fits &&
+                    charge_reset(map.logical_to_physical.capacity(), sizeof(uint32_t)) &&
+                    charge_reset(map.physical_to_logical.capacity(), sizeof(uint32_t));
+            }
+        }
+        for (uint32_t head = 0; head < state.kv_heads; ++head) {
+            reset_fits = reset_fits &&
+                charge_reset(v_cells[0].size(), sizeof(uint32_t)) &&
+                charge_reset(state.hot_row_capacity, sizeof(uint32_t));
+        }
+    }
+    if (!reset_fits) {
+        error = "PyramidKV C1 reset transition budget rejects old+new KV, observer, graph scratch, or map metadata";
+        return false;
+    }
+
+    ggml_backend_buffer_ptr new_buf(
+            ggml_backend_alloc_ctx_tensors_from_buft(new_ctx.get(), kv_buffer_type));
+    if (!new_buf) {
+        error = "PyramidKV C1 reset failed to allocate replacement KV pool";
+        return false;
+    }
+    ggml_backend_buffer_clear(new_buf.get(), 0);
+
+    if (new_rotation != nullptr) {
+        std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation;
+        std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation_inv;
+        ggml_turbo4_rotation_matrix(rotation.data(), false);
+        ggml_turbo4_rotation_matrix(rotation_inv.data(), true);
+        ggml_backend_tensor_set(new_rotation, rotation.data(), 0, rotation.size()*sizeof(float));
+        ggml_backend_tensor_set(new_rotation_inv, rotation_inv.data(), 0, rotation_inv.size()*sizeof(float));
+    }
+
+    std::vector<pyramidkv_c1_layer_state> new_states(layers.size());
+    const size_t logical_size = v_cells.empty() ? 0 : v_cells[0].size();
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        const auto & old_state = pyramidkv_c1_layers[layer_index];
+        auto & state = new_states[layer_index];
+        if (old_state.kv_heads == 0 || old_state.kv_heads != hparams.n_head_kv(layers[layer_index].il) ||
+                old_state.hot_heads.size() != old_state.kv_heads ||
+                old_state.hot_row_capacity == 0 ||
+                old_state.hot_row_capacity > std::numeric_limits<uint32_t>::max() / old_state.kv_heads ||
+                layers[layer_index].k_hot->ne[1] / old_state.kv_heads != old_state.hot_row_capacity ||
+                layers[layer_index].v_hot->ne[1] / old_state.kv_heads != old_state.hot_row_capacity) {
+            error = "PyramidKV C1 reset found incomplete hot-map state";
+            return false;
+        }
+        state.compacted = false;
+        state.kv_heads = old_state.kv_heads;
+        state.hot_row_capacity = old_state.hot_row_capacity;
+        state.hot_recent = old_state.hot_recent;
+        state.hot_heads.resize(state.kv_heads);
+        for (auto & head : state.hot_heads) {
+            head.row_capacity = state.hot_row_capacity;
+            head.next_row = 0;
+            head.logical_to_physical.assign(logical_size, pyramidkv_c1_invalid_cell);
+            head.physical_to_logical.assign(state.hot_row_capacity, pyramidkv_c1_invalid_cell);
+        }
+    }
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> new_ctxs_bufs;
+    new_ctxs_bufs.emplace_back(std::move(new_ctx), std::move(new_buf));
+
+    // Commit only after all new objects exist. Keep old objects alive until the
+    // context has reset scheduler and graph results. Reserve before moving any
+    // old handle so a metadata allocation failure leaves the old layout intact.
+    pyramidkv_c1_retired_ctxs_bufs.reserve(
+            pyramidkv_c1_retired_ctxs_bufs.size() + ctxs_bufs.size());
+    for (auto & entry : ctxs_bufs) {
+        pyramidkv_c1_retired_ctxs_bufs.emplace_back(std::move(entry));
+    }
+    ctxs_bufs = std::move(new_ctxs_bufs);
+    layers = std::move(new_layers);
+    pyramidkv_c1_layers = std::move(new_states);
+    turbo_rotation = new_rotation;
+    turbo_rotation_inv = new_rotation_inv;
+    sc_info = {};
+    pyramidkv_c1_compacted = false;
+    pyramidkv_c1_tokens_since_compact = 0;
+    pyramidkv_c1_graph_reset_needed = true;
+    pyramidkv_c1_reset_failed_flag = false;
+    pyramidkv_c1_reset_error.clear();
+        return true;
+    } catch (const std::exception & ex) {
+        error = std::string("PyramidKV C1 reset transaction failed: ") + ex.what();
+        return false;
+    } catch (...) {
+        error = "PyramidKV C1 reset transaction failed with an unknown exception";
+        return false;
+    }
+}
+
+void llama_kv_cache::pyramidkv_c1_graph_reset_complete() {
+    if (!pyramidkv_c1_graph_reset_needed) {
+        return;
+    }
+    pyramidkv_c1_retired_ctxs_bufs.clear();
+    pyramidkv_c1_graph_reset_needed = false;
+}
+
+bool llama_kv_cache::pyramidkv_c1_reset_failed(std::string & error) const {
+    if (!pyramidkv_c1_reset_failed_flag) {
+        return false;
+    }
+    error = pyramidkv_c1_reset_error.empty()
+        ? "PyramidKV C1 reset failed"
+        : pyramidkv_c1_reset_error;
+    return true;
+}
+
+void llama_kv_cache::pyramidkv_c1_fail_transition(const std::string & error) {
+    if (pyramidkv_c1_hot_enabled) {
+        pyramidkv_c1_reset_failed_flag = true;
+        pyramidkv_c1_reset_error = error;
+    }
+    if (tq4_key_center_enabled_flag) {
+        tq4_key_center_fail();
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
+    if (pyramidkv_c1_hot_enabled && pyramidkv_c1_compacted) {
+        std::string error;
+        if (!pyramidkv_c1_reinitialize(error)) {
+            pyramidkv_c1_reset_failed_flag = true;
+            pyramidkv_c1_reset_error = std::move(error);
+            pyramidkv_c1_graph_reset_needed = true;
+            tq4_key_center_fail();
+            LLAMA_LOG_ERROR("%s: PyramidKV C1 full clear cannot restore initial layout: %s\n",
+                    __func__, pyramidkv_c1_reset_error.c_str());
+            return;
+        }
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
 
+    if (pyramidkv_c1_hot_enabled) {
+        pyramidkv_c1_tokens_since_compact = 0;
+        for (auto & state : pyramidkv_c1_layers) {
+            state.compacted = false;
+            state.cold_row_capacity = 0;
+            state.cold_heads.clear();
+            for (auto & head : state.hot_heads) {
+                head.next_row = 0;
+                head.logical_to_physical.assign(v_cells.empty() ? 0 : v_cells[0].size(),
+                        pyramidkv_c1_invalid_cell);
+                head.physical_to_logical.assign(state.hot_row_capacity,
+                        pyramidkv_c1_invalid_cell);
+            }
+        }
+        // Even data=false must invalidate graph tensor handles after a C1
+        // layout replacement. The newly allocated initial buffer is empty.
+        pyramidkv_c1_graph_reset_needed = true;
+        pyramidkv_c1_reset_failed_flag = false;
+        pyramidkv_c1_reset_error.clear();
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+
+            if (turbo_rotation != nullptr && turbo_rotation->buffer == buf.get() && !model.hparams.no_alloc) {
+                std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation;
+                std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation_inv;
+                ggml_turbo4_rotation_matrix(rotation.data(), false);
+                ggml_turbo4_rotation_matrix(rotation_inv.data(), true);
+                ggml_backend_tensor_set(turbo_rotation, rotation.data(), 0, rotation.size()*sizeof(float));
+                ggml_backend_tensor_set(turbo_rotation_inv, rotation_inv.data(), 0, rotation_inv.size()*sizeof(float));
+            }
+        }
+        if (tq4_key_anchor_buf) {
+            ggml_backend_buffer_clear(tq4_key_anchor_buf.get(), 0);
         }
     }
+
+    tq4_key_center_invalidate();
+    tq4_key_center_failed_flag = false;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -393,6 +1047,48 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
     if (p1 < 0) {
         p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (pyramidkv_c1_reset_failed_flag) {
+        LLAMA_LOG_ERROR("%s: rejecting seq_rm while PyramidKV C1 reset is failed: %s\n",
+                __func__, pyramidkv_c1_reset_error.c_str());
+        return false;
+    }
+
+    // A complete removal must restore the constructor layout before the next
+    // prompt. Partial removal keeps the compact layout, but still forces a
+    // graph rebuild so prepare_batch_rows can clear stale per-head mappings.
+    if (pyramidkv_c1_hot_enabled && pyramidkv_c1_compacted) {
+        bool removes_all = true;
+        for (uint32_t s = 0; s < n_stream && removes_all; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.is_empty(i)) {
+                    continue;
+                }
+                if (!cells.pos_in(i, p0, p1)) {
+                    removes_all = false;
+                    break;
+                }
+                if (seq_id >= 0 && !cells.seq_has(i, seq_id)) {
+                    removes_all = false;
+                    break;
+                }
+            }
+        }
+
+        if (removes_all) {
+            std::string error;
+            if (!pyramidkv_c1_reinitialize(error)) {
+                pyramidkv_c1_reset_failed_flag = true;
+                pyramidkv_c1_reset_error = std::move(error);
+                pyramidkv_c1_graph_reset_needed = true;
+                tq4_key_center_fail();
+                LLAMA_LOG_ERROR("%s: PyramidKV C1 full seq_rm cannot restore initial layout: %s\n",
+                        __func__, pyramidkv_c1_reset_error.c_str());
+                return false;
+            }
+        }
     }
 
     if (seq_id >= 0) {
@@ -444,10 +1140,24 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    if (pyramidkv_c1_hot_enabled) {
+        pyramidkv_c1_graph_reset_needed = true;
+        pyramidkv_c1_tokens_since_compact = pyramidkv_c1_compacted
+            ? std::numeric_limits<uint32_t>::max() : 0;
+    }
+    if (tq4_key_center_enabled_flag && tq4_key_center_cache_empty()) {
+        tq4_key_center_invalidate();
+    }
     return true;
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && seq_id_src != seq_id_dst) {
+        pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
+            ? "TQ4 key center cannot copy cache rows to another sequence"
+            : "PyramidKV C1 cannot copy cache rows to another sequence");
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -540,6 +1250,12 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && seq_id != 0) {
+        pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
+            ? "TQ4 key center supports only sequence 0"
+            : "PyramidKV C1 supports only sequence 0");
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -564,9 +1280,20 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+    if (tq4_key_center_enabled_flag && tq4_key_center_cache_empty()) {
+        tq4_key_center_invalidate();
+    }
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const llama_pos range_begin = std::max<llama_pos>(0, p0);
+    const llama_pos range_end = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && shift != 0 && range_begin != range_end) {
+        pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
+            ? "TQ4 key center cannot shift original cache positions"
+            : "PyramidKV C1 cannot shift original cache positions");
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -617,6 +1344,14 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    const llama_pos range_begin = std::max<llama_pos>(0, p0);
+    const llama_pos range_end = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && d != 1 && range_begin != range_end) {
+        pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
+            ? "TQ4 key center cannot divide original cache positions"
+            : "PyramidKV C1 cannot divide original cache positions");
+        return;
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -683,18 +1418,27 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [ctx, buf] : ctxs_bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+    const auto add_buffers = [&](const auto & buffers) {
+        for (const auto & [ctx, buf] : buffers) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
-        if (hparams.no_alloc) {
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
-        } else {
-            // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            if (hparams.no_alloc) {
+                GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
+                ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            } else {
+                // Retired C1 buffers remain physically resident until the
+                // scheduler reset completes, so include them in the transient
+                // breakdown while they are still owned.
+                ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            }
         }
+    };
+    add_buffers(ctxs_bufs);
+    add_buffers(pyramidkv_c1_retired_ctxs_bufs);
+    if (tq4_key_anchor_buf) {
+        const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tq4_key_anchor_buf.get());
+        ret[buft] += ggml_backend_buffer_get_size(tq4_key_anchor_buf.get());
     }
-
     return ret;
 }
 
@@ -703,6 +1447,13 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    if (pyramidkv_c1_reset_failed_flag || tq4_key_center_failed_flag) {
+        LLAMA_LOG_ERROR("%s: refusing batch while KV transition is failed: %s\n",
+                __func__, pyramidkv_c1_reset_error.empty()
+                    ? "TQ4 key-center capture failed" : pyramidkv_c1_reset_error.c_str());
+        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
 
     do {
         balloc.split_reset();
@@ -855,6 +1606,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     if (do_shift) {
         if (!get_can_shift()) {
+            if (llama_kv_type_is_turbo4(type_k())) {
+                throw std::runtime_error("TurboQuant4 KV cache does not support K-shift");
+            }
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
         }
 
@@ -1005,7 +1759,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
+        const uint32_t search_limit = pyramidkv_c1_hot_enabled && !pyramidkv_c1_compacted
+            ? std::min(cells.size(), pyramidkv_c1_initial_capacity) : cells.size();
+        if (search_limit == 0 || n_tokens > search_limit) {
             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
             return { };
         }
@@ -1017,8 +1773,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > search_limit) {
+                n_tested += search_limit - head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -1076,7 +1832,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= search_limit) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1179,6 +1935,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (tq4_key_center_enabled_flag || llama_kv_type_is_turbo4(type_k())) {
+        return false;
+    }
+
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1217,6 +1977,14 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+ggml_tensor * llama_kv_cache::get_turbo_rotation() const {
+    return turbo_rotation;
+}
+
+ggml_tensor * llama_kv_cache::get_turbo_rotation_inv() const {
+    return turbo_rotation_inv;
+}
+
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
     std::vector<uint32_t> res;
     res.reserve(layers.size());
@@ -1240,6 +2008,982 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+bool llama_kv_cache::pyramidkv_c1_supported(std::string & error) const {
+    if (tq4_key_center_enabled_flag &&
+            (!tq4_key_anchor_buf || tq4_key_anchors.size() != layers.size())) {
+        error = "TQ4 key center has no complete persistent anchor allocation";
+        return false;
+    }
+    if (kv_buffer_type == nullptr) {
+        error = "PyramidKV C1 requires an explicit kv_buffer_type pool";
+        return false;
+    }
+    if (model.hparams.no_alloc) {
+        error = "PyramidKV C1 cannot compact a no_alloc cache";
+        return false;
+    }
+    if (other != nullptr) {
+        error = "PyramidKV C1 does not support a shared KV cache";
+        return false;
+    }
+    if (n_stream != 1 || n_seq_max != 1) {
+        error = "PyramidKV C1 requires one sequence and one cache stream";
+        return false;
+    }
+    if (n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+        error = "PyramidKV C1 rejects SWA caches";
+        return false;
+    }
+    if (v_trans) {
+        error = "PyramidKV C1 requires non-transposed V rows";
+        return false;
+    }
+    if (!sc_info.empty()) {
+        error = "PyramidKV C1 cannot compact with a pending stream copy";
+        return false;
+    }
+    if (get_has_shift()) {
+        error = "PyramidKV C1 cannot compact while a K-shift is pending";
+        return false;
+    }
+    if (layers.empty()) {
+        error = "PyramidKV C1 found no dense KV layers";
+        return false;
+    }
+    if (!pyramidkv_c1_hot_enabled || type_k() != GGML_TYPE_TURBO4_0 ||
+            type_v() != GGML_TYPE_TURBO4_0) {
+        error = "PyramidKV C1 requires TQ4 cold K/V plus an F16 hot window";
+        return false;
+    }
+    if (hparams.n_layer_all == 0) {
+        error = "PyramidKV C1 has no dense layer geometry";
+        return false;
+    }
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i].k == nullptr || layers[i].v == nullptr ||
+                layers[i].k_hot == nullptr || layers[i].v_hot == nullptr) {
+            error = "PyramidKV C1 requires cold and F16 hot K/V for every cached layer";
+            return false;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (layers[i].k == layers[j].k || layers[i].v == layers[j].v ||
+                    layers[i].k_hot == layers[j].k_hot || layers[i].v_hot == layers[j].v_hot) {
+                error = "PyramidKV C1 rejects reused or aliased layer storage";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::pyramidkv_c1_should_maintain(uint32_t n_tokens, uint32_t n_ubatch) {
+    if (!pyramidkv_c1_compacted) {
+        return true;
+    }
+
+    uint32_t hot_capacity = std::numeric_limits<uint32_t>::max();
+    for (const auto & layer : pyramidkv_c1_layers) {
+        hot_capacity = std::min(hot_capacity, layer.hot_row_capacity);
+    }
+    if (pyramidkv_c1_layers.empty() || n_ubatch == 0 || n_ubatch >= hot_capacity) {
+        return true;
+    }
+
+    // Leave room for a full next ubatch after any single-token prefix.
+    const uint32_t interval = std::min(n_ubatch, hot_capacity - n_ubatch + 1);
+    pyramidkv_c1_tokens_since_compact = static_cast<uint32_t>(std::min<uint64_t>(
+        static_cast<uint64_t>(pyramidkv_c1_tokens_since_compact) + n_tokens,
+        std::numeric_limits<uint32_t>::max()));
+    return pyramidkv_c1_tokens_since_compact >= interval;
+}
+
+bool llama_kv_cache::pyramidkv_c1_keep_all(
+        std::vector<llama_pyramidkv_c1_layer_selection> & selections,
+        std::string & error) const {
+    selections.clear();
+    if (!pyramidkv_c1_compacted) {
+        error = "PyramidKV append maintenance requires the initial prompt selection";
+        return false;
+    }
+    for (size_t index = 0; index < layers.size(); ++index) {
+        const auto & state = pyramidkv_c1_layers[index];
+        std::vector<std::vector<std::int64_t>> positions;
+        std::vector<std::vector<std::size_t>> cells;
+        std::vector<std::vector<std::size_t>> slots;
+        uint32_t active = 0;
+        if (!pyramidkv_c1_key_positions(layers[index].il,
+                state.cold_row_capacity + state.hot_row_capacity,
+                positions, cells, slots, active, error)) {
+            return false;
+        }
+        llama_pyramidkv_c1_layer_selection selection;
+        selection.il = layers[index].il;
+        selection.source_tokens = active;
+        selection.kv_heads = state.kv_heads;
+        selection.continuation_headroom = pyramidkv_c1_config.continuation_headroom;
+        selection.heads.resize(state.kv_heads);
+        for (uint32_t head = 0; head < state.kv_heads; ++head) {
+            auto & kept = selection.heads[head];
+            // Compaction addresses logical cells, which need not be in position order after seq_rm.
+            std::vector<std::pair<size_t, int64_t>> ordered;
+            ordered.reserve(cells[head].size());
+            for (size_t row = 0; row < cells[head].size(); ++row) {
+                ordered.emplace_back(cells[head][row], positions[head][row]);
+            }
+            std::sort(ordered.begin(), ordered.end());
+            for (const auto & row : ordered) {
+                kept.keep_cells.push_back(row.first);
+                kept.keep_positions.push_back(row.second);
+            }
+        }
+        selections.push_back(std::move(selection));
+    }
+    return true;
+}
+
+bool llama_kv_cache::pyramidkv_c1_hybrid_ready(int32_t il) const {
+    if (!pyramidkv_c1_compacted || !pyramidkv_c1_hot_enabled) {
+        return false;
+    }
+    const auto map_it = map_layer_ids.find(il);
+    if (map_it == map_layer_ids.end() ||
+            static_cast<size_t>(map_it->second) >= layers.size() ||
+            static_cast<size_t>(map_it->second) >= pyramidkv_c1_layers.size()) {
+        return false;
+    }
+    const auto & layer = layers[map_it->second];
+    const auto & state = pyramidkv_c1_layers[map_it->second];
+    return state.compacted && state.kv_heads == hparams.n_head_kv(il) &&
+        state.cold_heads.size() == state.kv_heads &&
+        state.hot_heads.size() == state.kv_heads &&
+        layer.k != nullptr && layer.v != nullptr &&
+        layer.k_hot != nullptr && layer.v_hot != nullptr;
+}
+
+bool llama_kv_cache::pyramidkv_c1_key_positions(
+        int32_t il,
+        uint32_t n_kv,
+        std::vector<std::vector<std::int64_t>> & positions,
+        std::vector<std::vector<std::size_t>> & logical_cells,
+        std::vector<std::vector<std::size_t>> & score_slots,
+        uint32_t & active_tokens,
+        std::string & error) const {
+    if (!pyramidkv_c1_supported(error)) {
+        return false;
+    }
+
+    const auto layer_it = map_layer_ids.find(il);
+    if (layer_it == map_layer_ids.end() ||
+            static_cast<std::size_t>(layer_it->second) >= pyramidkv_c1_layers.size()) {
+        error = "PyramidKV C1 score layer is not present in the cache map";
+        return false;
+    }
+
+    const auto & cells = v_cells[0];
+    active_tokens = cells.used_max_p1();
+    const auto & layer_state = pyramidkv_c1_layers[layer_it->second];
+    if (active_tokens == 0 || (!layer_state.compacted &&
+                (active_tokens > n_kv || n_kv > cells.size())) ||
+            (layer_state.compacted && n_kv != layer_state.cold_row_capacity + layer_state.hot_row_capacity)) {
+        error = "PyramidKV C1 score rows do not match the cache cell range";
+        return false;
+    }
+
+    const uint32_t kv_heads = layer_state.kv_heads != 0 ? layer_state.kv_heads : hparams.n_head_kv(il);
+    positions.assign(kv_heads, {});
+    logical_cells.assign(kv_heads, {});
+    score_slots.assign(kv_heads, {});
+    for (uint32_t head = 0; head < kv_heads; ++head) {
+        auto & head_positions = positions[head];
+        auto & head_cells = logical_cells[head];
+        auto & head_slots = score_slots[head];
+        std::vector<std::tuple<llama_pos, uint32_t, uint32_t>> entries;
+        if (layer_state.compacted) {
+            if (head >= layer_state.cold_heads.size() || head >= layer_state.hot_heads.size()) {
+                error = "PyramidKV C1 layer has no per-head cold/hot maps";
+                return false;
+            }
+        }
+        for (uint32_t i = 0; i < active_tokens; ++i) {
+            if (cells.is_empty(i) || cells.seq_count(i) != 1 || !cells.seq_has(i, 0)) {
+                continue;
+            }
+            uint32_t slot = i;
+            if (layer_state.compacted) {
+                const auto & hot = layer_state.hot_heads[head].logical_to_physical;
+                const auto & cold = layer_state.cold_heads[head].logical_to_physical;
+                if (i < hot.size() && hot[i] < layer_state.hot_row_capacity) {
+                    slot = layer_state.cold_row_capacity + hot[i];
+                } else if (i < cold.size() && cold[i] < layer_state.cold_row_capacity) {
+                    slot = cold[i];
+                } else {
+                    continue;
+                }
+            }
+            const llama_pos position = cells.pos_get(i);
+            if (position < 0) {
+                error = "PyramidKV C1 head has a negative original position";
+                return false;
+            }
+            entries.emplace_back(position, i, slot);
+        }
+        std::sort(entries.begin(), entries.end());
+        for (const auto & [position, logical, slot] : entries) {
+            if (!head_positions.empty() && position <= head_positions.back()) {
+                error = "PyramidKV C1 head contains duplicate original positions";
+                return false;
+            }
+            head_positions.push_back(position);
+            head_cells.push_back(logical);
+            head_slots.push_back(slot);
+        }
+        if (head_positions.empty()) {
+            error = "PyramidKV C1 layer has no valid logical row for a KV head";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::pyramidkv_c1_prepare_batch_rows(
+        const slot_info & sinfo,
+        const llama_ubatch & ubatch,
+        std::string & error) {
+    if (!pyramidkv_c1_hot_enabled && !pyramidkv_c1_compacted) {
+        return true;
+    }
+    if (sinfo.n_stream() != 1 || ubatch.n_tokens != sinfo.size()) {
+        error = "PyramidKV C1 batch row preparation requires one cache stream";
+        return false;
+    }
+    if (pyramidkv_c1_hot_enabled && pyramidkv_c1_compacted &&
+            (pyramidkv_c1_layers.empty() ||
+             pyramidkv_c1_layers.front().hot_row_capacity <= pyramidkv_c1_layers.front().hot_recent ||
+             ubatch.n_tokens > pyramidkv_c1_layers.front().hot_row_capacity -
+                 pyramidkv_c1_layers.front().hot_recent)) {
+        error = "PyramidKV C1 hot window has no bounded batch headroom";
+        return false;
+    }
+
+    auto & cells = v_cells[sinfo.strm[0]];
+    for (auto & state : pyramidkv_c1_layers) {
+        if (state.kv_heads == 0 || state.hot_heads.size() != state.kv_heads) {
+            error = "PyramidKV C1 layer has no per-head hot map";
+            return false;
+        }
+
+        if (state.compacted && state.cold_heads.size() != state.kv_heads) {
+            error = "PyramidKV C1 compacted layer has no per-head cold map";
+            return false;
+        }
+
+        for (uint32_t head = 0; head < state.kv_heads; ++head) {
+            auto & hot = state.hot_heads[head];
+            if (hot.logical_to_physical.size() != cells.size()) {
+                hot.logical_to_physical.assign(cells.size(), pyramidkv_c1_invalid_cell);
+            }
+            uint32_t free_hot_rows = 0;
+            for (uint32_t physical = 0; physical < hot.physical_to_logical.size(); ++physical) {
+                const uint32_t logical = hot.physical_to_logical[physical];
+                if (logical != pyramidkv_c1_invalid_cell &&
+                        (logical >= cells.size() || cells.is_empty(logical))) {
+                    hot.physical_to_logical[physical] = pyramidkv_c1_invalid_cell;
+                    if (logical < hot.logical_to_physical.size()) {
+                        hot.logical_to_physical[logical] = pyramidkv_c1_invalid_cell;
+                    }
+                }
+                free_hot_rows += hot.physical_to_logical[physical] == pyramidkv_c1_invalid_cell;
+            }
+            for (uint32_t logical : sinfo.idxs[0]) {
+                if (logical >= hot.logical_to_physical.size()) {
+                    error = "PyramidKV C1 batch cell exceeds the logical head map";
+                    return false;
+                }
+                if (hot.logical_to_physical[logical] != pyramidkv_c1_invalid_cell) {
+                    continue;
+                }
+                if (hot.physical_to_logical.empty()) {
+                    error = "PyramidKV C1 hot map has no physical row";
+                    return false;
+                }
+                const uint32_t capacity = static_cast<uint32_t>(hot.physical_to_logical.size());
+                uint32_t physical = pyramidkv_c1_invalid_cell;
+                if (free_hot_rows != 0) {
+                    // Partial seq_rm can leave holes away from next_row. Fill
+                    // those holes before discarding still-valid history.
+                    for (uint32_t offset = 0; offset < capacity; ++offset) {
+                        const uint32_t candidate = (hot.next_row + offset) % capacity;
+                        if (hot.physical_to_logical[candidate] == pyramidkv_c1_invalid_cell) {
+                            physical = candidate;
+                            --free_hot_rows;
+                            break;
+                        }
+                    }
+                } else {
+                    // Hole reuse can change physical age order. Evict the
+                    // oldest original position, never a row just assigned to
+                    // this ubatch (whose logical cell is not committed yet).
+                    llama_pos oldest = std::numeric_limits<llama_pos>::max();
+                    for (uint32_t candidate = 0; candidate < capacity; ++candidate) {
+                        const uint32_t existing = hot.physical_to_logical[candidate];
+                        if (existing < cells.size() && !cells.is_empty(existing) &&
+                                cells.pos_get(existing) < oldest) {
+                            oldest = cells.pos_get(existing);
+                            physical = candidate;
+                        }
+                    }
+                }
+                if (physical == pyramidkv_c1_invalid_cell) {
+                    error = "PyramidKV C1 hot window has no free or evictable row outside the active batch";
+                    return false;
+                }
+                const uint32_t evicted = hot.physical_to_logical[physical];
+                if (state.compacted && evicted != pyramidkv_c1_invalid_cell &&
+                        (evicted >= state.cold_heads[head].logical_to_physical.size() ||
+                         state.cold_heads[head].logical_to_physical[evicted] >= state.cold_row_capacity)) {
+                    error = "PyramidKV append maintenance did not preserve a live hot row before overwrite";
+                    return false;
+                }
+                if (evicted != pyramidkv_c1_invalid_cell && evicted < hot.logical_to_physical.size()) {
+                    hot.logical_to_physical[evicted] = pyramidkv_c1_invalid_cell;
+                }
+                hot.physical_to_logical[physical] = logical;
+                hot.logical_to_physical[logical] = physical;
+                hot.next_row = (physical + 1) % static_cast<uint32_t>(hot.physical_to_logical.size());
+            }
+            if (state.compacted) {
+                auto & cold = state.cold_heads[head];
+                if (cold.logical_to_physical.size() != cells.size()) {
+                    error = "PyramidKV C1 cold map is not aligned with logical cells";
+                    return false;
+                }
+                for (uint32_t physical = 0; physical < cold.physical_to_logical.size(); ++physical) {
+                    const uint32_t logical = cold.physical_to_logical[physical];
+                    if (logical != pyramidkv_c1_invalid_cell && cells.is_empty(logical)) {
+                        cold.physical_to_logical[physical] = pyramidkv_c1_invalid_cell;
+                        cold.logical_to_physical[logical] = pyramidkv_c1_invalid_cell;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::pyramidkv_c1_compact(
+        llama_context * lctx,
+        const std::vector<llama_pyramidkv_c1_layer_selection> & selections,
+        std::string & error) {
+    if (lctx == nullptr || !pyramidkv_c1_supported(error)) {
+        return false;
+    }
+    if (selections.empty()) {
+        error = "PyramidKV C1 received no layer selections";
+        return false;
+    }
+    const bool initial_selection = !pyramidkv_c1_compacted;
+
+    const auto & old_cells = v_cells[0];
+    const uint32_t old_active = old_cells.used_max_p1();
+    if (old_active == 0) {
+        error = "PyramidKV C1 cannot compact an empty cache";
+        return false;
+    }
+
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    auto & phase = pyramidkv_c1_phase_timing_stats;
+    ++phase.compaction_calls;
+#endif
+
+    struct head_plan {
+        std::vector<uint32_t> source_rows;
+        std::vector<int32_t> hot_source_rows;
+        std::vector<int64_t> hot_destination_rows;
+        uint32_t capacity = 0;
+    };
+    struct layer_plan {
+        size_t layer_index = 0;
+        const llama_pyramidkv_c1_layer_selection * selection = nullptr;
+        std::vector<head_plan> heads;
+        uint32_t cold_capacity = 0;
+    };
+
+    std::vector<const llama_pyramidkv_c1_layer_selection *> by_layer(layers.size(), nullptr);
+    for (const auto & selection : selections) {
+        const auto map_it = map_layer_ids.find(selection.il);
+        if (selection.source_tokens != old_active || map_it == map_layer_ids.end() ||
+                static_cast<size_t>(map_it->second) >= layers.size()) {
+            error = "PyramidKV C1 selection was built for a different cache or layer set";
+            return false;
+        }
+        const size_t layer_index = static_cast<size_t>(map_it->second);
+        if (by_layer[layer_index] != nullptr || selection.kv_heads == 0 ||
+                selection.heads.size() != selection.kv_heads ||
+                selection.continuation_headroom == 0) {
+            error = "PyramidKV C1 selection has duplicate layers or invalid per-head metadata";
+            return false;
+        }
+        by_layer[layer_index] = &selection;
+
+        for (size_t head = 0; head < selection.heads.size(); ++head) {
+            const auto & selected = selection.heads[head];
+            if (selected.keep_cells.empty() ||
+                    selected.keep_cells.size() != selected.keep_positions.size() ||
+                    selected.protected_recent_cells.size() != selected.protected_recent_positions.size()) {
+                error = "PyramidKV C1 selection has an empty or inconsistent head list";
+                return false;
+            }
+            size_t previous = 0;
+            bool first = true;
+            for (size_t i = 0; i < selected.keep_cells.size(); ++i) {
+                const size_t logical = selected.keep_cells[i];
+                if (logical >= old_active || (!first && logical <= previous) ||
+                        old_cells.is_empty(static_cast<uint32_t>(logical)) ||
+                        old_cells.pos_get(static_cast<uint32_t>(logical)) != selected.keep_positions[i]) {
+                    error = "PyramidKV C1 selection does not preserve logical positions";
+                    return false;
+                }
+                first = false;
+                previous = logical;
+            }
+            for (size_t i = 0; i < selected.protected_recent_cells.size(); ++i) {
+                const size_t logical = selected.protected_recent_cells[i];
+                if (logical >= old_active || old_cells.is_empty(static_cast<uint32_t>(logical)) ||
+                        old_cells.pos_get(static_cast<uint32_t>(logical)) != selected.protected_recent_positions[i] ||
+                        !std::binary_search(selected.keep_cells.begin(), selected.keep_cells.end(), logical)) {
+                    error = "PyramidKV C1 selection dropped a protected recent row";
+                    return false;
+                }
+            }
+        }
+    }
+    for (const auto & layer : layers) {
+        const auto map_it = map_layer_ids.find(static_cast<int32_t>(layer.il));
+        if (map_it == map_layer_ids.end() || by_layer[map_it->second] == nullptr) {
+            error = "PyramidKV C1 has no score selection for a cached layer";
+            return false;
+        }
+    }
+
+    std::vector<layer_plan> plans;
+    size_t promoted_rows = 0;
+    size_t copied_cold_rows = 0;
+    plans.reserve(layers.size());
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        const auto & layer = layers[layer_index];
+        const auto & selection = *by_layer[layer_index];
+        const auto & old_state = pyramidkv_c1_layers[layer_index];
+        const uint32_t kv_heads = hparams.n_head_kv(layer.il);
+        if (selection.kv_heads != kv_heads || old_state.kv_heads != kv_heads ||
+                selection.heads.size() != kv_heads) {
+            error = "PyramidKV C1 selection does not match layer KV-head geometry";
+            return false;
+        }
+        if (old_state.hot_heads.size() != kv_heads ||
+                old_state.compacted && old_state.cold_heads.size() != kv_heads) {
+            error = "PyramidKV C1 existing layer has no complete per-head maps";
+            return false;
+        }
+
+        layer_plan plan;
+        plan.layer_index = layer_index;
+        plan.selection = &selection;
+        plan.heads.resize(kv_heads);
+        for (uint32_t head = 0; head < kv_heads; ++head) {
+            const auto & selected = selection.heads[head];
+            auto & hp = plan.heads[head];
+            if (selected.keep_cells.size() > std::numeric_limits<uint32_t>::max() -
+                    selection.continuation_headroom) {
+                error = "PyramidKV C1 per-head capacity overflows uint32_t";
+                return false;
+            }
+            hp.capacity = GGML_PAD(static_cast<uint32_t>(selected.keep_cells.size() +
+                selection.continuation_headroom), n_pad);
+            if (hp.capacity == 0 || hp.capacity > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+                error = "PyramidKV C1 per-head capacity cannot be addressed by I32 indices";
+                return false;
+            }
+            hp.source_rows.reserve(selected.keep_cells.size());
+            for (const size_t logical_size : selected.keep_cells) {
+                const uint32_t logical = static_cast<uint32_t>(logical_size);
+                uint32_t source = logical;
+                if (old_state.compacted) {
+                    const auto & old_head = old_state.cold_heads[head];
+                    if (logical >= old_head.logical_to_physical.size() ||
+                            old_head.logical_to_physical[logical] == pyramidkv_c1_invalid_cell) {
+                        const auto & old_hot = old_state.hot_heads[head];
+                        if (logical >= old_hot.logical_to_physical.size() ||
+                                old_hot.logical_to_physical[logical] >= old_hot.row_capacity) {
+                            error = "PyramidKV selection has neither a cold nor a hot source row";
+                            return false;
+                        }
+                        const uint64_t hot_source = static_cast<uint64_t>(head) * old_hot.row_capacity +
+                            old_hot.logical_to_physical[logical];
+                        if (hot_source >= static_cast<uint64_t>(layer.k_hot->ne[1]) ||
+                                hot_source > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+                            error = "PyramidKV hot promotion row exceeds the physical cache";
+                            return false;
+                        }
+                        hp.hot_source_rows.push_back(static_cast<int32_t>(hot_source));
+                        hp.hot_destination_rows.push_back(static_cast<int64_t>(hp.source_rows.size()));
+                        hp.source_rows.push_back(pyramidkv_c1_invalid_cell);
+                        continue;
+                    }
+                    if (old_head.row_capacity == 0 ||
+                            old_head.logical_to_physical[logical] >= old_head.row_capacity ||
+                            head > (std::numeric_limits<uint32_t>::max() -
+                                old_head.logical_to_physical[logical]) / old_head.row_capacity) {
+                        error = "PyramidKV old per-head row address overflows";
+                        return false;
+                    }
+                    source = head * old_head.row_capacity + old_head.logical_to_physical[logical];
+                }
+                if (source >= layers[layer_index].k->ne[1]) {
+                    error = "PyramidKV source row exceeds the physical cold tensor";
+                    return false;
+                }
+                hp.source_rows.push_back(source);
+            }
+            plan.cold_capacity = std::max(plan.cold_capacity, hp.capacity);
+        }
+        if (plan.cold_capacity == 0 || plan.cold_capacity >
+                static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) / kv_heads) {
+            error = "PyramidKV layer cold capacity is invalid";
+            return false;
+        }
+        for (const auto & head : plan.heads) {
+            promoted_rows += head.hot_source_rows.size();
+            copied_cold_rows += head.source_rows.size() - head.hot_source_rows.size();
+        }
+        plans.push_back(std::move(plan));
+    }
+
+    const auto & transition_config = pyramidkv_c1_config;
+
+    size_t tensor_count = layers.size();
+    if (tensor_count > std::numeric_limits<size_t>::max() /
+            (4u * (1u + n_stream))) {
+        error = "PyramidKV C1 replacement tensor count overflows";
+        return false;
+    }
+    tensor_count *= 4u * (1u + n_stream);
+    if (turbo_rotation != nullptr && tensor_count > std::numeric_limits<size_t>::max() - 2u) {
+        error = "PyramidKV C1 rotation tensor count overflows";
+        return false;
+    }
+    const size_t overhead_tensors = tensor_count + (turbo_rotation != nullptr ? 2u : 0u);
+    if (overhead_tensors > std::numeric_limits<size_t>::max() / ggml_tensor_overhead()) {
+        error = "PyramidKV C1 replacement context size overflows";
+        return false;
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ overhead_tensors * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr new_ctx(ggml_init(params));
+    if (!new_ctx) {
+        error = "PyramidKV C1 failed to create the replacement ggml context";
+        return false;
+    }
+
+    std::vector<kv_layer> new_layers;
+    new_layers.reserve(layers.size());
+    for (const auto & plan : plans) {
+        const auto & old_layer = layers[plan.layer_index];
+        const uint32_t kv_heads = hparams.n_head_kv(old_layer.il);
+        const bool head_major = pyramidkv_c1_layers[plan.layer_index].compacted;
+        const uint32_t padded_k = static_cast<uint32_t>(old_layer.k->ne[0] / (head_major ? 1 : kv_heads));
+        const uint32_t padded_v = static_cast<uint32_t>(old_layer.v->ne[0] / (head_major ? 1 : kv_heads));
+        const uint64_t cold_rows = static_cast<uint64_t>(plan.cold_capacity) * kv_heads;
+        const uint64_t hot_rows = old_layer.k_hot->ne[1];
+        if (cold_rows > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
+                hot_rows > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+            error = "PyramidKV replacement row count exceeds ggml index range";
+            return false;
+        }
+        ggml_tensor * k = ggml_new_tensor_3d(new_ctx.get(), old_layer.k->type,
+            padded_k, cold_rows, n_stream);
+        ggml_tensor * v = ggml_new_tensor_3d(new_ctx.get(), old_layer.v->type,
+            padded_v, cold_rows, n_stream);
+        ggml_tensor * k_hot = ggml_new_tensor_3d(new_ctx.get(), GGML_TYPE_F16,
+            old_layer.k_hot->ne[0], hot_rows, n_stream);
+        ggml_tensor * v_hot = ggml_new_tensor_3d(new_ctx.get(), GGML_TYPE_F16,
+            old_layer.v_hot->ne[0], hot_rows, n_stream);
+        ggml_format_name(k, "cache_k_l%d", old_layer.il);
+        ggml_format_name(v, "cache_v_l%d", old_layer.il);
+        ggml_format_name(k_hot, "cache_k_hot_l%d", old_layer.il);
+        ggml_format_name(v_hot, "cache_v_hot_l%d", old_layer.il);
+
+        std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_hot_stream;
+        std::vector<ggml_tensor *> v_hot_stream;
+        for (uint32_t stream = 0; stream < n_stream; ++stream) {
+            k_stream.push_back(ggml_view_2d(new_ctx.get(), k, k->ne[0], k->ne[1],
+                k->nb[1], stream * k->nb[2]));
+            v_stream.push_back(ggml_view_2d(new_ctx.get(), v, v->ne[0], v->ne[1],
+                v->nb[1], stream * v->nb[2]));
+            k_hot_stream.push_back(ggml_view_2d(new_ctx.get(), k_hot, k_hot->ne[0], k_hot->ne[1],
+                k_hot->nb[1], stream * k_hot->nb[2]));
+            v_hot_stream.push_back(ggml_view_2d(new_ctx.get(), v_hot, v_hot->ne[0], v_hot->ne[1],
+                v_hot->nb[1], stream * v_hot->nb[2]));
+        }
+        new_layers.push_back({ old_layer.il, k, v, k_stream, v_stream,
+            k_hot, v_hot, k_hot_stream, v_hot_stream });
+    }
+
+    ggml_tensor * new_rotation = nullptr;
+    ggml_tensor * new_rotation_inv = nullptr;
+    if (turbo_rotation != nullptr) {
+        new_rotation = ggml_new_tensor_2d(new_ctx.get(), GGML_TYPE_F32,
+            GGML_TURBO4_QK, GGML_TURBO4_QK);
+        new_rotation_inv = ggml_new_tensor_2d(new_ctx.get(), GGML_TYPE_F32,
+            GGML_TURBO4_QK, GGML_TURBO4_QK);
+        ggml_format_name(new_rotation, "turbo4_rotation");
+        ggml_format_name(new_rotation_inv, "turbo4_rotation_inv");
+    }
+
+    const size_t new_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+        new_ctx.get(), kv_buffer_type);
+    const size_t old_bytes = total_size();
+    const size_t observer_bytes = transition_config.observer_max_bytes;
+    const size_t graph_scratch_bytes = observer_bytes;
+    size_t copy_scratch_bytes = 0;
+    size_t metadata_bytes = 0;
+    bool metadata_ok = true;
+    const auto add_metadata_vector = [&](size_t logical_count, size_t physical_count) {
+        if (!metadata_ok || logical_count > std::numeric_limits<size_t>::max() - physical_count) {
+            metadata_ok = false;
+            return;
+        }
+        const size_t entries = logical_count + physical_count;
+        if (entries > std::numeric_limits<size_t>::max() / sizeof(uint32_t) ||
+                metadata_bytes > std::numeric_limits<size_t>::max() -
+                    entries * sizeof(uint32_t)) {
+            metadata_ok = false;
+            return;
+        }
+        metadata_bytes += entries * sizeof(uint32_t);
+    };
+    for (const auto & plan : plans) {
+        const auto & old_layer = layers[plan.layer_index];
+        for (const auto * tensor : { old_layer.k, old_layer.v }) {
+            const size_t bytes = ggml_nbytes(tensor);
+            if (bytes > std::numeric_limits<size_t>::max() / 2) {
+                error = "PyramidKV C1 copy scratch size overflows";
+                return false;
+            }
+            copy_scratch_bytes = std::max(copy_scratch_bytes, bytes * 2);
+        }
+        copy_scratch_bytes = std::max({ copy_scratch_bytes,
+            ggml_nbytes(old_layer.k_hot), ggml_nbytes(old_layer.v_hot) });
+        const auto & old_state = pyramidkv_c1_layers[plan.layer_index];
+        for (uint32_t head = 0; head < plan.heads.size(); ++head) {
+            const auto & old_hot = old_state.hot_heads[head];
+            // The old hot map and its copied replacement are simultaneously
+            // live until the atomic state swap.
+            add_metadata_vector(old_hot.logical_to_physical.size(),
+                old_hot.physical_to_logical.size());
+            add_metadata_vector(old_hot.logical_to_physical.size(),
+                old_hot.physical_to_logical.size());
+            if (old_state.compacted) {
+                const auto & old_cold = old_state.cold_heads[head];
+                add_metadata_vector(old_cold.logical_to_physical.size(),
+                    old_cold.physical_to_logical.size());
+            }
+            // New cold maps retain the logical cell index range and add the
+            // head-local physical map.
+            add_metadata_vector(old_cells.size(), plan.cold_capacity);
+        }
+    }
+    size_t transition_bytes = old_bytes;
+    const auto add_transition = [&](size_t bytes) {
+        if (transition_bytes > std::numeric_limits<size_t>::max() - bytes) {
+            return false;
+        }
+        transition_bytes += bytes;
+        return true;
+    };
+    bool plan_bytes_ok = add_transition(params.mem_size);
+    const auto charge_plan = [&](size_t count, size_t bytes) {
+        plan_bytes_ok = plan_bytes_ok && count <= std::numeric_limits<size_t>::max() / bytes &&
+            add_transition(count * bytes);
+    };
+    charge_plan(plans.capacity(), sizeof(layer_plan));
+    charge_plan(layers.size(), sizeof(pyramidkv_c1_layer_state));
+    for (const auto & plan : plans) {
+        charge_plan(plan.heads.capacity(), sizeof(head_plan));
+        charge_plan(plan.heads.size() * 2, sizeof(pyramidkv_c1_head_state));
+        for (const auto & head : plan.heads) {
+            charge_plan(head.source_rows.capacity(), sizeof(uint32_t));
+            charge_plan(head.hot_source_rows.capacity(), sizeof(int32_t));
+            charge_plan(head.hot_destination_rows.capacity() * 2, sizeof(int64_t));
+        }
+    }
+    if (!metadata_ok || !add_transition(new_bytes) || !add_transition(observer_bytes) ||
+            !add_transition(graph_scratch_bytes) || !add_transition(metadata_bytes) ||
+            !plan_bytes_ok || !add_transition(copy_scratch_bytes) ||
+            transition_bytes > transition_config.transition_max_bytes) {
+        error = "PyramidKV C1 transition budget rejects old+new KV, observer, scratch, or map metadata";
+        return false;
+    }
+
+    llama_synchronize(lctx);
+    ggml_backend_sched_reset(lctx->get_sched());
+    ggml_backend_buffer_ptr new_buf(
+        ggml_backend_alloc_ctx_tensors_from_buft(new_ctx.get(), kv_buffer_type));
+    if (!new_buf) {
+        error = "PyramidKV C1 failed to allocate replacement kv_buffer_type buffers";
+        return false;
+    }
+    ggml_backend_buffer_clear(new_buf.get(), 0);
+
+    auto copy_hot = [&](ggml_tensor * source, ggml_tensor * destination) {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const int64_t phase_start_us = ggml_time_us();
+#endif
+        const size_t bytes = ggml_nbytes(source);
+        std::vector<uint8_t> host(bytes);
+        ggml_backend_tensor_get(source, host.data(), 0, bytes);
+        ggml_backend_tensor_set(destination, host.data(), 0, bytes);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        ++phase.hot_copy_calls;
+        // Count both the device-to-host read and host-to-device write, matching
+        // cold-copy accounting for the total host payload moved.
+        phase.hot_copy_bytes += static_cast<uint64_t>(bytes) * 2;
+        phase.hot_copy_us += static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+#endif
+    };
+    auto copy_head_runs = [&](ggml_tensor * source, ggml_tensor * destination,
+            const std::vector<uint32_t> & rows, uint32_t head,
+            uint32_t old_capacity, uint32_t new_capacity, bool old_head_major) {
+        const size_t source_row_bytes = ggml_row_size(source->type, source->ne[0]);
+        const size_t destination_row_bytes = ggml_row_size(destination->type, destination->ne[0]);
+        const size_t source_head_bytes = ggml_row_size(source->type,
+            destination->ne[0]);
+        size_t begin = 0;
+        while (begin < rows.size()) {
+            if (rows[begin] == pyramidkv_c1_invalid_cell) {
+                ++begin;
+                continue;
+            }
+            size_t run = 1;
+            while (begin + run < rows.size() && rows[begin + run] != pyramidkv_c1_invalid_cell &&
+                    rows[begin + run] == rows[begin] + run) {
+                ++run;
+            }
+            if (run > std::numeric_limits<size_t>::max() / source_row_bytes ||
+                    run > std::numeric_limits<size_t>::max() / destination_row_bytes) {
+                throw std::runtime_error("PyramidKV row-run copy size overflows");
+            }
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            const int64_t phase_start_us = ggml_time_us();
+#endif
+            std::vector<uint8_t> source_host(run * source_row_bytes);
+            ggml_backend_tensor_get(source, source_host.data(),
+                static_cast<size_t>(rows[begin]) * source_row_bytes, source_host.size());
+            std::vector<uint8_t> destination_host(run * destination_row_bytes, 0);
+            for (size_t i = 0; i < run; ++i) {
+                const uint8_t * src = source_host.data() + i * source_row_bytes;
+                if (!old_head_major) {
+                    src += static_cast<size_t>(head) * source_head_bytes;
+                }
+                if (source_head_bytes != destination_row_bytes) {
+                    throw std::runtime_error("PyramidKV head row byte geometry changed");
+                }
+                std::memcpy(destination_host.data() + i * destination_row_bytes,
+                    src, destination_row_bytes);
+            }
+            const size_t destination_row = static_cast<size_t>(head) * new_capacity + begin;
+            ggml_backend_tensor_set(destination, destination_host.data(),
+                destination_row * destination_row_bytes, destination_host.size());
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            ++phase.cold_copy_calls;
+            phase.cold_copy_bytes += source_host.size() + destination_host.size();
+            phase.cold_copy_us += static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+#endif
+            begin += run;
+        }
+        GGML_UNUSED(old_capacity);
+    };
+
+    auto promote_hot = [&](const kv_layer & source, const kv_layer & destination,
+            const head_plan & plan, uint32_t head, uint32_t capacity) {
+        if (plan.hot_source_rows.empty()) {
+            return;
+        }
+        if (turbo_rotation_inv == nullptr || plan.hot_source_rows.size() != plan.hot_destination_rows.size()) {
+            throw std::runtime_error("PyramidKV hot promotion has no rotation or complete row map");
+        }
+        const auto device = ggml_backend_buft_get_device(kv_buffer_type);
+        ggml_backend_t backend = nullptr;
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(lctx->get_sched()); ++i) {
+            auto candidate = ggml_backend_sched_get_backend(lctx->get_sched(), i);
+            if (ggml_backend_get_device(candidate) == device) {
+                backend = candidate;
+                break;
+            }
+        }
+        if (backend == nullptr || ggml_backend_buffer_is_host(source.k_hot->buffer)) {
+            throw std::runtime_error("PyramidKV hot promotion requires its KV GPU backend");
+        }
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        const int64_t phase_start_us = ggml_time_us();
+        ++phase.promotion_calls;
+        phase.promotion_rows += plan.hot_source_rows.size();
+#endif
+        const size_t max_nodes = 32;
+        const ggml_init_params promotion_params = {
+            /*.mem_size   =*/ max_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(max_nodes, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr promotion_ctx(ggml_init(promotion_params));
+        if (!promotion_ctx) {
+            throw std::runtime_error("PyramidKV hot promotion context allocation failed");
+        }
+        auto * graph = ggml_new_graph_custom(promotion_ctx.get(), max_nodes, false);
+        auto * source_indices = ggml_new_tensor_1d(promotion_ctx.get(), GGML_TYPE_I32, plan.hot_source_rows.size());
+        auto * destination_indices = ggml_new_tensor_1d(promotion_ctx.get(), GGML_TYPE_I64, plan.hot_destination_rows.size());
+        auto encode = [&](ggml_tensor * hot, ggml_tensor * cold) {
+            auto * hot_rows = ggml_reshape_2d(promotion_ctx.get(), hot, hot->ne[0], hot->ne[1]);
+            auto * selected = ggml_get_rows(promotion_ctx.get(), hot_rows, source_indices);
+            // Hot is already in the WHT basis. Undo that rotation before the
+            // existing TQ4 encoder applies it once to newly promoted rows.
+            auto * flat = ggml_reshape_2d(promotion_ctx.get(), selected,
+                GGML_TURBO4_QK, ggml_nelements(selected) / GGML_TURBO4_QK);
+            auto * unrotated = ggml_mul_mat(promotion_ctx.get(), turbo_rotation_inv, flat);
+            ggml_mul_mat_set_prec(unrotated, GGML_PREC_F32);
+            unrotated = ggml_reshape_2d(promotion_ctx.get(), unrotated, cold->ne[0], plan.hot_source_rows.size());
+            auto * cold_rows = ggml_reshape_2d(promotion_ctx.get(), cold, cold->ne[0], cold->ne[1]);
+            auto * encoded = ggml_set_rows(promotion_ctx.get(), cold_rows, unrotated, destination_indices);
+            ggml_format_name(encoded, "pyramidkv_promote_l%d_%s", source.il, hot == source.k_hot ? "k" : "v");
+            ggml_build_forward_expand(graph, encoded);
+        };
+        encode(source.k_hot, destination.k);
+        encode(source.v_hot, destination.v);
+
+        const size_t promotion_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(promotion_ctx.get(), kv_buffer_type);
+        if (promotion_bytes > graph_scratch_bytes || promotion_params.mem_size > graph_scratch_bytes - promotion_bytes) {
+            throw std::runtime_error("PyramidKV hot promotion exceeds the reserved transition scratch budget");
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            if (!ggml_backend_supports_op(backend, ggml_graph_node(graph, i))) {
+                throw std::runtime_error("PyramidKV hot promotion contains an unsupported KV-device operation");
+            }
+        }
+        ggml_backend_buffer_ptr promotion_buffer(
+            ggml_backend_alloc_ctx_tensors_from_buft(promotion_ctx.get(), kv_buffer_type));
+        if (!promotion_buffer) {
+            throw std::runtime_error("PyramidKV hot promotion GPU allocation failed");
+        }
+        auto destination_rows = plan.hot_destination_rows;
+        for (auto & row : destination_rows) {
+            row += static_cast<int64_t>(head) * capacity;
+        }
+        ggml_backend_tensor_set(source_indices, plan.hot_source_rows.data(), 0,
+            plan.hot_source_rows.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(destination_indices, destination_rows.data(), 0,
+            destination_rows.size() * sizeof(int64_t));
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("PyramidKV hot promotion GPU computation failed");
+        }
+        ggml_backend_synchronize(backend);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+        ++phase.promotion_syncs;
+        phase.promotion_us += static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+#endif
+    };
+
+    try {
+        for (const auto & plan : plans) {
+            const auto & old_layer = layers[plan.layer_index];
+            const auto & old_state = pyramidkv_c1_layers[plan.layer_index];
+            const bool old_head_major = old_state.compacted;
+            const uint32_t old_capacity = old_state.compacted && !old_state.cold_heads.empty()
+                ? old_state.cold_heads[0].row_capacity : 0;
+            for (uint32_t head = 0; head < plan.heads.size(); ++head) {
+                copy_head_runs(old_layer.k, new_layers[plan.layer_index].k,
+                    plan.heads[head].source_rows, head, old_capacity,
+                    plan.cold_capacity, old_head_major);
+                copy_head_runs(old_layer.v, new_layers[plan.layer_index].v,
+                    plan.heads[head].source_rows, head, old_capacity,
+                    plan.cold_capacity, old_head_major);
+                promote_hot(old_layer, new_layers[plan.layer_index], plan.heads[head], head, plan.cold_capacity);
+            }
+            copy_hot(old_layer.k_hot, new_layers[plan.layer_index].k_hot);
+            copy_hot(old_layer.v_hot, new_layers[plan.layer_index].v_hot);
+        }
+        if (new_rotation != nullptr) {
+            std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation;
+            std::array<float, GGML_TURBO4_QK*GGML_TURBO4_QK> rotation_inv;
+            ggml_turbo4_rotation_matrix(rotation.data(), false);
+            ggml_turbo4_rotation_matrix(rotation_inv.data(), true);
+            ggml_backend_tensor_set(new_rotation, rotation.data(), 0, rotation.size()*sizeof(float));
+            ggml_backend_tensor_set(new_rotation_inv, rotation_inv.data(), 0, rotation_inv.size()*sizeof(float));
+        }
+    } catch (const std::exception & ex) {
+        error = std::string("PyramidKV C1 replacement copy failed: ") + ex.what();
+        return false;
+    }
+
+    std::vector<pyramidkv_c1_layer_state> new_states(layers.size());
+    for (const auto & plan : plans) {
+        const auto & selection = *plan.selection;
+        const auto & old_state = pyramidkv_c1_layers[plan.layer_index];
+        auto & state = new_states[plan.layer_index];
+        state.compacted = true;
+        state.kv_heads = selection.kv_heads;
+        state.cold_row_capacity = plan.cold_capacity;
+        state.hot_row_capacity = old_state.hot_row_capacity;
+        state.hot_recent = old_state.hot_recent;
+        state.hot_heads = old_state.hot_heads;
+        state.cold_heads.resize(selection.kv_heads);
+        for (uint32_t head = 0; head < selection.kv_heads; ++head) {
+            auto & map = state.cold_heads[head];
+            map.row_capacity = plan.cold_capacity;
+            map.logical_to_physical.assign(old_cells.size(), pyramidkv_c1_invalid_cell);
+            map.physical_to_logical.assign(plan.cold_capacity, pyramidkv_c1_invalid_cell);
+            const auto & selected = selection.heads[head];
+            if (!old_state.compacted) {
+                auto & hot = state.hot_heads[head];
+                for (uint32_t physical = 0; physical < hot.physical_to_logical.size(); ++physical) {
+                    const uint32_t logical = hot.physical_to_logical[physical];
+                    if (logical != pyramidkv_c1_invalid_cell &&
+                            !std::binary_search(selected.keep_cells.begin(), selected.keep_cells.end(), logical)) {
+                        hot.physical_to_logical[physical] = pyramidkv_c1_invalid_cell;
+                        hot.logical_to_physical[logical] = pyramidkv_c1_invalid_cell;
+                    }
+                }
+            }
+            for (size_t physical = 0; physical < selected.keep_cells.size(); ++physical) {
+                const uint32_t logical = static_cast<uint32_t>(selected.keep_cells[physical]);
+                map.logical_to_physical[logical] = static_cast<uint32_t>(physical);
+                map.physical_to_logical[physical] = logical;
+            }
+        }
+    }
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> new_ctxs_bufs;
+    new_ctxs_bufs.emplace_back(std::move(new_ctx), std::move(new_buf));
+    ctxs_bufs = std::move(new_ctxs_bufs);
+    layers = std::move(new_layers);
+    pyramidkv_c1_layers = std::move(new_states);
+    turbo_rotation = new_rotation;
+    turbo_rotation_inv = new_rotation_inv;
+    sc_info = {};
+    pyramidkv_c1_compacted = true;
+    pyramidkv_c1_tokens_since_compact = 0;
+
+    LLAMA_LOG_INFO("%s: PyramidKV C1 installed per-layer/per-KV-head cold rows with F16 hot headroom using %s; copied=%zu promoted_on_kv_gpu=%zu stage=%s\n",
+        __func__, ggml_backend_buft_name(kv_buffer_type), copied_cold_rows, promoted_rows,
+        initial_selection ? "prefill" : "append");
+    return true;
+}
+
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -1249,51 +2993,107 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
-
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        uint32_t physical_limit = cells.size();
+        if (pyramidkv_c1_hot_enabled && !pyramidkv_c1_compacted && !layers.empty() &&
+                layers.front().k != nullptr) {
+            physical_limit = std::min<uint32_t>(physical_limit,
+                static_cast<uint32_t>(layers.front().k->ne[1]));
+        }
+        const uint32_t pad_floor = std::min(physical_limit, n_pad_cur);
+        const uint32_t used_padded = GGML_PAD(cells.used_max_p1(), n_pad_cur);
+        result = std::max(std::min(physical_limit, std::max(pad_floor, used_padded)), result);
     }
 
     return result;
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k(
+        ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+        ggml_tensor * read_idxs) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t kv_size      = pyramidkv_c1_hot_enabled && !pyramidkv_c1_compacted
+        ? k->ne[1] : get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    if (n_kv > k->ne[1]) {
+        throw std::runtime_error("PyramidKV C1 logical K rows exceed the bounded physical cache");
+    }
+
+    if (!llama_kv_type_is_turbo4(k->type)) {
+        assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    }
+
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    const uint32_t n_embd_head_k = llama_kv_type_is_turbo4(k->type) ?
+        (pyramidkv_c1_compacted ? static_cast<uint32_t>(k->ne[0]) : n_embd_k_gqa / n_head_kv) :
+        hparams.n_embd_head_k(il);
+
+    if (pyramidkv_c1_compacted) {
+        if (read_idxs == nullptr || sinfo.n_stream() != 1 || sinfo.s0 != 0 || sinfo.s1 != 0) {
+            throw std::runtime_error("PyramidKV C1 K view requires one compacted stream and read indices");
+        }
+        // A compacted layer has its own physical row count. Gather logical
+        // rows before exposing the unchanged logical [head, kv-head, key]
+        // graph shape. Logical dropped rows are redirected to a harmless
+        // spare row; the hybrid lane uses original-position metadata for
+        // validity instead of a common logical mask.
+        ggml_tensor * rows = ggml_reshape_2d(ctx, k, k->ne[0], k->ne[1] * k->ne[2]);
+        rows = ggml_get_rows(ctx, rows, read_idxs);
+        return ggml_reshape_4d(ctx, rows, n_embd_head_k, n_head_kv, n_kv, 1);
+    }
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
-            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            n_embd_head_k, n_head_kv, n_kv, ns,
+            ggml_row_size(k->type, n_embd_head_k),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_v(
+        ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+        ggml_tensor * read_idxs) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t kv_size      = pyramidkv_c1_hot_enabled && !pyramidkv_c1_compacted
+        ? v->ne[1] : get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
+
+    if (n_kv > v->ne[1]) {
+        throw std::runtime_error("PyramidKV C1 logical V rows exceed the bounded physical cache");
+    }
 
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    const uint32_t n_embd_head_v = llama_kv_type_is_turbo4(v->type) ?
+        (pyramidkv_c1_compacted ? static_cast<uint32_t>(v->ne[0]) : n_embd_v_gqa / n_head_kv) :
+        hparams.n_embd_head_v(il);
+
+    if (pyramidkv_c1_compacted) {
+        if (read_idxs == nullptr || v_trans || sinfo.n_stream() != 1 || sinfo.s0 != 0 || sinfo.s1 != 0) {
+            throw std::runtime_error("PyramidKV C1 V view requires one non-transposed stream and read indices");
+        }
+        ggml_tensor * rows = ggml_reshape_2d(ctx, v, v->ne[0], v->ne[1] * v->ne[2]);
+        rows = ggml_get_rows(ctx, rows, read_idxs);
+        return ggml_reshape_4d(ctx, rows, n_embd_head_v, n_head_kv, n_kv, 1);
+    }
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
-                ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
+                n_embd_head_v, n_head_kv, n_kv, ns,
+                ggml_row_size(v->type, n_embd_head_v),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
@@ -1301,14 +3101,88 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
-            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
+            n_kv, n_head_kv, n_embd_head_v, ns,
+            ggml_row_size(v->type, kv_size*n_embd_head_v),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::get_k_hot(
+        ggml_context * ctx, int32_t il, uint32_t n_kv, ggml_tensor * read_idxs) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k_hot = layers[ikv].k_hot;
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    if (!pyramidkv_c1_hot_enabled || k_hot == nullptr || read_idxs == nullptr ||
+            read_idxs->ne[0] != static_cast<int64_t>(n_kv)*n_head_kv) {
+        throw std::runtime_error("PyramidKV C1 hot K view has invalid head-local indices");
+    }
+    ggml_tensor * rows = ggml_reshape_2d(ctx, k_hot, k_hot->ne[0], k_hot->ne[1]*k_hot->ne[2]);
+    rows = ggml_get_rows(ctx, rows, read_idxs);
+    return ggml_reshape_4d(ctx, rows, k_hot->ne[0], n_head_kv, n_kv, 1);
+}
+
+ggml_tensor * llama_kv_cache::get_v_hot(
+        ggml_context * ctx, int32_t il, uint32_t n_kv, ggml_tensor * read_idxs) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * v_hot = layers[ikv].v_hot;
+    const uint32_t n_head_kv = hparams.n_head_kv(il);
+    if (!pyramidkv_c1_hot_enabled || v_hot == nullptr || read_idxs == nullptr ||
+            read_idxs->ne[0] != static_cast<int64_t>(n_kv)*n_head_kv) {
+        throw std::runtime_error("PyramidKV C1 hot V view has invalid head-local indices");
+    }
+    ggml_tensor * rows = ggml_reshape_2d(ctx, v_hot, v_hot->ne[0], v_hot->ne[1]*v_hot->ne[2]);
+    rows = ggml_get_rows(ctx, rows, read_idxs);
+    return ggml_reshape_4d(ctx, rows, v_hot->ne[0], n_head_kv, n_kv, 1);
+}
+
+ggml_tensor * llama_kv_cache::get_k_hybrid(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    if (!pyramidkv_c1_hybrid_ready(il)) {
+        throw std::runtime_error("PyramidKV C1 cold K hybrid view is not ready");
+    }
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const ggml_tensor * storage = layers[ikv].k;
+    return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
+        state.cold_row_capacity, state.kv_heads, storage->ne[2]);
+}
+
+ggml_tensor * llama_kv_cache::get_v_hybrid(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    if (!pyramidkv_c1_hybrid_ready(il)) {
+        throw std::runtime_error("PyramidKV C1 cold V hybrid view is not ready");
+    }
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const ggml_tensor * storage = layers[ikv].v;
+    return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
+        state.cold_row_capacity, state.kv_heads, storage->ne[2]);
+}
+
+ggml_tensor * llama_kv_cache::get_k_hot_hybrid(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    if (!pyramidkv_c1_hybrid_ready(il)) {
+        throw std::runtime_error("PyramidKV C1 hot K hybrid view is not ready");
+    }
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const ggml_tensor * storage = layers[ikv].k_hot;
+    return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
+        state.hot_row_capacity, state.kv_heads, storage->ne[2]);
+}
+
+ggml_tensor * llama_kv_cache::get_v_hot_hybrid(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    if (!pyramidkv_c1_hybrid_ready(il)) {
+        throw std::runtime_error("PyramidKV C1 hot V hybrid view is not ready");
+    }
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const ggml_tensor * storage = layers[ikv].v_hot;
+    return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
+        state.hot_row_capacity, state.kv_heads, storage->ne[2]);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        const slot_info & sinfo, ggml_tensor * physical_idxs) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1319,13 +3193,37 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
 
-    const int64_t n_embd_gqa = n_embd_head*n_head;
+    if (llama_kv_type_is_turbo4(k->type)) {
+        const int64_t padded_head = pyramidkv_c1_compacted ? k->ne[0] : k->ne[0] / n_head;
+        if (n_embd_head < padded_head) {
+            k_cur = ggml_pad(ctx, k_cur, padded_head - n_embd_head, 0, 0, 0);
+        }
+    }
+
+    const int64_t n_embd_gqa = k_cur->ne[0]*n_head;
 
     // we can merge dims 0 and 1
     // TODO: add ggml helper function for this?
-    GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+    if (ggml_row_size(k_cur->type, k_cur->ne[0]) != k_cur->nb[1]) {
+        k_cur = ggml_cont(ctx, k_cur);
+    }
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    if (pyramidkv_c1_compacted) {
+        if (physical_idxs == nullptr) {
+            throw std::runtime_error("PyramidKV C1 K write requires physical indices");
+        }
+        if (k->ne[2] != 1 || physical_idxs->ne[0] != n_tokens*n_head) {
+            throw std::runtime_error("PyramidKV C1 K write index geometry is invalid");
+        }
+        if (k_cur->ne[0] % n_head != 0) {
+            throw std::runtime_error("PyramidKV C1 K write rows are not head-major");
+        }
+        k_cur = ggml_reshape_2d(ctx, k_cur, k_cur->ne[0] / n_head, n_tokens*n_head);
+        k = ggml_reshape_2d(ctx, k, k->ne[0], k->ne[1] * k->ne[2]);
+        return ggml_set_rows(ctx, k, k_cur, physical_idxs);
+    }
 
     const int64_t n_stream = k->ne[2];
 
@@ -1343,7 +3241,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
-ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
+ggml_tensor * llama_kv_cache::cpy_v(
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il,
+        const slot_info & sinfo, ggml_tensor * physical_idxs) const {
     GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
@@ -1354,16 +3254,40 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_head      = v_cur->ne[1];
     const int64_t n_tokens    = v_cur->ne[2];
 
-    const int64_t n_embd_gqa = n_embd_head*n_head;
+    if (llama_kv_type_is_turbo4(v->type)) {
+        const int64_t padded_head = pyramidkv_c1_compacted ? v->ne[0] : v->ne[0] / n_head;
+        if (n_embd_head < padded_head) {
+            v_cur = ggml_pad(ctx, v_cur, padded_head - n_embd_head, 0, 0, 0);
+        }
+    }
+
+    const int64_t n_embd_gqa = v_cur->ne[0]*n_head;
 
     // we can merge dims 0 and 1
-    GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
+    if (ggml_row_size(v_cur->type, v_cur->ne[0]) != v_cur->nb[1]) {
+        v_cur = ggml_cont(ctx, v_cur);
+    }
 
     const int64_t n_stream = v->ne[2];
 
     // take this branch when FA is enabled (the V cache is not transposed)
     if (!v_trans) {
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+
+        if (pyramidkv_c1_compacted) {
+            if (physical_idxs == nullptr) {
+                throw std::runtime_error("PyramidKV C1 V write requires physical indices");
+            }
+            if (v->ne[2] != 1 || physical_idxs->ne[0] != n_tokens*n_head) {
+                throw std::runtime_error("PyramidKV C1 V write index geometry is invalid");
+            }
+            if (v_cur->ne[0] % n_head != 0) {
+                throw std::runtime_error("PyramidKV C1 V write rows are not head-major");
+            }
+            v_cur = ggml_reshape_2d(ctx, v_cur, v_cur->ne[0] / n_head, n_tokens*n_head);
+            v = ggml_reshape_2d(ctx, v, v->ne[0], v->ne[1] * v->ne[2]);
+            return ggml_set_rows(ctx, v, v_cur, physical_idxs);
+        }
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
@@ -1376,6 +3300,10 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         }
 
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
+    }
+
+    if (pyramidkv_c1_compacted) {
+        throw std::runtime_error("PyramidKV C1 does not support transposed V writes");
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
@@ -1397,6 +3325,58 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_k_hot(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k_hot = layers[ikv].k_hot;
+    if (!pyramidkv_c1_hot_enabled || k_hot == nullptr || k_idxs == nullptr) {
+        throw std::runtime_error("PyramidKV C1 hot K storage is unavailable");
+    }
+    const int64_t n_head = k_cur->ne[1];
+    const int64_t n_tokens = k_cur->ne[2];
+    const int64_t padded_head = k_hot->ne[0];
+    if (n_head <= 0 || n_tokens <= 0 || k_cur->ne[0] > padded_head ||
+            k_idxs->ne[0] != n_head*n_tokens) {
+        throw std::runtime_error("PyramidKV C1 hot K write geometry is invalid");
+    }
+    if (k_cur->ne[0] < padded_head) {
+        k_cur = ggml_pad(ctx, k_cur, padded_head - k_cur->ne[0], 0, 0, 0);
+    }
+    if (k_cur->type != GGML_TYPE_F16) {
+        k_cur = ggml_cast(ctx, k_cur, GGML_TYPE_F16);
+    }
+    k_cur = ggml_cont(ctx, k_cur);
+    k_cur = ggml_reshape_2d(ctx, k_cur, padded_head, n_head*n_tokens);
+    k_hot = ggml_reshape_2d(ctx, k_hot, padded_head, k_hot->ne[1]*k_hot->ne[2]);
+    return ggml_set_rows(ctx, k_hot, k_cur, k_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_v_hot(
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * v_hot = layers[ikv].v_hot;
+    if (!pyramidkv_c1_hot_enabled || v_hot == nullptr || v_idxs == nullptr) {
+        throw std::runtime_error("PyramidKV C1 hot V storage is unavailable");
+    }
+    const int64_t n_head = v_cur->ne[1];
+    const int64_t n_tokens = v_cur->ne[2];
+    const int64_t padded_head = v_hot->ne[0];
+    if (n_head <= 0 || n_tokens <= 0 || v_cur->ne[0] > padded_head ||
+            v_idxs->ne[0] != n_head*n_tokens) {
+        throw std::runtime_error("PyramidKV C1 hot V write geometry is invalid");
+    }
+    if (v_cur->ne[0] < padded_head) {
+        v_cur = ggml_pad(ctx, v_cur, padded_head - v_cur->ne[0], 0, 0, 0);
+    }
+    if (v_cur->type != GGML_TYPE_F16) {
+        v_cur = ggml_cast(ctx, v_cur, GGML_TYPE_F16);
+    }
+    v_cur = ggml_cont(ctx, v_cur);
+    v_cur = ggml_reshape_2d(ctx, v_cur, padded_head, n_head*n_tokens);
+    v_hot = ggml_reshape_2d(ctx, v_hot, padded_head, v_hot->ne[1]*v_hot->ne[2]);
+    return ggml_set_rows(ctx, v_hot, v_cur, v_idxs);
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -1913,6 +3893,9 @@ size_t llama_kv_cache::total_size() const {
     for (const auto & [_, buf] : ctxs_bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
     }
+    if (tq4_key_anchor_buf) {
+        size += ggml_backend_buffer_get_size(tq4_key_anchor_buf.get());
+    }
 
     return size;
 }
@@ -1922,6 +3905,7 @@ size_t llama_kv_cache::size_k_bytes() const {
 
     for (const auto & layer : layers) {
         size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.k_hot ? ggml_nbytes(layer.k_hot) : 0;
     }
 
     return size_k_bytes;
@@ -1932,6 +3916,7 @@ size_t llama_kv_cache::size_v_bytes() const {
 
     for (const auto & layer : layers) {
         size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += layer.v_hot ? ggml_nbytes(layer.v_hot) : 0;
     }
 
     return size_v_bytes;
@@ -1947,6 +3932,10 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
                       float   freq_base,
                       float   freq_scale,
                    uint32_t   il) const {
+    if (llama_kv_type_is_turbo4(cur->type)) {
+        throw std::runtime_error("TurboQuant4 KV cache does not support K-shift re-quantization");
+    }
+
     const auto & n_ctx_orig = cparams.n_ctx_orig_yarn;
 
     const auto & yarn_ext_factor  = cparams.yarn_ext_factor;
@@ -2020,6 +4009,10 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     GGML_ASSERT(!other);
 
+    if (llama_kv_type_is_turbo4(type_k())) {
+        throw std::runtime_error("TurboQuant4 KV cache does not support K-shift");
+    }
+
     auto * ctx = res->get_ctx();
     auto * gf  = res->get_gf();
 
@@ -2069,6 +4062,15 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if (tq4_key_center_enabled_flag) {
+        throw std::runtime_error(
+            "TQ4 key-center state_write is disabled until the anchor has a versioned state format");
+    }
+    if (pyramidkv_c1_hot_enabled) {
+        throw std::runtime_error(
+            "PyramidKV C1 state_write is disabled: the bounded cold/hot layout has no format version/remap");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2139,6 +4141,15 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if (tq4_key_center_enabled_flag) {
+        throw std::runtime_error(
+            "TQ4 key-center state_read is disabled until the anchor has a versioned state format");
+    }
+    if (pyramidkv_c1_hot_enabled) {
+        throw std::runtime_error(
+            "PyramidKV C1 state_read is disabled: the bounded cold/hot layout has no format version/remap");
+    }
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -2234,9 +4245,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-
         auto * k = layer.k_stream[cr.strm];
+        const uint32_t n_embd_k_gqa = llama_kv_type_is_turbo4(k->type) ? k->ne[0] : hparams.n_embd_k_gqa(il);
 
         // Write key type
         const int32_t k_type_i = (int32_t) k->type;
@@ -2258,12 +4268,11 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
 
-            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;
             }
+            const uint32_t n_embd_v_gqa = llama_kv_type_is_turbo4(v->type) ? v->ne[0] : hparams.n_embd_v_gqa(il);
 
             // Write value type
             const int32_t v_type_i = (int32_t) v->type;
@@ -2287,12 +4296,11 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
 
-            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;
             }
+            const uint32_t n_embd_v_gqa = llama_kv_type_is_turbo4(v->type) ? v->ne[0] : hparams.n_embd_v_gqa(il);
 
             // Write value type
             const int32_t v_type_i = (int32_t) v->type;
@@ -2471,10 +4479,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
-
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-
         auto * k = layer.k_stream[strm];
+        const uint32_t n_embd_k_gqa = llama_kv_type_is_turbo4(k->type) ? k->ne[0] : hparams.n_embd_k_gqa(il);
 
         // Read type of key
         int32_t k_type_i_ref;
@@ -2511,13 +4517,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     if (!this->v_trans) {
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
-
-            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
-
             auto * v = layer.v_stream[strm];
             if (!v) {
                 continue;
             }
+            const uint32_t n_embd_v_gqa = llama_kv_type_is_turbo4(v->type) ? v->ne[0] : hparams.n_embd_v_gqa(il);
 
             // Read type of value
             int32_t v_type_i_ref;
@@ -2554,13 +4558,11 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // For each layer, read the values for each cell (transposed)
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
-
-            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
-
             auto * v = layer.v_stream[strm];
             if (!v) {
                 continue;
             }
+            const uint32_t n_embd_v_gqa = llama_kv_type_is_turbo4(v->type) ? v->ne[0] : hparams.n_embd_v_gqa(il);
 
             // Read type of value
             int32_t v_type_i_ref;
@@ -2621,6 +4623,9 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    if (kv->pyramidkv_c1_hot_enabled && !kv->pyramidkv_c1_compacted) {
+        n_kv = std::min(n_kv, static_cast<int32_t>(kv->pyramidkv_c1_initial_capacity));
+    }
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -2653,6 +4658,406 @@ llama_kv_cache_context::llama_kv_cache_context(
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
 
+llama_kv_cache_context::pyramidkv_graph_inputs & llama_kv_cache_context::pyramidkv_input(int32_t il) const {
+    auto it = std::find_if(pyramidkv_inputs.begin(), pyramidkv_inputs.end(),
+        [il](const pyramidkv_graph_inputs & input) { return input.il == il; });
+    if (it == pyramidkv_inputs.end()) {
+        pyramidkv_inputs.push_back({ il, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr });
+        it = pyramidkv_inputs.end();
+        --it;
+    }
+    return *it;
+}
+
+ggml_tensor * llama_kv_cache_context::pyramidkv_read_idxs(ggml_context * ctx, int32_t il) const {
+    if (!kv->pyramidkv_c1_is_compacted()) {
+        return nullptr;
+    }
+
+    auto & input = pyramidkv_input(il);
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 read index layer is unknown");
+    }
+    const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+    if (state.kv_heads == 0 || n_kv > std::numeric_limits<size_t>::max() / state.kv_heads) {
+        throw std::runtime_error("PyramidKV C1 read index count overflows");
+    }
+    const size_t count = static_cast<size_t>(n_kv) * state.kv_heads;
+    if (input.read_idxs == nullptr) {
+        input.read_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, count);
+        ggml_set_input(input.read_idxs);
+    } else if (static_cast<size_t>(input.read_idxs->ne[0]) != count) {
+        throw std::runtime_error("PyramidKV C1 read index shape changed while reusing a graph");
+    }
+    return input.read_idxs;
+}
+
+ggml_tensor * llama_kv_cache_context::pyramidkv_write_idxs(
+        ggml_context * ctx, int32_t il, size_t n) const {
+    if (!kv->pyramidkv_c1_is_compacted()) {
+        return nullptr;
+    }
+
+    auto & input = pyramidkv_input(il);
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 write index layer is unknown");
+    }
+    const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+    if (state.kv_heads == 0 || n > std::numeric_limits<size_t>::max() / state.kv_heads) {
+        throw std::runtime_error("PyramidKV C1 write index count overflows");
+    }
+    n *= state.kv_heads;
+    if (input.write_idxs == nullptr) {
+        input.write_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_input(input.write_idxs);
+    } else if (static_cast<size_t>(input.write_idxs->ne[0]) != n) {
+        throw std::runtime_error("PyramidKV C1 write index shape changed while reusing a graph");
+    }
+    return input.write_idxs;
+}
+
+ggml_tensor * llama_kv_cache_context::pyramidkv_hot_read_idxs(ggml_context * ctx, int32_t il) const {
+    if (!kv->pyramidkv_c1_is_compacted()) {
+        return nullptr;
+    }
+    auto & input = pyramidkv_input(il);
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 hot read index layer is unknown");
+    }
+    const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+    if (state.kv_heads == 0 || n_kv > std::numeric_limits<size_t>::max() / state.kv_heads) {
+        throw std::runtime_error("PyramidKV C1 hot read index count overflows");
+    }
+    const size_t count = static_cast<size_t>(n_kv) * state.kv_heads;
+    if (input.hot_read_idxs == nullptr) {
+        input.hot_read_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, count);
+        ggml_set_input(input.hot_read_idxs);
+    } else if (static_cast<size_t>(input.hot_read_idxs->ne[0]) != count) {
+        throw std::runtime_error("PyramidKV C1 hot read index shape changed while reusing a graph");
+    }
+    return input.hot_read_idxs;
+}
+
+ggml_tensor * llama_kv_cache_context::pyramidkv_hot_write_idxs(
+        ggml_context * ctx, int32_t il, size_t n) const {
+    if (!kv->pyramidkv_c1_hot_enabled && !kv->pyramidkv_c1_is_compacted()) {
+        return nullptr;
+    }
+    auto & input = pyramidkv_input(il);
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 hot write index layer is unknown");
+    }
+    const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+    if (state.kv_heads == 0 || n > std::numeric_limits<size_t>::max() / state.kv_heads) {
+        throw std::runtime_error("PyramidKV C1 hot write index count overflows");
+    }
+    n *= state.kv_heads;
+    if (input.hot_write_idxs == nullptr) {
+        input.hot_write_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n);
+        ggml_set_input(input.hot_write_idxs);
+    } else if (static_cast<size_t>(input.hot_write_idxs->ne[0]) != n) {
+        throw std::runtime_error("PyramidKV C1 hot write index shape changed while reusing a graph");
+    }
+    return input.hot_write_idxs;
+}
+
+ggml_tensor * llama_kv_cache_context::pyramidkv_k_positions(ggml_context * ctx, int32_t il) const {
+    if (!kv->pyramidkv_c1_is_compacted()) {
+        return nullptr;
+    }
+    auto & input = pyramidkv_input(il);
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 position layer is unknown");
+    }
+    const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+    const size_t rows = static_cast<size_t>(state.cold_row_capacity) + state.hot_row_capacity;
+    if (state.kv_heads == 0 || rows == 0 || rows > std::numeric_limits<size_t>::max() / state.kv_heads) {
+        throw std::runtime_error("PyramidKV C1 position shape overflows");
+    }
+    if (input.k_positions == nullptr) {
+        input.k_positions = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, rows, state.kv_heads, 1, 1);
+        ggml_set_input(input.k_positions);
+    } else if (static_cast<size_t>(input.k_positions->ne[0]) != rows ||
+            static_cast<size_t>(input.k_positions->ne[1]) != state.kv_heads) {
+        throw std::runtime_error("PyramidKV C1 key position shape changed while reusing a graph");
+    }
+    return input.k_positions;
+}
+
+ggml_tensor * llama_kv_cache_context::pyramidkv_q_positions(ggml_context * ctx, int32_t il, size_t n) const {
+    if (!kv->pyramidkv_c1_is_compacted() || n == 0) {
+        return nullptr;
+    }
+    auto & input = pyramidkv_input(il);
+    if (input.q_positions == nullptr) {
+        input.q_positions = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n, 1, 1, 1);
+        ggml_set_input(input.q_positions);
+    } else if (static_cast<size_t>(input.q_positions->ne[0]) != n) {
+        throw std::runtime_error("PyramidKV C1 query position shape changed while reusing a graph");
+    }
+    return input.q_positions;
+}
+
+ggml_tensor * llama_kv_cache_context::get_pyramidkv_observer_mask(
+        ggml_context * ctx, int32_t il, size_t n) const {
+    if (!kv->pyramidkv_c1_is_compacted()) {
+        return nullptr;
+    }
+    auto * positions = pyramidkv_k_positions(ctx, il);
+    const size_t rows = static_cast<size_t>(positions->ne[0]);
+    const size_t query_heads = kv->hparams.n_head(il);
+    const auto & config = kv->pyramidkv_c1_get_config();
+    if (n == 0 || query_heads == 0 || rows > config.observer_max_bytes / sizeof(float) / query_heads / n) {
+        throw std::runtime_error("PyramidKV hybrid observer mask exceeds its byte budget");
+    }
+
+    auto & input = pyramidkv_input(il);
+    if (input.valid_mask == nullptr) {
+        input.valid_mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, rows, n, query_heads);
+        ggml_format_name(input.valid_mask, "pyramidkv_observer_mask_l%d", il);
+        ggml_set_input(input.valid_mask);
+    } else if (input.valid_mask->ne[0] != static_cast<int64_t>(rows) ||
+            input.valid_mask->ne[1] != static_cast<int64_t>(n) ||
+            input.valid_mask->ne[2] != static_cast<int64_t>(query_heads)) {
+        throw std::runtime_error("PyramidKV hybrid observer mask shape changed while reusing a graph");
+    }
+    return input.valid_mask;
+}
+
+void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ubatch) const {
+    if (!kv->pyramidkv_c1_hot_enabled && !kv->pyramidkv_c1_is_compacted()) {
+        return;
+    }
+    if (ubatch == nullptr || i_cur >= sinfos.size() || sinfos[i_cur].n_stream() != 1 ||
+            ubatch->pos == nullptr ||
+            (ubatch->n_pos != 1 && !(kv->model.arch == LLM_ARCH_QWEN35 && ubatch->token && ubatch->n_pos == 4))) {
+        throw std::runtime_error("PyramidKV C1 input mapping requires one stream and one-dimensional positions");
+    }
+    for (uint32_t axis = 1; axis < ubatch->n_pos; ++axis) {
+        for (uint32_t token = 0; token < ubatch->n_tokens; ++token) {
+            if (ubatch->pos[axis * ubatch->n_tokens + token] != ubatch->pos[token]) {
+                throw std::runtime_error("PyramidKV C1 only supports broadcast text positions");
+            }
+        }
+    }
+
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    const int64_t phase_start_us = ggml_time_us();
+    auto & phase = kv->pyramidkv_c1_phase_timing_stats;
+#endif
+
+    const auto & sinfo = sinfos[i_cur];
+    const auto & cells = kv->v_cells[sinfo.strm[0]];
+    const uint32_t active = cells.used_max_p1();
+    for (auto & input : pyramidkv_inputs) {
+        const auto map_it = kv->map_layer_ids.find(input.il);
+        if (map_it == kv->map_layer_ids.end() ||
+                static_cast<size_t>(map_it->second) >= kv->pyramidkv_c1_layers.size()) {
+            throw std::runtime_error("PyramidKV C1 graph input references an unknown layer");
+        }
+        const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+        if (state.kv_heads == 0 || state.hot_heads.size() != state.kv_heads ||
+                state.hot_row_capacity == 0 ||
+                (state.compacted && (state.cold_heads.size() != state.kv_heads ||
+                    state.cold_row_capacity == 0))) {
+            throw std::runtime_error("PyramidKV C1 graph input has no per-head maps");
+        }
+
+        const uint32_t heads = state.kv_heads;
+        const uint32_t cold_scratch = state.cold_row_capacity - 1;
+        const uint32_t hot_scratch = state.hot_row_capacity - 1;
+        const auto valid_cell = [&](size_t logical) {
+            return logical < active && logical < cells.size() && !cells.is_empty(static_cast<uint32_t>(logical)) &&
+                cells.seq_count(static_cast<uint32_t>(logical)) == 1 &&
+                cells.seq_has(static_cast<uint32_t>(logical), 0);
+        };
+        const auto cold_row = [&](uint32_t head, size_t logical) {
+            const auto & map = state.cold_heads[head];
+            if (valid_cell(logical) && logical < map.logical_to_physical.size() &&
+                    map.logical_to_physical[logical] != llama_kv_cache::pyramidkv_c1_invalid_cell &&
+                    map.logical_to_physical[logical] < map.row_capacity) {
+                return head * state.cold_row_capacity + map.logical_to_physical[logical];
+            }
+            return head * state.cold_row_capacity + cold_scratch;
+        };
+        const auto hot_row = [&](uint32_t head, size_t logical) {
+            const auto & map = state.hot_heads[head];
+            if (valid_cell(logical) && logical < map.logical_to_physical.size() &&
+                    map.logical_to_physical[logical] != llama_kv_cache::pyramidkv_c1_invalid_cell &&
+                    map.logical_to_physical[logical] < map.row_capacity) {
+                return head * state.hot_row_capacity + map.logical_to_physical[logical];
+            }
+            return head * state.hot_row_capacity + hot_scratch;
+        };
+        const auto hot_valid = [&](uint32_t head, size_t logical) {
+            const auto & map = state.hot_heads[head];
+            return valid_cell(logical) && logical < map.logical_to_physical.size() &&
+                map.logical_to_physical[logical] != llama_kv_cache::pyramidkv_c1_invalid_cell &&
+                map.logical_to_physical[logical] < map.row_capacity;
+        };
+
+        if (input.read_idxs != nullptr) {
+            const size_t count = static_cast<size_t>(input.read_idxs->ne[0]);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_read_elems += count;
+#endif
+            if (count % heads != 0) {
+                throw std::runtime_error("PyramidKV C1 cold read index count is not head-major");
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.read_idxs->buffer));
+            auto * data = static_cast<int32_t *>(input.read_idxs->data);
+            for (size_t logical = 0; logical < count / heads; ++logical) {
+                for (uint32_t head = 0; head < heads; ++head) {
+                    data[logical*heads + head] = static_cast<int32_t>(cold_row(head, logical));
+                }
+            }
+        }
+        if (input.hot_read_idxs != nullptr) {
+            const size_t count = static_cast<size_t>(input.hot_read_idxs->ne[0]);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_hot_read_elems += count;
+#endif
+            if (count % heads != 0) {
+                throw std::runtime_error("PyramidKV C1 hot read index count is not head-major");
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.hot_read_idxs->buffer));
+            auto * data = static_cast<int32_t *>(input.hot_read_idxs->data);
+            for (size_t logical = 0; logical < count / heads; ++logical) {
+                for (uint32_t head = 0; head < heads; ++head) {
+                    data[logical*heads + head] = static_cast<int32_t>(hot_row(head, logical));
+                }
+            }
+        }
+        if (input.write_idxs != nullptr) {
+            const size_t count = static_cast<size_t>(input.write_idxs->ne[0]);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_write_elems += count;
+#endif
+            if (count != static_cast<size_t>(sinfo.size())*heads) {
+                throw std::runtime_error("PyramidKV C1 cold write index count does not match the active batch");
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.write_idxs->buffer));
+            auto * data = static_cast<int32_t *>(input.write_idxs->data);
+            for (size_t token = 0; token < sinfo.size(); ++token) {
+                const uint32_t logical = sinfo.idxs[0][token];
+                for (uint32_t head = 0; head < heads; ++head) {
+                    data[token*heads + head] = static_cast<int32_t>(cold_row(head, logical));
+                }
+            }
+        }
+        if (input.hot_write_idxs != nullptr) {
+            const size_t count = static_cast<size_t>(input.hot_write_idxs->ne[0]);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_hot_write_elems += count;
+#endif
+            if (count != static_cast<size_t>(sinfo.size())*heads) {
+                throw std::runtime_error("PyramidKV C1 hot write index count does not match the active batch");
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.hot_write_idxs->buffer));
+            auto * data = static_cast<int32_t *>(input.hot_write_idxs->data);
+            for (size_t token = 0; token < sinfo.size(); ++token) {
+                const uint32_t logical = sinfo.idxs[0][token];
+                for (uint32_t head = 0; head < heads; ++head) {
+                    const auto & map = state.hot_heads[head];
+                    if (logical >= map.logical_to_physical.size() ||
+                            map.logical_to_physical[logical] == llama_kv_cache::pyramidkv_c1_invalid_cell) {
+                        throw std::runtime_error("PyramidKV C1 batch row has no hot physical destination");
+                    }
+                    data[token*heads + head] = static_cast<int32_t>(hot_row(head, logical));
+                }
+            }
+        }
+        if (input.k_positions != nullptr) {
+            const size_t rows = static_cast<size_t>(state.cold_row_capacity) + state.hot_row_capacity;
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_position_elems += rows * heads;
+#endif
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.k_positions->buffer));
+            auto * data = static_cast<int32_t *>(input.k_positions->data);
+            for (uint32_t head = 0; head < heads; ++head) {
+                const auto & cold = state.cold_heads[head];
+                const auto & hot = state.hot_heads[head];
+                for (uint32_t row = 0; row < state.cold_row_capacity; ++row) {
+                    const uint32_t logical = row < cold.physical_to_logical.size()
+                        ? cold.physical_to_logical[row] : llama_kv_cache::pyramidkv_c1_invalid_cell;
+                    // A logical token must be consumed exactly once. While
+                    // it is present in the recent hot ring, hide the older
+                    // retained cold copy; hot eviction exposes it again.
+                    data[row + rows*head] = valid_cell(logical) && !hot_valid(head, logical)
+                        ? cells.pos_get(logical) : -1;
+                }
+                for (uint32_t row = 0; row < state.hot_row_capacity; ++row) {
+                    const uint32_t logical = row < hot.physical_to_logical.size()
+                        ? hot.physical_to_logical[row] : llama_kv_cache::pyramidkv_c1_invalid_cell;
+                    data[state.cold_row_capacity + row + rows*head] = valid_cell(logical) ? cells.pos_get(logical) : -1;
+                }
+            }
+        }
+        if (input.q_positions != nullptr) {
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_position_elems += ubatch->n_tokens;
+#endif
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.q_positions->buffer));
+            auto * data = static_cast<int32_t *>(input.q_positions->data);
+            for (uint32_t token = 0; token < ubatch->n_tokens; ++token) {
+                data[token] = static_cast<int32_t>(ubatch->pos[token]);
+            }
+        }
+        if (input.valid_mask != nullptr) {
+            const size_t rows = static_cast<size_t>(input.valid_mask->ne[0]);
+            const size_t queries = static_cast<size_t>(input.valid_mask->ne[1]);
+            const size_t query_heads = static_cast<size_t>(input.valid_mask->ne[2]);
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+            phase.input_map_mask_elems += rows * queries * query_heads;
+#endif
+            if (input.k_positions == nullptr || rows != static_cast<size_t>(input.k_positions->ne[0]) ||
+                    queries != ubatch->n_tokens || query_heads % heads != 0) {
+                throw std::runtime_error("PyramidKV hybrid observer mask has invalid GQA geometry");
+            }
+            GGML_ASSERT(ggml_backend_buffer_is_host(input.valid_mask->buffer));
+            const auto * positions = static_cast<const int32_t *>(input.k_positions->data);
+            auto * mask = static_cast<float *>(input.valid_mask->data);
+            const size_t group = query_heads / heads;
+            for (size_t qhead = 0; qhead < query_heads; ++qhead) {
+                for (size_t query = 0; query < queries; ++query) {
+                    for (size_t row = 0; row < rows; ++row) {
+                        const int32_t position = positions[row + rows * (qhead / group)];
+                        mask[row + rows * (query + queries * qhead)] =
+                            position >= 0 && position <= ubatch->pos[query] ? 0.0f : -INFINITY;
+                    }
+                }
+            }
+        }
+    }
+#if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
+    ++phase.input_map_calls;
+    phase.input_map_us += static_cast<uint64_t>(ggml_time_us() - phase_start_us);
+#endif
+}
+
+
+ggml_tensor * llama_kv_cache_context::get_kq_mask(
+        ggml_context * ctx, ggml_tensor * base_mask, int32_t il) const {
+    if (!kv->pyramidkv_c1_is_compacted()) {
+        return base_mask;
+    }
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(base_mask);
+    if (!kv->pyramidkv_c1_hybrid_ready(il)) {
+        throw std::runtime_error("PyramidKV C1 compacted attention requires the TQ4/F16 hybrid kernel");
+    }
+    // A single logical mask cannot represent head-local cold rows.  The
+    // hybrid kernel applies causal validity from q_positions/k_positions.
+    return nullptr;
+}
+
+
+
 bool llama_kv_cache_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
@@ -2673,7 +5078,19 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
+    std::string error;
+    if (!kv->pyramidkv_c1_prepare_batch_rows(sinfos[i_cur], ubatches[i_cur], error)) {
+        LLAMA_LOG_ERROR("%s: failed to prepare PyramidKV C1 batch rows: %s\n", __func__, error.c_str());
+        kv->pyramidkv_c1_fail_transition(error);
+        status = LLAMA_MEMORY_STATUS_FAILED_PREPARE;
+        return false;
+    }
+
+    // Headroom and physical destinations are checked before mutating the
+    // logical cell arena.  A rejected hot batch therefore cannot leave cells
+    // committed without matching per-head row maps.
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     return true;
@@ -2701,20 +5118,70 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
+    return kv->get_turbo_rotation();
+}
+
+ggml_tensor * llama_kv_cache_context::get_turbo_rotation_inv() const {
+    return kv->get_turbo_rotation_inv();
+}
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, n_kv, sinfos[i_cur], pyramidkv_read_idxs(ctx, il));
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, n_kv, sinfos[i_cur], pyramidkv_read_idxs(ctx, il));
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_hot(ggml_context * ctx, int32_t il) const {
+    GGML_UNUSED(n_kv);
+    return kv->get_k_hot_hybrid(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_hot(ggml_context * ctx, int32_t il) const {
+    GGML_UNUSED(n_kv);
+    return kv->get_v_hot_hybrid(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_hybrid(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_hybrid(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_hybrid(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_hybrid(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_positions(ggml_context * ctx, int32_t il) const {
+    return pyramidkv_k_positions(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_q_positions(ggml_context * ctx, int32_t il, size_t n) const {
+    return pyramidkv_q_positions(ctx, il, n);
+}
+
+bool llama_kv_cache_context::pyramidkv_hybrid_ready(int32_t il) const {
+    return kv->pyramidkv_c1_hybrid_ready(il);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur],
+        pyramidkv_write_idxs(ctx, il, static_cast<size_t>(k_cur->ne[2])));
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
-    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+    return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur],
+        pyramidkv_write_idxs(ctx, il, static_cast<size_t>(v_cur->ne[2])));
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_hot(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const {
+    return kv->cpy_k_hot(ctx, k_cur,
+        pyramidkv_hot_write_idxs(ctx, il, static_cast<size_t>(k_cur->ne[2])), il);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v_hot(ggml_context * ctx, ggml_tensor * v_cur, int32_t il) const {
+    return kv->cpy_v_hot(ctx, v_cur,
+        pyramidkv_hot_write_idxs(ctx, il, static_cast<size_t>(v_cur->ne[2])), il);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

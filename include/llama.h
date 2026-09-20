@@ -358,6 +358,22 @@ extern "C" {
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
+    // Immutable, opt-in PyramidKV C1 profile copied into each context.
+    // Zero/disabled is the default; all nine values are validated before
+    // backend and KV allocation when enabled.
+    struct llama_pyramidkv_c1_params {
+        bool     enabled;
+        uint32_t max_capacity_prompt;
+        uint32_t beta;
+        uint32_t observation_window;
+        uint32_t recent_window;
+        uint32_t pooling_kernel;
+        uint64_t observer_max_bytes;
+        uint32_t observer_chunk;
+        uint64_t transition_max_bytes;
+        uint32_t hot_capacity;
+    };
+
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
@@ -418,6 +434,21 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // caller-provided buffer type for supported Flash Attention KV caches;
+        // nullptr keeps the default allocation path. When set, this device owns
+        // KV allocation, cache writes, and Flash Attention placement; offload_kqv
+        // does not disable that explicit target. Unsupported graph/configuration
+        // combinations are rejected. Supported Qwen hybrids use this for their
+        // attention cache only; recurrent state keeps its default buffer type.
+        ggml_backend_buffer_type_t kv_buffer_type;
+
+        // Immutable PyramidKV C1 profile; enabled=false keeps the normal path.
+        struct llama_pyramidkv_c1_params pyramidkv_c1;
+
+        // Experimental fixed post-RoPE K offset stored on the KV device.
+        // State I/O and sequence shifts are unsupported for this profile.
+        bool tq4_key_center;
     };
 
     struct llama_model_tensor_override {
@@ -582,6 +613,7 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    LLAMA_API bool llama_tq4_key_center_is_ready(const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);

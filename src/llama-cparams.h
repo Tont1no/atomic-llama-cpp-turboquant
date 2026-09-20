@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-pyramidkv-c1.h"
 
 #include <cstdint>
 #include <functional>
@@ -69,4 +70,11 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // caller-provided buffer type for the KV cache; nullptr keeps the default allocation path
+    ggml_backend_buffer_type_t kv_buffer_type = nullptr;
+
+    // Immutable context-local C1 profile; no environment or mutable setter.
+    llama_pyramidkv_c1_config pyramidkv_c1;
+    bool tq4_key_center = false;
 };

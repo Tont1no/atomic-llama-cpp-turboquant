@@ -25,6 +25,12 @@
 
 #define UNUSED GGML_UNUSED
 
+static const float ggml_turbo4_centroids[GGML_TURBO4_CENTROID_COUNT] = GGML_TURBO4_CENTROIDS_INIT;
+static const float ggml_turbo4_midpoints[GGML_TURBO4_MIDPOINT_COUNT] = GGML_TURBO4_MIDPOINTS_INIT;
+static const int8_t ggml_turbo4_signs1[GGML_TURBO4_QK] = GGML_TURBO4_SIGNS1_INIT;
+static const int8_t ggml_turbo4_signs2[GGML_TURBO4_QK] = GGML_TURBO4_SIGNS2_INIT;
+static const float ggml_turbo4_selector_sqrt_half = 0.7071067811865475f;
+
 static inline int best_index_int8(int n, const int8_t * val, float x) {
     if (x <= val[0]) return 0;
     if (x >= val[n-1]) return n-1;
@@ -2479,6 +2485,121 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
                     *y++ = (float) (q - 1) * d;
                 }
             }
+        }
+    }
+}
+
+static inline uint8_t ggml_turbo4_centroid_index(float value) {
+    for (uint8_t index = 0; index < GGML_TURBO4_MIDPOINT_COUNT; ++index) {
+        if (value < ggml_turbo4_midpoints[index]) {
+            return index;
+        }
+    }
+    return GGML_TURBO4_CENTROID_COUNT - 1;
+}
+
+static inline void ggml_turbo4_forward_wht(float * values) {
+    for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+        values[i] *= (float) ggml_turbo4_signs1[i];
+    }
+
+    for (int half = 1; half < GGML_TURBO4_QK; half <<= 1) {
+        for (int base = 0; base < GGML_TURBO4_QK; base += 2 * half) {
+            for (int i = 0; i < half; ++i) {
+                const float a = values[base + i];
+                const float b = values[base + i + half];
+                values[base + i]        = a + b;
+                values[base + i + half] = a - b;
+            }
+        }
+    }
+
+    for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+        values[i] *= GGML_TURBO4_INV_SQRT128 * (float) ggml_turbo4_signs2[i];
+    }
+}
+
+static inline float ggml_turbo4_encode_candidate(
+        const float * values, float norm, float inverse_norm, float selector_scale,
+        block_turbo4_0 * output) {
+    uint8_t indices[GGML_TURBO4_QK];
+    float reconstruction_squared = 0.0f;
+
+    for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+        indices[i] = ggml_turbo4_centroid_index(values[i] * selector_scale);
+        const float centroid = ggml_turbo4_centroids[indices[i]];
+        reconstruction_squared += centroid * centroid;
+    }
+
+    const float reconstruction_norm = sqrtf(reconstruction_squared);
+    const float corrected_norm = reconstruction_norm > 1.0e-10f ?
+        norm / reconstruction_norm : norm;
+    const ggml_fp16_t stored_norm = GGML_FP32_TO_FP16(corrected_norm);
+
+    output->norm = stored_norm;
+    output->rnorm = 0;
+    for (int i = 0; i < GGML_TURBO4_PACKED_BYTES; ++i) {
+        output->qs[i] = (uint8_t) (indices[2 * i] | (indices[2 * i + 1] << 4));
+    }
+
+    const float decoded_norm = GGML_FP16_TO_FP32(stored_norm);
+    float squared_error = 0.0f;
+    for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+        const float centroid = ggml_turbo4_centroids[indices[i]];
+        float reconstructed = centroid * decoded_norm;
+        reconstructed *= inverse_norm;
+        const float error = values[i] - reconstructed;
+        squared_error += error * error;
+    }
+    return squared_error;
+}
+
+void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % GGML_TURBO4_QK == 0);
+    const int64_t nb = k / GGML_TURBO4_QK;
+
+    for (int64_t block = 0; block < nb; ++block) {
+        float values[GGML_TURBO4_QK] = { 0.0f };
+        float norm_squared = 0.0f;
+
+        for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+            values[i] = x[block * GGML_TURBO4_QK + i];
+            norm_squared += values[i] * values[i];
+        }
+
+        const float norm = sqrtf(norm_squared);
+        const float inverse_norm = norm > 1.0e-10f ? 1.0f / norm : 0.0f;
+        for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+            values[i] *= inverse_norm;
+        }
+        ggml_turbo4_forward_wht(values);
+
+        block_turbo4_0 legacy;
+        block_turbo4_0 scaled;
+        const float legacy_error = ggml_turbo4_encode_candidate(
+            values, norm, inverse_norm, 1.0f, &legacy);
+        const float scaled_error = ggml_turbo4_encode_candidate(
+            values, norm, inverse_norm, ggml_turbo4_selector_sqrt_half, &scaled);
+        y[block] = scaled_error < legacy_error ? scaled : legacy;
+    }
+}
+
+size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    GGML_ASSERT(n_per_row % GGML_TURBO4_QK == 0);
+    quantize_row_turbo4_0_ref(src, (block_turbo4_0 *) dst, nrow * n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_TURBO4_0, n_per_row);
+}
+
+void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % GGML_TURBO4_QK == 0);
+    const int64_t nb = k / GGML_TURBO4_QK;
+
+    for (int64_t block = 0; block < nb; ++block) {
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        for (int i = 0; i < GGML_TURBO4_QK; ++i) {
+            const uint8_t index = (x[block].qs[i / 2] >> ((i & 1) * 4)) & 0x0f;
+            y[block * GGML_TURBO4_QK + i] = ggml_turbo4_centroids[index] * norm;
         }
     }
 }
@@ -5603,6 +5724,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
+            } break;
+        case GGML_TYPE_TURBO4_0:
+            {
+                const block_turbo4_0 * q = (const block_turbo4_0 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].norm, i) || !validate_fp16(q[i].rnorm, i)) {
+                        return false;
+                    }
+                    if (q[i].rnorm != 0 || (q[i].norm & 0x8000u) != 0) {
+                        fprintf(stderr, "%s: found invalid TurboQuant4 norm/rnorm at block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_IQ1_S:
             {

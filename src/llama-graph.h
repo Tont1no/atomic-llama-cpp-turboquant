@@ -5,7 +5,9 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 #include "llama-cparams.h"
+#include "llama-pyramidkv-c1.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -320,16 +322,23 @@ public:
     const llama_cparams cparams;
 };
 
+struct llm_graph_pyramidkv_inputs {
+    int32_t il = -1;
+    ggml_tensor * read_idxs = nullptr;
+    ggml_tensor * write_idxs = nullptr;
+    ggml_tensor * hot_read_idxs = nullptr;
+    ggml_tensor * hot_write_idxs = nullptr;
+    ggml_tensor * k_positions = nullptr;
+    ggml_tensor * q_positions = nullptr;
+    ggml_tensor * valid_mask = nullptr;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx) :
-        hparams(hparams),
-        cparams(cparams),
-        mctx(mctx) {
-    }
+            const llama_kv_cache_context * mctx);
     ~llm_graph_input_attn_kv() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -340,6 +349,9 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    ggml_tensor * get_kq_mask(ggml_context * ctx, int32_t il) const;
+
+    std::vector<llm_graph_pyramidkv_inputs> pyramidkv_inputs;
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
@@ -808,6 +820,13 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // Observer side-graph presence is part of graph topology.
+    bool pyramidkv_observer = true;
+
+    // Native TQ4 key-centering anchor capture is a graph-topology change:
+    // the first graph copies post-RoPE K into the persistent anchor.
+    bool tq4_key_center_capture = false;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -880,6 +899,8 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            pyramidkv_observer == other.pyramidkv_observer &&
+            tq4_key_center_capture == other.tq4_key_center_capture &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -890,6 +911,19 @@ struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
     int il;
+};
+
+struct llm_graph_pyramidkv_score {
+    // C1 observer output is reduced [key, kv_head, 1, 1], never a full score matrix.
+    ggml_tensor * tensor = nullptr;
+    int il = -1;
+    std::size_t query_heads = 0;
+    std::size_t kv_heads = 0;
+    std::size_t query_tokens = 0;
+    std::size_t query_start = 0;
+    std::size_t key_tokens = 0;
+    std::size_t key_stride = 0;
+    std::size_t observation_window = 0;
 };
 
 class llm_graph_result {
@@ -927,7 +961,10 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    void add_pyramidkv_score(llm_graph_pyramidkv_score result);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
+    const std::vector<llm_graph_pyramidkv_score> & get_pyramidkv_scores() const { return pyramidkv_scores; }
 
     void set_params(const llm_graph_params & params);
 
@@ -948,6 +985,11 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+    std::vector<llm_graph_pyramidkv_score> pyramidkv_scores;
+    // Peak observer bytes charged for one layer (the allocator reuses the
+    // intermediates across layers) plus the retained per-layer score outputs.
+    size_t pyramidkv_observer_bytes = 0;
+    size_t pyramidkv_observer_output_bytes = 0;
 
     ggml_context_ptr ctx_compute;
 
@@ -989,6 +1031,8 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    const bool pyramidkv_observer_enabled;
+    const bool tq4_key_center_capture_enabled;
 
     const int64_t n_embd;
     const int64_t n_layer;
@@ -1165,6 +1209,19 @@ struct llm_graph_context {
     //
     // attention
     //
+
+    // Build the bounded PyramidKV C1 score side-graph. The tensors already
+    // use the attention layout [D, rows, heads, streams]. k_hot is optional;
+    // when present, cold and hot rows are cast to F32 and concatenated along
+    // the physical key-row dimension before the common score reduction.
+    void build_pyramidkv_observer(
+            ggml_tensor * q,
+            ggml_tensor * k_cold,
+            ggml_tensor * k_hot,
+            ggml_tensor * observer_mask,
+                  float   kq_scale,
+            ggml_tensor * sinks,
+                    int   il) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

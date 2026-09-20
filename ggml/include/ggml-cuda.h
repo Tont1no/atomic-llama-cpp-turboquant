@@ -27,6 +27,20 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// Dedicated KV buffer backed by a native CUDA memory pool. Returns nullptr when unsupported.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_kv_buffer_type(int device);
+
+struct ggml_backend_cuda_kv_pool_stats {
+    bool   supported;
+    int    physical_device;
+    size_t used_mem_current;
+    size_t reserved_mem_current;
+};
+
+GGML_BACKEND_API bool ggml_backend_cuda_kv_pool_supported(int device);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_pool_get_stats(int device, struct ggml_backend_cuda_kv_pool_stats * stats);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_pool_trim(int device, size_t min_reserved_bytes);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 

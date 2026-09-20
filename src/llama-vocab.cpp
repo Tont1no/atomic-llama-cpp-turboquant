@@ -535,6 +535,11 @@ struct llm_tokenizer_bpe : llm_tokenizer {
                     "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
                 };
                 break;
+            case LLAMA_VOCAB_PRE_TYPE_K2_HORIZON:
+                regex_exprs = {
+                    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}|\\p{M}|\\u200C|\\u200D)+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+                };
+                break;
             case LLAMA_VOCAB_PRE_TYPE_WHITESPACE:
                 // whitespace pre-tokenizer (jinaai/jina-embeddings-v2-base-zh)
                 regex_exprs = {
@@ -602,10 +607,22 @@ struct llm_tokenizer_bpe_session {
 
     virtual void tokenize(const std::string & text, std::vector<llama_token> & output) {
         int final_prev_index = -1;
-        const auto word_collection = unicode_regex_split(text, tokenizer.regex_exprs, tokenizer.byte_encode);
-
         symbols_final.clear();
         auto tok_pre = vocab.get_pre_type();
+
+        // The K2 tokenizer JSON applies NFC before its isolated regex split.
+        // This session is called only after tokenizer_st_partition(), so
+        // special-token fragments have already been removed and remain exact.
+        std::string normalized_text;
+        const std::string * split_text = &text;
+        if (tok_pre == LLAMA_VOCAB_PRE_TYPE_K2_HORIZON) {
+            normalized_text.reserve(text.size());
+            for (const uint32_t cpt : unicode_cpts_normalize_nfc(unicode_cpts_from_utf8(text))) {
+                normalized_text += unicode_cpt_to_utf8(cpt);
+            }
+            split_text = &normalized_text;
+        }
+        const auto word_collection = unicode_regex_split(*split_text, tokenizer.regex_exprs, tokenizer.byte_encode);
 
         for (const auto & word : word_collection) {
             work_queue = llm_bigram_bpe::queue();
@@ -2381,6 +2398,10 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
             } else if (
                 tokenizer_pre == "mellum2") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_MELLUM2;
+            } else if (
+                tokenizer_pre == "k2-horizon") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_K2_HORIZON;
+                clean_spaces = false;
             } else {
                 throw std::runtime_error(format("unknown pre-tokenizer type: '%s'", tokenizer_pre.c_str()));
             }

@@ -4,7 +4,9 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-pyramidkv-c1.h"
 
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -12,6 +14,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+class llama_kv_cache_context;
 
 //
 // llama_kv_cache
@@ -112,7 +115,10 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        ggml_backend_buffer_type_t kv_buffer_type = nullptr,
+        llama_pyramidkv_c1_config pyramidkv_c1 = {},
+        bool tq4_key_center = false);
 
     ~llama_kv_cache() = default;
 
@@ -158,13 +164,72 @@ public:
 
     bool get_has_shift() const;
 
+    // Optional dense Qwen2 K-anchor seam.  The anchor is a separate F32
+    // allocation and is populated by the graph owner after the first
+    // successful device synchronization.  It is intentionally fail-closed:
+    // state I/O, sequence remapping and shared caches are not part of this
+    // first format/version contract.
+    bool tq4_key_center_enabled() const;
+    bool tq4_key_center_capture() const;
+    bool tq4_key_center_ready() const;
+    ggml_tensor * get_tq4_key_anchor(int32_t il) const;
+    bool tq4_key_center_prepare(const llama_ubatch & ubatch, std::string & error);
+    void tq4_key_center_commit_capture();
+    void tq4_key_center_fail();
+
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    // Signed 128-value rotation used by the native TurboQuant-4 graph path.
+    // The matrices live in the same backend buffer as the cache tensors.
+    ggml_tensor * get_turbo_rotation() const;
+    ggml_tensor * get_turbo_rotation_inv() const;
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // C1 applies to this attention cache, including the attention part of a hybrid model.
+    bool pyramidkv_c1_supported(std::string & error) const;
+    const llama_pyramidkv_c1_config & pyramidkv_c1_get_config() const { return pyramidkv_c1_config; }
+    bool pyramidkv_c1_key_positions(
+            int32_t il,
+            uint32_t n_kv,
+            std::vector<std::vector<std::int64_t>> & positions,
+            std::vector<std::vector<std::size_t>> & logical_cells,
+            std::vector<std::vector<std::size_t>> & score_slots,
+            uint32_t & active_tokens,
+            std::string & error) const;
+    bool pyramidkv_c1_prepare_batch_rows(
+            const slot_info & sinfo,
+            const llama_ubatch & ubatch,
+            std::string & error);
+    bool pyramidkv_c1_compact(
+            llama_context * lctx,
+            const std::vector<llama_pyramidkv_c1_layer_selection> & selections,
+            std::string & error);
+    bool pyramidkv_c1_is_compacted() const { return pyramidkv_c1_compacted; }
+    // Call after each computed continuation ubatch; maintenance never reselects tokens.
+    bool pyramidkv_c1_should_maintain(uint32_t n_tokens, uint32_t n_ubatch);
+    bool pyramidkv_c1_keep_all(
+            std::vector<llama_pyramidkv_c1_layer_selection> & selections,
+            std::string & error) const;
+    bool pyramidkv_c1_hybrid_ready(int32_t il) const;
+
+    // A layout replacement keeps old graph tensors alive until the scheduler
+    // has been reset. Callers use this state to fail closed after an
+    // allocation failure instead of evaluating with stale compacted rows.
+    bool pyramidkv_c1_graph_reset_pending() const { return pyramidkv_c1_graph_reset_needed; }
+    void pyramidkv_c1_graph_reset_complete();
+    bool pyramidkv_c1_reset_failed(std::string & error) const;
+    void pyramidkv_c1_fail_transition(const std::string & error);
+    const llama_pyramidkv_c1_phase_timing & pyramidkv_c1_get_phase_timing() const {
+        return pyramidkv_c1_phase_timing_stats;
+    }
+    void pyramidkv_c1_reset_phase_timing() {
+        pyramidkv_c1_phase_timing_stats = {};
+    }
 
     //
     // graph_build API
@@ -173,12 +238,26 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+                        ggml_tensor * read_idxs = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+                        ggml_tensor * read_idxs = nullptr) const;
+    ggml_tensor * get_k_hot(ggml_context * ctx, int32_t il, uint32_t n_kv,
+                            ggml_tensor * read_idxs = nullptr) const;
+    ggml_tensor * get_v_hot(ggml_context * ctx, int32_t il, uint32_t n_kv,
+                            ggml_tensor * read_idxs = nullptr) const;
+    ggml_tensor * get_k_hybrid(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hybrid(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_hot_hybrid(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hot_hybrid(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo,
+                        ggml_tensor * physical_idxs = nullptr) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo,
+                        ggml_tensor * physical_idxs = nullptr) const;
+    ggml_tensor * cpy_k_hot(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_v_hot(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
 
     //
     // preparation API
@@ -230,6 +309,8 @@ public:
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
+    friend class llama_kv_cache_context;
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -243,7 +324,34 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // C1 hybrid lane: F16 hot rows are separate from the TQ4 cold rows.
+        ggml_tensor * k_hot = nullptr;
+        ggml_tensor * v_hot = nullptr;
+        std::vector<ggml_tensor *> k_hot_stream;
+        std::vector<ggml_tensor *> v_hot_stream;
     };
+
+    struct pyramidkv_c1_head_state {
+        uint32_t row_capacity = 0;
+        uint32_t next_row = 0;
+        std::vector<uint32_t> logical_to_physical;
+        std::vector<uint32_t> physical_to_logical;
+    };
+
+    struct pyramidkv_c1_layer_state {
+        bool compacted = false;
+        uint32_t kv_heads = 0;
+        uint32_t cold_row_capacity = 0;
+        uint32_t hot_row_capacity = 0;
+        uint32_t hot_recent = 0;
+        std::vector<pyramidkv_c1_head_state> cold_heads;
+        std::vector<pyramidkv_c1_head_state> hot_heads;
+    };
+
+    bool pyramidkv_c1_reinitialize(std::string & error);
+    void tq4_key_center_invalidate() noexcept;
+    bool tq4_key_center_cache_empty() const;
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -268,6 +376,10 @@ private:
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
+    // TurboQuant-4 signed forward/inverse rotations (128 x 128).
+    ggml_tensor * turbo_rotation     = nullptr;
+    ggml_tensor * turbo_rotation_inv = nullptr;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -276,6 +388,22 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // The K anchors are deliberately outside ctxs_bufs: C1 replaces that
+    // vector during compaction, while this allocation must keep its identity.
+    ggml_context_ptr tq4_key_anchor_ctx;
+    ggml_backend_buffer_ptr tq4_key_anchor_buf;
+    std::vector<ggml_tensor *> tq4_key_anchors;
+
+    // Retired C1 buffers stay alive until llama_context resets scheduler and
+    // graph results. This prevents old graph tensor handles becoming dangling.
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> pyramidkv_c1_retired_ctxs_bufs;
+
+    // A failed reinitialization is sticky until a later successful full clear.
+    // init_batch and context scheduling use it as a fail-closed gate.
+    bool pyramidkv_c1_graph_reset_needed = false;
+    bool pyramidkv_c1_reset_failed_flag = false;
+    std::string pyramidkv_c1_reset_error;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -293,6 +421,31 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    // Retaining this handle is required for C1 reallocation.  The normal
+    // constructor path still uses per-layer placement when it is null.
+    ggml_backend_buffer_type_t kv_buffer_type = nullptr;
+
+    // Immutable profile copied from llama_context_params.
+    llama_pyramidkv_c1_config pyramidkv_c1_config;
+    mutable llama_pyramidkv_c1_phase_timing pyramidkv_c1_phase_timing_stats;
+
+    bool tq4_key_center_enabled_flag = false;
+    bool tq4_key_center_valid_flag = false;
+    bool tq4_key_center_capture_pending = false;
+    bool tq4_key_center_failed_flag = false;
+
+    // The existing state format has no physical-row remap/version field.
+    // Once rows are compacted, state I/O is therefore explicitly rejected.
+    bool pyramidkv_c1_compacted = false;
+    bool pyramidkv_c1_hot_enabled = false;
+    // Keep the full configured cold context until the prompt is complete.
+    uint32_t pyramidkv_c1_initial_capacity = 0;
+    uint32_t pyramidkv_c1_tokens_since_compact = 0;
+
+    static constexpr uint32_t pyramidkv_c1_invalid_cell = std::numeric_limits<uint32_t>::max();
+
+    std::vector<pyramidkv_c1_layer_state> pyramidkv_c1_layers;
 
     std::vector<kv_layer> layers;
 
@@ -379,9 +532,27 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    ggml_tensor * get_turbo_rotation() const;
+    ggml_tensor * get_turbo_rotation_inv() const;
+    ggml_tensor * get_tq4_key_anchor(int32_t il) const { return kv == nullptr ? nullptr : kv->get_tq4_key_anchor(il); }
+    bool tq4_key_center_enabled() const { return kv != nullptr && kv->tq4_key_center_enabled(); }
+    bool tq4_key_center_capture() const { return kv != nullptr && kv->tq4_key_center_capture(); }
+    bool tq4_key_center_ready() const { return kv != nullptr && kv->tq4_key_center_ready(); }
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_hot(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hot(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_hybrid(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hybrid(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_positions(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_q_positions(ggml_context * ctx, int32_t il, size_t n) const;
+    ggml_tensor * get_pyramidkv_observer_mask(ggml_context * ctx, int32_t il, size_t n) const;
+    bool pyramidkv_hybrid_ready(int32_t il) const;
+    bool pyramidkv_c1_compacted() const { return kv->pyramidkv_c1_is_compacted(); }
+
+    ggml_tensor * get_kq_mask(ggml_context * ctx, ggml_tensor * base_mask, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -391,6 +562,8 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k_hot(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const;
+    ggml_tensor * cpy_v_hot(ggml_context * ctx, ggml_tensor * v_cur, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
@@ -447,4 +620,23 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    using pyramidkv_graph_inputs = llm_graph_pyramidkv_inputs;
+
+    mutable std::vector<pyramidkv_graph_inputs> pyramidkv_inputs;
+
+    pyramidkv_graph_inputs & pyramidkv_input(int32_t il) const;
+
+    ggml_tensor * pyramidkv_read_idxs(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * pyramidkv_write_idxs(ggml_context * ctx, int32_t il, std::size_t n) const;
+    ggml_tensor * pyramidkv_hot_read_idxs(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * pyramidkv_hot_write_idxs(ggml_context * ctx, int32_t il, std::size_t n) const;
+    ggml_tensor * pyramidkv_k_positions(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * pyramidkv_q_positions(ggml_context * ctx, int32_t il, size_t n) const;
+    void set_input_pyramidkv_indices(const llama_ubatch * ubatch) const;
+
+    friend class llm_graph_input_attn_kv;
+    // The hybrid memory input routes its attention half through the same
+    // PyramidKV input list when a reused graph changes memory context.
+    friend class llm_graph_input_mem_hybrid;
 };

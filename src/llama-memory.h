@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-pyramidkv-c1.h"
 
 #include <map>
 #include <memory>
@@ -19,12 +20,19 @@ struct llama_memory_params {
     ggml_type type_k;
     ggml_type type_v;
 
+    // caller-provided buffer type for the KV cache; nullptr keeps the default allocation path
+    ggml_backend_buffer_type_t kv_buffer_type;
+
     // use full-size SWA cache
     bool swa_full;
 
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Copied once from llama_context_params before cache allocation.
+    llama_pyramidkv_c1_config pyramidkv_c1;
+    bool tq4_key_center = false;
 };
 
 enum llama_memory_status {

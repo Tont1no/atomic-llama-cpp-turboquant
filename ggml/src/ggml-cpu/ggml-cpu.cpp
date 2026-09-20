@@ -429,6 +429,32 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // Turbo4 stores rotated KV coordinates. Generic decode/modify/re-encode
+    // arithmetic would apply the encoder's rotation a second time.
+    bool uses_turbo4 = op->type == GGML_TYPE_TURBO4_0;
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        uses_turbo4 |= op->src[i] && op->src[i]->type == GGML_TYPE_TURBO4_0;
+    }
+    if (uses_turbo4) {
+        switch (op->op) {
+            case GGML_OP_CPY:
+            case GGML_OP_DUP:
+            case GGML_OP_CONT:
+                return (src0->type == GGML_TYPE_TURBO4_0 &&
+                        (op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_F32)) ||
+                       (src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_TURBO4_0);
+            case GGML_OP_SET_ROWS:
+                return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_TURBO4_0;
+            case GGML_OP_GET_ROWS:
+                return src0->type == GGML_TYPE_TURBO4_0 && op->type == GGML_TYPE_F32;
+            case GGML_OP_FLASH_ATTN_EXT:
+                return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TURBO4_0 &&
+                       op->src[2]->type == GGML_TYPE_TURBO4_0;
+            default:
+                return false;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
