@@ -10401,6 +10401,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // is one n_ubatch tile of the measured 32K TQ4 prefill regression.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    // Draft-verification widths (NQ 2 and 4, MTP depth 1 and 3) go to the
+    // MMA-F16 kernel as well; D256 is the Qwen 27B head.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 1024, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 4096, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     // GQA bundling in the TQ4 vector kernel (NQ=1): group sizes 2, 4, 3 (tail
@@ -10888,6 +10893,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 32768, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // Qwen 27B embedded-MTP head (D256, 4 KV heads, GQA 8) over an
+    // uncompacted 128K draft cache: single draft step and the depth-3
+    // verification batch, TQ4 against the F16 draft cache.
+    for (const ggml_type kv_type : { GGML_TYPE_TURBO4_0, GGML_TYPE_F16 }) {
+        for (const int nb : { 1, 2, 4, 8, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, 131072, nb, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
+    // The same verification widths at D128 (Vibe geometry) for the vec/MMA
+    // batch threshold.
+    for (const int nb : { 2, 4, 8, 16 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 131072, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    }
+    for (const int kv : { 2048, 8192 }) {
+        for (const int nb : { 2, 4 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

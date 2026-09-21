@@ -21,22 +21,24 @@ static inline int ggml_cuda_fattn_quant_vec_max_batch() {
 }
 
 // Largest Q column count that keeps symmetric TURBO4_0 K/V on the direct
-// vector kernel. The vector kernel reads the quantized cache once per two Q
-// columns; the MMA path reads it once, writes and reads it again as F16 (about
-// nine cache passes), so it only wins for wider Q tiles such as prefill. The
-// F16 copy lives in the FLASH_ATTN_EXT allocation (see
-// ggml_cuda_flash_attn_ext_get_alloc_size). Override for A/B runs with
-// GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH=0..1024 (0 sends single-token decode
-// through the MMA path as well).
+// vector kernel. Only single-token decode stays there: the two-column vector
+// kernel runs at one block per SM for D256 and walks each key range serially,
+// so a draft-verification ubatch (2..16 rows) measured 3-10x slower than the
+// tensor-core kernel on a transient F16 copy of the layer's K/V at every
+// context length (128K, D256, 4 rows: 11.9 ms against 1.1 ms; 2K, D128,
+// 2 rows: 33 us against 23 us). The F16 copy lives in the FLASH_ATTN_EXT
+// allocation (see ggml_cuda_flash_attn_ext_get_alloc_size). Override for A/B
+// runs with GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH=0..1024 (0 sends single-token
+// decode through the MMA path as well).
 static inline int ggml_cuda_fattn_turbo4_vec_max_batch() {
     static const int value = []() {
         const char * text = std::getenv("GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH");
         if (!text || !*text) {
-            return 16;
+            return 1;
         }
         char * end = nullptr;
         const long parsed = std::strtol(text, &end, 10);
-        return end != text && *end == '\0' && parsed >= 0 && parsed <= 1024 ? int(parsed) : 16;
+        return end != text && *end == '\0' && parsed >= 0 && parsed <= 1024 ? int(parsed) : 1;
     }();
     return value;
 }
