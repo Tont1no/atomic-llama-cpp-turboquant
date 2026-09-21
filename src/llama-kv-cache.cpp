@@ -705,7 +705,9 @@ void llama_kv_cache::tq4_key_center_fail() {
 
 bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
     auto & aux = pyramidkv_c1_aux;
+    ggml_backend_t backend = aux.backend; // bound once by the context, survives rebuilds
     aux = pyramidkv_c1_aux_tensors{};
+    aux.backend = backend;
     if (!pyramidkv_c1_hot_enabled || kv_buffer_type == nullptr || pyramidkv_c1_layers.empty()) {
         return true; // host graph inputs remain the fallback
     }
@@ -5172,17 +5174,26 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     }
     // The previous graph has been synchronised by the decode loop, so the
     // device tensors are free; one upload per kind replaces per-layer inputs.
+    // Ordered on the KV backend's compute stream: inside one decode call
+    // the previous ubatch's graph can still be reading these tensors while
+    // this ubatch is staged (a plain tensor_set copies on another stream and
+    // raced with it - nondeterministic C1 prefills). The staging vectors are
+    // reusable on return: a pageable-host copy is staged before returning.
+    const auto upload = [&](ggml_tensor * tensor, const void * data, size_t bytes) {
+        if (aux.backend != nullptr) {
+            ggml_backend_tensor_set_async(aux.backend, tensor, data, 0, bytes);
+        } else {
+            ggml_backend_tensor_set(tensor, data, 0, bytes);
+        }
+    };
     if (aux_pos_dirty) {
-        ggml_backend_tensor_set(aux.k_positions, aux.stage_pos.data(), 0,
-            aux_pos_layers*aux.k_positions->nb[1]);
+        upload(aux.k_positions, aux.stage_pos.data(), aux_pos_layers*aux.k_positions->nb[1]);
     }
     if (aux_hot_dirty) {
-        ggml_backend_tensor_set(aux.hot_write_idxs, aux.stage_hot.data(), 0,
-            aux_hot_layers*aux.hot_write_idxs->nb[1]);
+        upload(aux.hot_write_idxs, aux.stage_hot.data(), aux_hot_layers*aux.hot_write_idxs->nb[1]);
     }
     if (aux_q_dirty) {
-        ggml_backend_tensor_set(aux.q_positions, aux.stage_q.data(), 0,
-            static_cast<size_t>(ubatch->n_tokens)*sizeof(int32_t));
+        upload(aux.q_positions, aux.stage_q.data(), static_cast<size_t>(ubatch->n_tokens)*sizeof(int32_t));
     }
 #if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
     ++phase.input_map_calls;

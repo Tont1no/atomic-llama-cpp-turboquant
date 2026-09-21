@@ -474,9 +474,17 @@ private:
         std::vector<int32_t> stage_pos;
         std::vector<int32_t> stage_hot;
         std::vector<int32_t> stage_q;
+        // Backend that computes on the KV device. The per-ubatch uploads go
+        // through its stream (tensor_set_async) so they are ordered after the
+        // previous ubatch's graph, which may still be reading these tensors:
+        // the buffer's synchronous tensor_set copies on a different stream.
+        ggml_backend_t backend = nullptr;
     };
     pyramidkv_c1_aux_tensors pyramidkv_c1_aux;
     bool pyramidkv_c1_aux_rebuild(std::string & error);
+public:
+    void pyramidkv_c1_bind_aux_backend(ggml_backend_t backend) { pyramidkv_c1_aux.backend = backend; }
+private:
 
     std::vector<kv_layer> layers;
 

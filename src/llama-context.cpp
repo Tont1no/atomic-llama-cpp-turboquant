@@ -680,6 +680,14 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (auto * c1_kv = llama_context_attention_cache(memory.get())) {
+            // The C1 aux uploads must be ordered on the KV device's stream.
+            const auto kv_device = cparams.kv_buffer_type != nullptr
+                ? ggml_backend_buft_get_device(cparams.kv_buffer_type)
+                : model.dev_layer(0);
+            c1_kv->pyramidkv_c1_bind_aux_backend(llama_backend_for_device(backends, kv_device));
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
