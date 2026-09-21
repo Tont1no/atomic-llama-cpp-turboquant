@@ -394,8 +394,10 @@ llama_context::llama_context(
             params.type_k == GGML_TYPE_TURBO4_0 &&
             params.type_v == GGML_TYPE_TURBO4_0 &&
             cparams.flash_attn && cparams.causal_attn &&
-            cparams.n_seq_max == 1 && cparams.n_rs_seq == 0 &&
-            params.n_rs_seq == 0 &&
+            cparams.n_seq_max == 1 &&
+            // Recurrent rollback planes (n_rs_seq) belong to the recurrent
+            // memory; the compacted attention cache handles a rejected draft
+            // tail as a partial seq_rm, so an embedded MTP drafter is allowed.
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
             cparams.kv_buffer_type != nullptr &&
             params.ctx_other == nullptr && cparams.ctx_other == nullptr &&
@@ -403,7 +405,7 @@ llama_context::llama_context(
         if (!supported) {
             throw std::runtime_error(
                 "PyramidKV C1 requires Qwen2 or Qwen35 attention, symmetric TQ4 K/V, causal FlashAttention, "
-                "one sequence, explicit KV buffer, no SWA/shared/speculative context, and embeddings=false");
+                "one sequence, explicit KV buffer, no SWA/shared context, and embeddings=false");
         }
     }
 
@@ -3228,10 +3230,11 @@ bool llama_context::extract_pyramidkv_scores(
     if (res == nullptr || (model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_QWEN35) ||
         !cparams.flash_attn || !cparams.causal_attn || cparams.n_seq_max != 1 ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
-        cparams.n_rs_seq != 0 || cparams.nextn_layer_offset != 0 ||
-        cparams.embeddings_nextn || cparams.embeddings_nextn_masked ||
+        cparams.nextn_layer_offset != 0 ||
         model.hparams.is_swa_any()) {
-        return fail("C1 requires Qwen2 or Qwen35 attention without SWA or speculative contexts");
+        // embeddings_nextn only adds the hidden-row output an embedded MTP
+        // drafter reads; the observer graph is unaffected by it.
+        return fail("C1 requires Qwen2 or Qwen35 attention without SWA or a shared context");
     }
     // Qwen35 text broadcasts each position across its four M-RoPE axes.
     // Image positions and unsupported memory layouts remain rejected.

@@ -2339,14 +2339,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
              params.type_k != GGML_TYPE_TURBO4_0 ||
              params.type_v != GGML_TYPE_TURBO4_0 ||
              !cparams.flash_attn || !cparams.causal_attn ||
-             cparams.n_seq_max != 1 || cparams.n_rs_seq != 0 ||
+             cparams.n_seq_max != 1 ||
              cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
              params.kv_buffer_type == nullptr || params.mem_other != nullptr ||
              hparams.is_swa_any() || cparams.embeddings)) {
+        // n_rs_seq (recurrent rollback planes for an embedded MTP drafter) is
+        // a property of the recurrent memory; the compacted attention cache
+        // takes a rejected draft tail as a partial seq_rm.
         throw std::runtime_error(
             "PyramidKV C1 memory requires dense Qwen2 or target Qwen35-27B hybrid geometry, "
             "symmetric TQ4 K/V, causal FlashAttention, "
-            "one sequence, explicit KV buffer, no SWA/shared/speculative context, and embeddings=false");
+            "one sequence, explicit KV buffer, no SWA/shared context, and embeddings=false");
     }
 
     if (params.kv_buffer_type != nullptr) {
