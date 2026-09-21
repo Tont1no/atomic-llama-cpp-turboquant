@@ -18,6 +18,7 @@
 
 #include "../ggml/src/ggml-turbo4.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -629,6 +630,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // A paged C1 graph (per-sequence lists, no logical mask) and a plain
+    // graph (arena attention with the logical mask) are different graphs.
+    const bool built_paged = std::any_of(pyramidkv_inputs.begin(), pyramidkv_inputs.end(),
+        [](const llm_graph_pyramidkv_inputs & in) { return in.k_list != nullptr; });
+    res &= built_paged == next_mctx->pyramidkv_paged_ready();
 
     return res;
 }
@@ -3239,7 +3246,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         // The compacted hybrid operator applies causal and validity checks
         // from original q/k positions. Building the old logical mask here
         // would allocate against the full logical context again.
-        inp->self_kq_mask = mctx_cur->pyramidkv_c1_compacted()
+        inp->self_kq_mask = mctx_cur->pyramidkv_c1_compacted() || mctx_cur->pyramidkv_paged_ready()
             ? nullptr : build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams, sched);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
@@ -3369,7 +3376,10 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const bool use_pyramidkv_c1 = cparams.pyramidkv_c1.enabled;
-    const bool use_pyramidkv_hybrid = use_pyramidkv_c1 &&
+    // Paged C1: every sequence of this ubatch is selected, the arena keeps
+    // receiving every token and attention walks the per-sequence lists.
+    const bool use_pyramidkv_paged = use_pyramidkv_c1 && mctx_cur->pyramidkv_paged_ready();
+    const bool use_pyramidkv_hybrid = use_pyramidkv_c1 && !use_pyramidkv_paged &&
         mctx_cur->pyramidkv_hybrid_ready(il);
 
     // Before the first observation the bounded cold cache is populated by
@@ -3387,7 +3397,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v_hot(ctx0, v_hot_cur, il));
     }
 
-    if (use_pyramidkv_hybrid) {
+    if (use_pyramidkv_hybrid || use_pyramidkv_paged) {
         const bool qwen35_c1_geometry =
             arch == LLM_ARCH_QWEN35 && hparams.n_layer() == 64 &&
             il >= 0 && static_cast<uint32_t>(il) < hparams.n_layer() && !hparams.is_recr(il) &&
@@ -3406,11 +3416,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_pyramidkv_hybrid
-        ? mctx_cur->get_k_hybrid(ctx0, il) : mctx_cur->get_k(ctx0, il);
+        ? mctx_cur->get_k_hybrid(ctx0, il) : use_pyramidkv_paged
+        ? mctx_cur->get_k_paged(ctx0, il) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_pyramidkv_hybrid
-        ? mctx_cur->get_v_hybrid(ctx0, il) : mctx_cur->get_v(ctx0, il);
+        ? mctx_cur->get_v_hybrid(ctx0, il) : use_pyramidkv_paged
+        ? mctx_cur->get_v_paged(ctx0, il) : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * kq_mask = use_pyramidkv_hybrid
+    ggml_tensor * kq_mask = use_pyramidkv_hybrid || use_pyramidkv_paged
         ? nullptr : inp->get_kq_mask(ctx0, il);
 
     if (turbo4_k && !turbo4_q_rotated) {
@@ -3423,7 +3435,21 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     ggml_tensor * cur = nullptr;
-    if (use_pyramidkv_hybrid) {
+    if (use_pyramidkv_paged) {
+        // [D, tokens, QHeads, 1] queries against the arena view and the hot
+        // ring; lists and query metadata are views of the device-resident
+        // aux tensors (staged per ubatch in set_input_pyramidkv_indices).
+        ggml_tensor * q_paged = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        ggml_tensor * k_hot = mctx_cur->get_k_hot_ring(ctx0, il);
+        ggml_tensor * v_hot = mctx_cur->get_v_hot_ring(ctx0, il);
+        cur = ggml_flash_attn_ext_hybrid_paged(ctx0, q_paged, k, v, k_hot, v_hot,
+            mctx_cur->get_q_meta(ctx0, il, ubatch.n_tokens),
+            mctx_cur->get_k_list(ctx0, il), mctx_cur->get_k_list_len(ctx0, il), kq_scale,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else if (use_pyramidkv_hybrid) {
         // The hybrid operator consumes [D, rows, KVHeads, seq].  The Q path
         // uses the same signed-WHT basis as the already encoded TQ4 cold rows;
         // hot rows were rotated before their F16 cache writes and are read

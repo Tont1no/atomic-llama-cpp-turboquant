@@ -426,6 +426,7 @@ llama_kv_cache::llama_kv_cache(
                 head.physical_to_logical.assign(state.hot_row_capacity, pyramidkv_c1_invalid_cell);
             }
         }
+        pyramidkv_c1_paged_reset();
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -727,6 +728,17 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
         return false;
     }
 
+    // Paged lists: one (row_code, position) pair per entry, per head and
+    // per sequence slot of the ubatch (at most n_seq_max), per layer.
+    const bool paged = pyramidkv_c1_config.paged;
+    const uint64_t list_capacity = paged ? std::max<uint64_t>(1, pyramidkv_c1_config.list_capacity) : 0;
+    const uint64_t list_stride = paged ? 2ull*list_capacity*heads_max*n_seq_max : 0;
+    const uint64_t len_stride  = paged ? static_cast<uint64_t>(heads_max)*n_seq_max : 0;
+    if (list_stride > (1ull << 31) || len_stride > (1ull << 31)) {
+        error = "PyramidKV C1 paged list geometry exceeds the I32 index range";
+        return false;
+    }
+
     ggml_init_params params = {
         /*.mem_size   =*/ 8*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -743,6 +755,17 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
     ggml_format_name(k_positions, "pyramidkv_c1_aux_k_positions");
     ggml_format_name(hot_write,   "pyramidkv_c1_aux_hot_write_idxs");
     ggml_format_name(q_positions, "pyramidkv_c1_aux_q_positions");
+    ggml_tensor * k_list = nullptr;
+    ggml_tensor * k_list_len = nullptr;
+    ggml_tensor * q_meta = nullptr;
+    if (paged) {
+        k_list     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, list_stride, n_layers);
+        k_list_len = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, len_stride, n_layers);
+        q_meta     = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 2*n_ubatch);
+        ggml_format_name(k_list,     "pyramidkv_c1_aux_k_list");
+        ggml_format_name(k_list_len, "pyramidkv_c1_aux_k_list_len");
+        ggml_format_name(q_meta,     "pyramidkv_c1_aux_q_meta");
+    }
     ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), kv_buffer_type) };
     if (!buf) {
         error = "PyramidKV C1 device input buffer allocation failed";
@@ -761,7 +784,224 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
     aux.stage_pos.assign(pos_stride*n_layers, -1);
     aux.stage_hot.assign(hot_stride*n_layers, 0);
     aux.stage_q.assign(n_ubatch, 0);
+    if (paged) {
+        aux.k_list = k_list;
+        aux.k_list_len = k_list_len;
+        aux.q_meta = q_meta;
+        aux.list_stride = static_cast<uint32_t>(list_stride);
+        aux.len_stride  = static_cast<uint32_t>(len_stride);
+        aux.heads_max   = static_cast<uint32_t>(heads_max);
+        aux.stage_list.assign(list_stride*n_layers, -1);
+        aux.stage_len.assign(len_stride*n_layers, 0);
+        aux.stage_meta.assign(2*n_ubatch, -1);
+    }
     return true;
+}
+
+//
+// Paged C1
+//
+
+void llama_kv_cache::pyramidkv_c1_paged_reset() {
+    pyramidkv_c1_paged_compacted.assign(n_seq_max, 0);
+    pyramidkv_c1_paged_lists.assign(pyramidkv_c1_layers.size(), {});
+    for (size_t layer_index = 0; layer_index < pyramidkv_c1_layers.size(); ++layer_index) {
+        const auto & state = pyramidkv_c1_layers[layer_index];
+        pyramidkv_c1_paged_lists[layer_index].assign(state.kv_heads,
+            std::vector<std::vector<pyramidkv_c1_list_entry>>(n_seq_max));
+    }
+}
+
+bool llama_kv_cache::pyramidkv_c1_paged_seq_compacted(llama_seq_id seq_id) const {
+    return pyramidkv_c1_paged() && seq_id >= 0 &&
+        static_cast<size_t>(seq_id) < pyramidkv_c1_paged_compacted.size() &&
+        pyramidkv_c1_paged_compacted[seq_id] != 0;
+}
+
+bool llama_kv_cache::pyramidkv_c1_paged_ubatch_ready(const llama_ubatch & ubatch) const {
+    if (!pyramidkv_c1_paged()) {
+        return false;
+    }
+    if (pyramidkv_c1_reserve_paged) {
+        return true;
+    }
+    if (ubatch.n_seqs_unq == 0 || ubatch.seq_id_unq == nullptr) {
+        return false;
+    }
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        if (!pyramidkv_c1_paged_seq_compacted(ubatch.seq_id_unq[s])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t llama_kv_cache::pyramidkv_c1_paged_list_size(llama_seq_id seq_id) const {
+    size_t longest = 0;
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= n_seq_max) {
+        return 0;
+    }
+    for (const auto & layer : pyramidkv_c1_paged_lists) {
+        for (const auto & head : layer) {
+            longest = std::max(longest, head[seq_id].size());
+        }
+    }
+    return longest;
+}
+
+void llama_kv_cache::pyramidkv_c1_paged_trim(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= n_seq_max) {
+        return;
+    }
+    for (auto & layer : pyramidkv_c1_paged_lists) {
+        for (auto & head : layer) {
+            auto & list = head[seq_id];
+            list.erase(std::remove_if(list.begin(), list.end(),
+                [&](const pyramidkv_c1_list_entry & e) { return e.pos >= p0 && e.pos < p1; }), list.end());
+        }
+    }
+}
+
+bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
+        llama_seq_id seq_id,
+        const std::vector<llama_pyramidkv_c1_layer_selection> & selections,
+        std::string & error) {
+    if (!pyramidkv_c1_paged()) {
+        error = "PyramidKV C1 paged selection on a non-paged cache";
+        return false;
+    }
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= n_seq_max) {
+        error = "PyramidKV C1 paged selection names an unknown sequence";
+        return false;
+    }
+    if (selections.empty()) {
+        error = "PyramidKV C1 received no layer selections";
+        return false;
+    }
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    std::vector<const llama_pyramidkv_c1_layer_selection *> by_layer(layers.size(), nullptr);
+    for (const auto & selection : selections) {
+        const auto map_it = map_layer_ids.find(selection.il);
+        if (map_it == map_layer_ids.end() || static_cast<size_t>(map_it->second) >= layers.size() ||
+                by_layer[map_it->second] != nullptr) {
+            error = "PyramidKV C1 selection was built for a different cache or layer set";
+            return false;
+        }
+        by_layer[map_it->second] = &selection;
+    }
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        if (by_layer[layer_index] == nullptr) {
+            error = "PyramidKV C1 has no score selection for a cached layer";
+            return false;
+        }
+        if (by_layer[layer_index]->heads.size() != pyramidkv_c1_layers[layer_index].kv_heads) {
+            error = "PyramidKV C1 selection does not match layer KV-head geometry";
+            return false;
+        }
+    }
+
+    // Per-head selections differ, so their union over 16 layers x 4 heads
+    // covers nearly the whole prompt and would free nothing. Memory only
+    // comes back when a cell is dropped for every layer and head: rank the
+    // cells by how many (layer, head) selections keep them (ties: newer
+    // first), keep max_capacity_prompt of them, and cut every head's list to
+    // that set. Protected recent rows are in every selection and stay.
+    std::vector<uint32_t> votes(cells.size(), 0);
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        const auto & selection = *by_layer[layer_index];
+        for (size_t head = 0; head < selection.heads.size(); ++head) {
+            const auto & selected = selection.heads[head];
+            if (selected.keep_cells.size() != selected.keep_positions.size()) {
+                error = "PyramidKV C1 selection has an inconsistent head list";
+                return false;
+            }
+            for (size_t i = 0; i < selected.keep_cells.size(); ++i) {
+                const size_t logical = selected.keep_cells[i];
+                if (logical >= cells.size() || cells.is_empty(static_cast<uint32_t>(logical)) ||
+                        !cells.seq_has(static_cast<uint32_t>(logical), seq_id) ||
+                        cells.pos_get(static_cast<uint32_t>(logical)) != selected.keep_positions[i]) {
+                    error = "PyramidKV C1 selection does not preserve logical positions";
+                    return false;
+                }
+                ++votes[logical];
+            }
+        }
+    }
+    std::vector<uint32_t> candidates;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (votes[i] != 0) {
+            candidates.push_back(i);
+        }
+    }
+    const size_t union_cap = std::max<size_t>(1, pyramidkv_c1_config.max_capacity_prompt) *
+        std::max<size_t>(1, pyramidkv_c1_config.paged_union_factor);
+    if (candidates.size() > union_cap) {
+        std::nth_element(candidates.begin(), candidates.begin() + union_cap, candidates.end(),
+            [&](uint32_t a, uint32_t b) {
+                if (votes[a] != votes[b]) {
+                    return votes[a] > votes[b];
+                }
+                return cells.pos_get(a) > cells.pos_get(b);
+            });
+        candidates.resize(union_cap);
+    }
+    std::vector<uint8_t> kept(cells.size(), 0);
+    for (const uint32_t cell : candidates) {
+        kept[cell] = 1;
+    }
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        const auto & selection = *by_layer[layer_index];
+        for (size_t head = 0; head < selection.heads.size(); ++head) {
+            const auto & selected = selection.heads[head];
+            auto & list = pyramidkv_c1_paged_lists[layer_index][head][seq_id];
+            list.clear();
+            list.reserve(selected.keep_cells.size());
+            for (size_t i = 0; i < selected.keep_cells.size(); ++i) {
+                const size_t logical = selected.keep_cells[i];
+                if (!kept[logical]) {
+                    continue;
+                }
+                list.push_back({ static_cast<uint32_t>(logical), static_cast<int32_t>(selected.keep_positions[i]) });
+            }
+            if (list.empty() || list.size() > pyramidkv_c1_config.list_capacity) {
+                error = "PyramidKV C1 selection left an empty or oversized head list";
+                return false;
+            }
+        }
+    }
+    uint32_t freed = 0;
+    auto & head_pos = v_heads[seq_to_stream[seq_id]];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (kept[i] || cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.seq_count(i) != 1) {
+            continue;
+        }
+        cells.rm(i);
+        ++freed;
+        head_pos = std::min(head_pos, i);
+    }
+    pyramidkv_c1_paged_compacted[seq_id] = 1;
+    LLAMA_LOG_INFO("%s: PyramidKV paged selection seq=%d kept_cells=%zu freed_cells=%u longest_list=%zu\n",
+        __func__, (int) seq_id, static_cast<size_t>(std::count(kept.begin(), kept.end(), 1)), freed,
+        pyramidkv_c1_paged_list_size(seq_id));
+    return true;
+}
+
+ggml_tensor * llama_kv_cache::get_k_paged(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const ggml_tensor * storage = layers[ikv].k;
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const int64_t d = storage->ne[0] / state.kv_heads;
+    return ggml_view_4d(ctx, const_cast<ggml_tensor *>(storage), d, storage->ne[1], state.kv_heads, 1,
+        storage->nb[1], ggml_row_size(storage->type, d), storage->nb[2], 0);
+}
+
+ggml_tensor * llama_kv_cache::get_v_paged(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const ggml_tensor * storage = layers[ikv].v;
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const int64_t d = storage->ne[0] / state.kv_heads;
+    return ggml_view_4d(ctx, const_cast<ggml_tensor *>(storage), d, storage->ne[1], state.kv_heads, 1,
+        storage->nb[1], ggml_row_size(storage->type, d), storage->nb[2], 0);
 }
 
 bool llama_kv_cache::pyramidkv_c1_reinitialize(std::string & error) {
@@ -1062,6 +1302,7 @@ void llama_kv_cache::clear(bool data) {
 
     if (pyramidkv_c1_hot_enabled) {
         pyramidkv_c1_tokens_since_compact = 0;
+        pyramidkv_c1_paged_reset();
         for (auto & state : pyramidkv_c1_layers) {
             state.compacted = false;
             state.cold_row_capacity = 0;
@@ -1124,6 +1365,34 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         LLAMA_LOG_ERROR("%s: rejecting seq_rm while PyramidKV C1 reset is failed: %s\n",
                 __func__, pyramidkv_c1_reset_error.c_str());
         return false;
+    }
+
+    // Paged C1: the arena keeps its layout; only this sequence's lists are
+    // trimmed (a full removal also clears its selection state).
+    if (pyramidkv_c1_paged()) {
+        const llama_pos rm_p0 = p0;
+        const llama_pos rm_p1 = p1;
+        const auto trim_seq = [&](llama_seq_id s) {
+            pyramidkv_c1_paged_trim(s, rm_p0, rm_p1);
+            bool any = false;
+            for (const auto & layer : pyramidkv_c1_paged_lists) {
+                for (const auto & head : layer) {
+                    if (s >= 0 && static_cast<size_t>(s) < head.size() && !head[s].empty()) {
+                        any = true;
+                    }
+                }
+            }
+            if (!any && s >= 0 && static_cast<size_t>(s) < pyramidkv_c1_paged_compacted.size()) {
+                pyramidkv_c1_paged_compacted[s] = 0;
+            }
+        };
+        if (seq_id >= 0) {
+            trim_seq(seq_id);
+        } else {
+            for (uint32_t s = 0; s < n_seq_max; ++s) {
+                trim_seq(static_cast<llama_seq_id>(s));
+            }
+        }
     }
 
     // A complete removal must restore the constructor layout before the next
@@ -2106,7 +2375,7 @@ bool llama_kv_cache::pyramidkv_c1_supported(std::string & error) const {
         error = "PyramidKV C1 does not support a shared KV cache";
         return false;
     }
-    if (n_stream != 1 || n_seq_max != 1) {
+    if (n_stream != 1 || (n_seq_max != 1 && !pyramidkv_c1_config.paged)) {
         error = "PyramidKV C1 requires one sequence and one cache stream";
         return false;
     }
@@ -2248,10 +2517,12 @@ bool llama_kv_cache::pyramidkv_c1_key_positions(
         std::vector<std::vector<std::size_t>> & logical_cells,
         std::vector<std::vector<std::size_t>> & score_slots,
         uint32_t & active_tokens,
-        std::string & error) const {
+        std::string & error,
+        llama_seq_id seq_id) const {
     if (!pyramidkv_c1_supported(error)) {
         return false;
     }
+    const llama_seq_id want_seq = seq_id < 0 ? 0 : seq_id;
 
     const auto layer_it = map_layer_ids.find(il);
     if (layer_it == map_layer_ids.end() ||
@@ -2286,7 +2557,7 @@ bool llama_kv_cache::pyramidkv_c1_key_positions(
             }
         }
         for (uint32_t i = 0; i < active_tokens; ++i) {
-            if (cells.is_empty(i) || cells.seq_count(i) != 1 || !cells.seq_has(i, 0)) {
+            if (cells.is_empty(i) || cells.seq_count(i) != 1 || !cells.seq_has(i, want_seq)) {
                 continue;
             }
             uint32_t slot = i;
@@ -2431,6 +2702,29 @@ bool llama_kv_cache::pyramidkv_c1_prepare_batch_rows(
                 hot.physical_to_logical[physical] = logical;
                 hot.logical_to_physical[logical] = physical;
                 hot.next_row = (physical + 1) % static_cast<uint32_t>(hot.physical_to_logical.size());
+            }
+            if (pyramidkv_c1_paged() && ubatch.seq_id != nullptr && ubatch.pos != nullptr) {
+                // Paged: a token of a selected sequence joins that sequence's
+                // list for this layer/head (its arena row is written by the
+                // same ubatch). The list must stay position-ordered.
+                auto & lists = pyramidkv_c1_paged_lists[&state - pyramidkv_c1_layers.data()][head];
+                for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+                    const llama_seq_id seq = ubatch.n_seq_id[token] > 0 ? ubatch.seq_id[token][0] : -1;
+                    if (!pyramidkv_c1_paged_seq_compacted(seq)) {
+                        continue;
+                    }
+                    auto & list = lists[seq];
+                    const int32_t pos = static_cast<int32_t>(ubatch.pos[token]);
+                    if (!list.empty() && list.back().pos >= pos) {
+                        error = "PyramidKV C1 paged append is not position-ordered (rollback missed?)";
+                        return false;
+                    }
+                    if (list.size() >= pyramidkv_c1_config.list_capacity) {
+                        error = "PyramidKV C1 paged list_capacity exhausted for a sequence";
+                        return false;
+                    }
+                    list.push_back({ sinfo.idxs[0][token], pos });
+                }
             }
             if (state.compacted) {
                 auto & cold = state.cold_heads[head];
@@ -3239,6 +3533,28 @@ ggml_tensor * llama_kv_cache::get_v_hybrid(ggml_context * ctx, int32_t il) const
     const ggml_tensor * storage = layers[ikv].v;
     return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
         state.cold_row_capacity, state.kv_heads, storage->ne[2]);
+}
+
+ggml_tensor * llama_kv_cache::get_k_hot_ring(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const ggml_tensor * storage = layers[ikv].k_hot;
+    if (storage == nullptr || state.kv_heads == 0) {
+        throw std::runtime_error("PyramidKV C1 hot K ring is not allocated");
+    }
+    return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
+        state.hot_row_capacity, state.kv_heads, storage->ne[2]);
+}
+
+ggml_tensor * llama_kv_cache::get_v_hot_ring(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    const auto & state = pyramidkv_c1_layers[ikv];
+    const ggml_tensor * storage = layers[ikv].v_hot;
+    if (storage == nullptr || state.kv_heads == 0) {
+        throw std::runtime_error("PyramidKV C1 hot V ring is not allocated");
+    }
+    return ggml_reshape_4d(ctx, const_cast<ggml_tensor *>(storage), storage->ne[0],
+        state.hot_row_capacity, state.kv_heads, storage->ne[2]);
 }
 
 ggml_tensor * llama_kv_cache::get_k_hot_hybrid(ggml_context * ctx, int32_t il) const {
@@ -4968,7 +5284,8 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
         return t != nullptr && root != nullptr && t->view_src == root;
     };
     bool aux_pos_dirty = false, aux_hot_dirty = false, aux_q_dirty = false;
-    size_t aux_pos_layers = 0, aux_hot_layers = 0;
+    bool aux_list_dirty = false, aux_meta_dirty = false;
+    size_t aux_pos_layers = 0, aux_hot_layers = 0, aux_list_layers = 0;
     for (auto & input : pyramidkv_inputs) {
         const auto map_it = kv->map_layer_ids.find(input.il);
         if (map_it == kv->map_layer_ids.end() ||
@@ -5128,6 +5445,49 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
                 }
             }
         }
+        if (input.k_list != nullptr && kv->pyramidkv_c1_paged()) {
+            // Paged lists for the sequence slots of this ubatch: entries carry
+            // the arena cell, or the hot ring row while the head's hot map
+            // holds the cell (the arena copy stays hidden until eviction).
+            const auto & lists = kv->pyramidkv_c1_paged_lists[slot];
+            const uint32_t cap = kv->pyramidkv_c1_paged_list_capacity();
+            int32_t * list_data = aux.stage_list.data() + static_cast<size_t>(slot)*aux.list_stride;
+            int32_t * len_data  = aux.stage_len.data()  + static_cast<size_t>(slot)*aux.len_stride;
+            std::fill(len_data, len_data + aux.len_stride, 0);
+            for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+                const llama_seq_id seq = ubatch->seq_id_unq[s];
+                for (uint32_t head = 0; head < heads; ++head) {
+                    const auto & list = lists[head][seq];
+                    const auto & hot = state.hot_heads[head];
+                    int32_t * out = list_data + 2ull*cap*(head + static_cast<size_t>(heads)*s);
+                    const size_t n = std::min<size_t>(list.size(), cap);
+                    for (size_t i = 0; i < n; ++i) {
+                        const uint32_t cell = list[i].cell;
+                        int32_t code = static_cast<int32_t>(cell);
+                        if (cell < hot.logical_to_physical.size()) {
+                            const uint32_t phys = hot.logical_to_physical[cell];
+                            if (phys != llama_kv_cache::pyramidkv_c1_invalid_cell && phys < hot.row_capacity) {
+                                // head-local ring row: the operator adds the head stride itself
+                                code = static_cast<int32_t>(0x40000000u | phys);
+                            }
+                        }
+                        out[2*i + 0] = code;
+                        out[2*i + 1] = list[i].pos;
+                    }
+                    len_data[head + heads*s] = static_cast<int32_t>(n);
+                }
+            }
+            aux_list_dirty = true;
+            aux_list_layers = std::max(aux_list_layers, slot + 1);
+        }
+        if (input.q_meta != nullptr && kv->pyramidkv_c1_paged()) {
+            for (uint32_t token = 0; token < ubatch->n_tokens; ++token) {
+                const llama_seq_id seq = ubatch->n_seq_id[token] > 0 ? ubatch->seq_id[token][0] : -1;
+                aux.stage_meta[2*token + 0] = static_cast<int32_t>(ubatch->pos[token]);
+                aux.stage_meta[2*token + 1] = seq >= 0 ? ubatch->seq_idx[seq] : -1;
+            }
+            aux_meta_dirty = true;
+        }
         if (input.q_positions != nullptr) {
 #if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
             phase.input_map_position_elems += ubatch->n_tokens;
@@ -5194,6 +5554,13 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     }
     if (aux_q_dirty) {
         upload(aux.q_positions, aux.stage_q.data(), static_cast<size_t>(ubatch->n_tokens)*sizeof(int32_t));
+    }
+    if (aux_list_dirty) {
+        upload(aux.k_list, aux.stage_list.data(), aux_list_layers*aux.k_list->nb[1]);
+        upload(aux.k_list_len, aux.stage_len.data(), aux_list_layers*aux.k_list_len->nb[1]);
+    }
+    if (aux_meta_dirty) {
+        upload(aux.q_meta, aux.stage_meta.data(), 2ull*ubatch->n_tokens*sizeof(int32_t));
     }
 #if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
     ++phase.input_map_calls;
@@ -5323,6 +5690,73 @@ ggml_tensor * llama_kv_cache_context::get_q_positions(ggml_context * ctx, int32_
 
 bool llama_kv_cache_context::pyramidkv_hybrid_ready(int32_t il) const {
     return kv->pyramidkv_c1_hybrid_ready(il);
+}
+
+bool llama_kv_cache_context::pyramidkv_paged_ready() const {
+    if (!kv->pyramidkv_c1_paged()) {
+        return false;
+    }
+    if (kv->pyramidkv_c1_reserve_paged_active()) {
+        return true;
+    }
+    return i_cur < ubatches.size() && kv->pyramidkv_c1_paged_ubatch_ready(ubatches[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_paged(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_paged(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_paged(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_paged(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_list(ggml_context * ctx, int32_t il) const {
+    auto & input = pyramidkv_input(il);
+    const auto & aux = kv->pyramidkv_c1_aux;
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (aux.k_list == nullptr || map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 paged list tensor is not allocated");
+    }
+    if (input.k_list == nullptr) {
+        const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+        const size_t slot = static_cast<size_t>(map_it->second);
+        const uint32_t cap = kv->pyramidkv_c1_paged_list_capacity();
+        // [2, cap, heads, n_seq_max], contiguous within the layer's region
+        input.k_list = ggml_view_4d(ctx, aux.k_list, 2, cap, state.kv_heads, kv->n_seq_max,
+            2*sizeof(int32_t), 2ull*cap*sizeof(int32_t), 2ull*cap*state.kv_heads*sizeof(int32_t),
+            slot*aux.k_list->nb[1]);
+    }
+    return input.k_list;
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_list_len(ggml_context * ctx, int32_t il) const {
+    auto & input = pyramidkv_input(il);
+    const auto & aux = kv->pyramidkv_c1_aux;
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (aux.k_list_len == nullptr || map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV C1 paged list length tensor is not allocated");
+    }
+    if (input.k_list_len == nullptr) {
+        const auto & state = kv->pyramidkv_c1_layers[map_it->second];
+        const size_t slot = static_cast<size_t>(map_it->second);
+        input.k_list_len = ggml_view_2d(ctx, aux.k_list_len, state.kv_heads, kv->n_seq_max,
+            state.kv_heads*sizeof(int32_t), slot*aux.k_list_len->nb[1]);
+    }
+    return input.k_list_len;
+}
+
+ggml_tensor * llama_kv_cache_context::get_q_meta(ggml_context * ctx, int32_t il, size_t n) const {
+    auto & input = pyramidkv_input(il);
+    const auto & aux = kv->pyramidkv_c1_aux;
+    if (aux.q_meta == nullptr || n > aux.n_ubatch) {
+        throw std::runtime_error("PyramidKV C1 paged query metadata tensor is not allocated for this ubatch");
+    }
+    if (input.q_meta == nullptr) {
+        input.q_meta = ggml_view_2d(ctx, aux.q_meta, 2, n, 2*sizeof(int32_t), 0);
+    } else if (static_cast<size_t>(input.q_meta->ne[1]) != n) {
+        throw std::runtime_error("PyramidKV C1 query metadata shape changed while reusing a graph");
+    }
+    return input.q_meta;
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

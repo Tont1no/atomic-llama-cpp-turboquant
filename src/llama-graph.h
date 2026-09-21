@@ -331,6 +331,10 @@ struct llm_graph_pyramidkv_inputs {
     ggml_tensor * k_positions = nullptr;
     ggml_tensor * q_positions = nullptr;
     ggml_tensor * valid_mask = nullptr;
+    // paged C1 (views of the device-resident aux tensors)
+    ggml_tensor * k_list = nullptr;
+    ggml_tensor * k_list_len = nullptr;
+    ggml_tensor * q_meta = nullptr;
 };
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {

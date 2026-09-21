@@ -372,6 +372,20 @@ extern "C" {
         uint32_t observer_chunk;
         uint64_t transition_max_bytes;
         uint32_t hot_capacity;
+        // Paged C1: the TQ4 arena keeps every sequence, the once-prefill
+        // selection is bookkeeping (per layer/head row lists), decode of a
+        // selected sequence runs ggml_flash_attn_ext_hybrid_paged, and
+        // several sequences share the cache (n_seq_max > 1). list_capacity
+        // bounds one sequence's per-head list (kept prompt rows plus every
+        // generated token); a longer answer fails the request.
+        bool     paged;
+        uint32_t list_capacity;
+        // Cells a selected prompt keeps in total (union over layers and KV
+        // heads), as a multiple of max_capacity_prompt; the rest goes back
+        // to the arena. Per-head lists differ, so their union is much wider
+        // than one list; 4 keeps the per-head selections intact on prompts
+        // up to 4x the capacity and still frees a 256K prompt to ~4K cells.
+        uint32_t paged_union_factor;
     };
 
     struct llama_context_params {

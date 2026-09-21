@@ -23,6 +23,7 @@ constexpr std::size_t kMaxObserverChunk = 512;
 constexpr std::size_t kMinTransitionBytes = 64u*1024u*1024u;
 constexpr std::size_t kMaxTransitionBytes = 1ull << 40;
 constexpr std::size_t kMaxHotCapacity = 1u << 16;
+constexpr std::size_t kMaxListCapacity = 1u << 22;
 
 std::size_t checked_mul(std::size_t left, std::size_t right, bool & ok) {
     if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
@@ -126,6 +127,21 @@ bool llama_pyramidkv_c1_make_config(
     if (output.hot_capacity < minimum_hot_capacity) {
         error = "PyramidKV C1 hot_capacity must cover recent_window plus effective ubatch headroom";
         return false;
+    }
+    output.paged = params.paged;
+    if (output.paged) {
+        if (!copy_c1_value("pyramidkv_c1.list_capacity", params.list_capacity,
+                1, kMaxListCapacity, output.list_capacity, error)) {
+            return false;
+        }
+        if (output.list_capacity < output.max_capacity_prompt + output.continuation_headroom) {
+            error = "PyramidKV C1 list_capacity must cover max_capacity_prompt plus effective ubatch headroom";
+            return false;
+        }
+        if (!copy_c1_value("pyramidkv_c1.paged_union_factor", params.paged_union_factor,
+                1, 1024, output.paged_union_factor, error)) {
+            return false;
+        }
     }
     return true;
 }

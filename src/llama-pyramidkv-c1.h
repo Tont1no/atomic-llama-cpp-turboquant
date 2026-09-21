@@ -92,6 +92,9 @@ struct llama_pyramidkv_c1_config {
     std::size_t transition_max_bytes = 8ull*1024ull*1024ull*1024ull;
     std::size_t continuation_headroom = 1;
     std::size_t hot_capacity = 384;
+    bool paged = false;
+    std::size_t list_capacity = 0;
+    std::size_t paged_union_factor = 4;
 };
 
 struct llama_pyramidkv_c1_score {

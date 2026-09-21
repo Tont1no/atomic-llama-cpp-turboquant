@@ -193,6 +193,8 @@ public:
     // C1 applies to this attention cache, including the attention part of a hybrid model.
     bool pyramidkv_c1_supported(std::string & error) const;
     const llama_pyramidkv_c1_config & pyramidkv_c1_get_config() const { return pyramidkv_c1_config; }
+    // seq_id < 0 lists every cell of sequence 0 (single-sequence C1); a
+    // paged cache lists the cells of that sequence only.
     bool pyramidkv_c1_key_positions(
             int32_t il,
             uint32_t n_kv,
@@ -200,7 +202,8 @@ public:
             std::vector<std::vector<std::size_t>> & logical_cells,
             std::vector<std::vector<std::size_t>> & score_slots,
             uint32_t & active_tokens,
-            std::string & error) const;
+            std::string & error,
+            llama_seq_id seq_id = -1) const;
     bool pyramidkv_c1_prepare_batch_rows(
             const slot_info & sinfo,
             const llama_ubatch & ubatch,
@@ -216,6 +219,24 @@ public:
             std::vector<llama_pyramidkv_c1_layer_selection> & selections,
             std::string & error) const;
     bool pyramidkv_c1_hybrid_ready(int32_t il) const;
+
+    // Paged C1 (several sequences share the cache). The TQ4 arena keeps every
+    // token of every sequence, the selection is per layer/head bookkeeping
+    // (row lists), and decode of a selected sequence runs the paged hybrid
+    // operator over its lists. No layout replacement ever happens.
+    bool pyramidkv_c1_paged() const { return pyramidkv_c1_hot_enabled && pyramidkv_c1_config.paged; }
+    bool pyramidkv_c1_paged_seq_compacted(llama_seq_id seq_id) const;
+    // Every sequence of the ubatch is selected: the ubatch runs the paged path.
+    bool pyramidkv_c1_paged_ubatch_ready(const llama_ubatch & ubatch) const;
+    bool pyramidkv_c1_paged_apply_selection(
+            llama_seq_id seq_id,
+            const std::vector<llama_pyramidkv_c1_layer_selection> & selections,
+            std::string & error);
+    // Graph reserve builds the paged decode graph once with this set.
+    void pyramidkv_c1_set_reserve_paged(bool value) { pyramidkv_c1_reserve_paged = value; }
+    bool pyramidkv_c1_reserve_paged_active() const { return pyramidkv_c1_reserve_paged; }
+    uint32_t pyramidkv_c1_paged_list_capacity() const { return static_cast<uint32_t>(pyramidkv_c1_config.list_capacity); }
+    size_t pyramidkv_c1_paged_list_size(llama_seq_id seq_id) const;
 
     // A layout replacement keeps old graph tensors alive until the scheduler
     // has been reset. Callers use this state to fail closed after an
@@ -258,6 +279,13 @@ public:
     ggml_tensor * get_v_hybrid(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_hot_hybrid(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_hot_hybrid(ggml_context * ctx, int32_t il) const;
+    // Paged views: the arena as [D, rows, kv_heads] (row stride = whole
+    // row, head stride = one head's TQ4 blocks) and the hot ring head-major.
+    ggml_tensor * get_k_paged(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_paged(ggml_context * ctx, int32_t il) const;
+    // hot ring head-major [D, hot_capacity, kv_heads, 1], no readiness gate
+    ggml_tensor * get_k_hot_ring(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_hot_ring(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo,
@@ -456,6 +484,21 @@ private:
 
     std::vector<pyramidkv_c1_layer_state> pyramidkv_c1_layers;
 
+    // Paged C1 bookkeeping: per sequence the selection state, per
+    // layer/head/sequence the ordered (cell, position) list the paged
+    // operator walks. Decode tokens of a selected sequence are appended in
+    // prepare_batch_rows; seq_rm trims by position.
+    struct pyramidkv_c1_list_entry {
+        uint32_t cell;
+        int32_t pos;
+    };
+    std::vector<uint8_t> pyramidkv_c1_paged_compacted;                          // [n_seq_max]
+    std::vector<std::vector<std::vector<std::vector<pyramidkv_c1_list_entry>>>>
+        pyramidkv_c1_paged_lists;                                               // [layer][head][seq]
+    bool pyramidkv_c1_reserve_paged = false;
+    void pyramidkv_c1_paged_reset();
+    void pyramidkv_c1_paged_trim(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+
     // C1 index and position tensors the graph reads per layer, resident on
     // the KV device. As per-layer graph inputs they lived in host memory and
     // ggml_backend_sched synchronised the device once per input before
@@ -468,12 +511,23 @@ private:
         ggml_tensor * k_positions    = nullptr; // I32 [pos_stride, n_layers]
         ggml_tensor * hot_write_idxs = nullptr; // I32 [hot_stride, n_layers]
         ggml_tensor * q_positions    = nullptr; // I32 [n_ubatch]
+        // paged lists: [2*list_capacity*heads_max*n_seq_max, n_layers],
+        // lengths [heads_max*n_seq_max, n_layers], q_meta [2*n_ubatch]
+        ggml_tensor * k_list         = nullptr;
+        ggml_tensor * k_list_len     = nullptr;
+        ggml_tensor * q_meta         = nullptr;
         uint32_t pos_stride = 0;
         uint32_t hot_stride = 0;
         uint32_t n_ubatch   = 0;
+        uint32_t list_stride = 0; // entries (pairs) per layer
+        uint32_t len_stride  = 0;
+        uint32_t heads_max   = 0;
         std::vector<int32_t> stage_pos;
         std::vector<int32_t> stage_hot;
         std::vector<int32_t> stage_q;
+        std::vector<int32_t> stage_list;
+        std::vector<int32_t> stage_len;
+        std::vector<int32_t> stage_meta;
         // Backend that computes on the KV device. The per-ubatch uploads go
         // through its stream (tensor_set_async) so they are ordered after the
         // previous ubatch's graph, which may still be reading these tensors:
@@ -589,6 +643,15 @@ public:
     ggml_tensor * get_q_positions(ggml_context * ctx, int32_t il, size_t n) const;
     ggml_tensor * get_pyramidkv_observer_mask(ggml_context * ctx, int32_t il, size_t n) const;
     bool pyramidkv_hybrid_ready(int32_t il) const;
+    // Paged C1: the current ubatch runs the paged operator.
+    bool pyramidkv_paged_ready() const;
+    ggml_tensor * get_k_paged(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_paged(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_hot_ring(ggml_context * ctx, int32_t il) const { return kv->get_k_hot_ring(ctx, il); }
+    ggml_tensor * get_v_hot_ring(ggml_context * ctx, int32_t il) const { return kv->get_v_hot_ring(ctx, il); }
+    ggml_tensor * get_k_list(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_list_len(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_q_meta(ggml_context * ctx, int32_t il, size_t n) const;
     bool pyramidkv_c1_compacted() const { return kv->pyramidkv_c1_is_compacted(); }
 
     ggml_tensor * get_kq_mask(ggml_context * ctx, ggml_tensor * base_mask, int32_t il) const;

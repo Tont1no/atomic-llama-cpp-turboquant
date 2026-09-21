@@ -2339,7 +2339,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
              params.type_k != GGML_TYPE_TURBO4_0 ||
              params.type_v != GGML_TYPE_TURBO4_0 ||
              !cparams.flash_attn || !cparams.causal_attn ||
-             cparams.n_seq_max != 1 ||
+             (cparams.n_seq_max != 1 && !params.pyramidkv_c1.paged) ||
              cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
              params.kv_buffer_type == nullptr || params.mem_other != nullptr ||
              hparams.is_swa_any() || cparams.embeddings)) {
