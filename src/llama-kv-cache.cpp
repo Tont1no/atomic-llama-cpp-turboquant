@@ -1210,9 +1210,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (pyramidkv_c1_hot_enabled) {
-        pyramidkv_c1_graph_reset_needed = true;
-        pyramidkv_c1_tokens_since_compact = pyramidkv_c1_compacted
-            ? std::numeric_limits<uint32_t>::max() : 0;
+        // A partial removal (speculative rollback) leaves the cold pool and
+        // the hot ring in place: prepare_batch_rows frees the hot and cold
+        // rows of emptied cells before the next ubatch reuses them, and the
+        // graph shape does not depend on cell occupancy. Removing rows never
+        // brings the ring closer to overwriting an unpromoted row, so the
+        // maintenance counter stands. Only a selection recorded before this
+        // call is stale; a full removal was reinitialized above and already
+        // requested its graph reset.
+        pyramidkv_c1_selection_stale = true;
+        if (!pyramidkv_c1_compacted) {
+            pyramidkv_c1_tokens_since_compact = 0;
+        }
     }
     if (tq4_key_center_enabled_flag && tq4_key_center_cache_empty()) {
         tq4_key_center_invalidate();

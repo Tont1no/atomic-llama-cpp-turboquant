@@ -1073,6 +1073,10 @@ bool llama_context::memory_update(bool optimize) {
             pyramidkv_c1_pending.clear();
             sched_reserve();
         }
+        if (c1_kv->pyramidkv_c1_take_selection_stale()) {
+            // Rows were removed after this selection was recorded.
+            pyramidkv_c1_pending.clear();
+        }
     }
 
     bool pyramidkv_c1_applied = false;
@@ -1743,6 +1747,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         if (c1_kv->pyramidkv_c1_graph_reset_pending()) {
             sched_reserve();
+        }
+        if (c1_kv->pyramidkv_c1_take_selection_stale()) {
+            // A partial seq_rm (draft rollback) since the last ubatch: the
+            // recorded selection names cells that may be gone. The layout is
+            // intact, so no reserve; the maintenance counter re-requests it.
+            pyramidkv_c1_pending.clear();
         }
     }
 

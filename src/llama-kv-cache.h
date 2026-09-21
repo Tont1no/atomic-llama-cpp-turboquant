@@ -222,6 +222,14 @@ public:
     // allocation failure instead of evaluating with stale compacted rows.
     bool pyramidkv_c1_graph_reset_pending() const { return pyramidkv_c1_graph_reset_needed; }
     void pyramidkv_c1_graph_reset_complete();
+    // A partial seq_rm (draft rollback) keeps the layout; only a selection
+    // the context recorded before the removal is stale. The context drops it
+    // and clears the flag; no graph reserve and no compaction is forced.
+    bool pyramidkv_c1_take_selection_stale() {
+        const bool stale = pyramidkv_c1_selection_stale;
+        pyramidkv_c1_selection_stale = false;
+        return stale;
+    }
     bool pyramidkv_c1_reset_failed(std::string & error) const;
     void pyramidkv_c1_fail_transition(const std::string & error);
     const llama_pyramidkv_c1_phase_timing & pyramidkv_c1_get_phase_timing() const {
@@ -402,6 +410,7 @@ private:
     // A failed reinitialization is sticky until a later successful full clear.
     // init_batch and context scheduling use it as a fail-closed gate.
     bool pyramidkv_c1_graph_reset_needed = false;
+    bool pyramidkv_c1_selection_stale = false;
     bool pyramidkv_c1_reset_failed_flag = false;
     std::string pyramidkv_c1_reset_error;
 

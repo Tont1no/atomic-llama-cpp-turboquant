@@ -310,16 +310,24 @@ static int ggml_cuda_hybrid_split_setting(const char * name, const int fallback,
     return end != text && *end == '\0' && parsed >= lo && parsed <= hi ? int(parsed) : fallback;
 }
 
-static int ggml_cuda_hybrid_split_count(const int64_t n_keys) {
+// n_rows query rows share the split budget: the partial output buffer is
+// n_rows*split_k*D floats, capped at 64 MiB so a draft-verification or
+// append ubatch with hundreds of rows does not exhaust the pool.
+static int ggml_cuda_hybrid_split_count(const int64_t n_keys, const uint64_t n_rows, const int64_t D) {
     static const int target_keys_per_block = ggml_cuda_hybrid_split_setting("GGML_CUDA_HYBRID_KEYS_PER_SPLIT", 16, 1, 4096);
     static const int max_split_limit       = ggml_cuda_hybrid_split_setting("GGML_CUDA_HYBRID_MAX_SPLIT", 512, 1, 4096);
     constexpr int64_t min_keys_for_split = 32;
-    if (n_keys < min_keys_for_split) {
+    constexpr uint64_t partial_budget_bytes = 64ull << 20;
+    if (n_keys < min_keys_for_split || n_rows == 0 || D <= 0) {
         return 1;
     }
 
     const int device = ggml_cuda_get_device();
-    const int max_split_k = std::max(1, std::min(max_split_limit, ggml_cuda_info().devices[device].nsm*16));
+    int max_split_k = std::max(1, std::min(max_split_limit, ggml_cuda_info().devices[device].nsm*16));
+    const uint64_t bytes_per_split = n_rows*(uint64_t) D*sizeof(float) + n_rows*sizeof(float2);
+    if (bytes_per_split > 0) {
+        max_split_k = (int) std::max<uint64_t>(1, std::min<uint64_t>(max_split_k, partial_budget_bytes/bytes_per_split));
+    }
     const int requested = (int) ((n_keys + target_keys_per_block - 1)/target_keys_per_block);
     return std::max(1, std::min(max_split_k, requested));
 }
@@ -377,8 +385,11 @@ void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tenso
         scale /= logit_softcap;
     }
 
-    const bool use_split_k = q->ne[1] == 1 && (q->ne[0] == 128 || q->ne[0] == 256);
-    const int split_k = use_split_k ? ggml_cuda_hybrid_split_count(n_keys) : 1;
+    // Every query row is one warp; a draft-verification ubatch (a handful
+    // of rows) or an append ubatch needs the key split just as much as
+    // single-token decode, otherwise each warp walks every key serially.
+    const bool use_split_k = q->ne[0] == 128 || q->ne[0] == 256;
+    const int split_k = use_split_k ? ggml_cuda_hybrid_split_count(n_keys, n_rows, q->ne[0]) : 1;
 
     if (split_k > 1) {
         const uint64_t partial_rows = n_rows*(uint64_t) split_k;
