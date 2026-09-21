@@ -928,6 +928,9 @@ struct llm_graph_pyramidkv_score {
     std::size_t key_tokens = 0;
     std::size_t key_stride = 0;
     std::size_t observation_window = 0;
+    // paged C1: the sequence this window scores (its last queries in the
+    // ubatch); -1 for the single-sequence observer.
+    llama_seq_id seq_id = -1;
 };
 
 class llm_graph_result {

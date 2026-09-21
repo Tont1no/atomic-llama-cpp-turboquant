@@ -963,6 +963,12 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
                 }
                 list.push_back({ static_cast<uint32_t>(logical), static_cast<int32_t>(selected.keep_positions[i]) });
             }
+            // The selection orders by cell; a prompt that landed in cells freed
+            // by an earlier sequence is not cell-ordered by position. The
+            // lists are position-ordered (appends and trims rely on it).
+            std::sort(list.begin(), list.end(), [](const pyramidkv_c1_list_entry & a, const pyramidkv_c1_list_entry & b) {
+                return a.pos < b.pos;
+            });
             if (list.empty() || list.size() > pyramidkv_c1_config.list_capacity) {
                 error = "PyramidKV C1 selection left an empty or oversized head list";
                 return false;
@@ -980,9 +986,20 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
         head_pos = std::min(head_pos, i);
     }
     pyramidkv_c1_paged_compacted[seq_id] = 1;
-    LLAMA_LOG_INFO("%s: PyramidKV paged selection seq=%d kept_cells=%zu freed_cells=%u longest_list=%zu\n",
+    int32_t pos_min = std::numeric_limits<int32_t>::max(), pos_max = -1;
+    size_t recent = 0;
+    if (!pyramidkv_c1_paged_lists.empty() && !pyramidkv_c1_paged_lists[0].empty()) {
+        for (const auto & e : pyramidkv_c1_paged_lists[0][0][seq_id]) {
+            pos_min = std::min(pos_min, e.pos);
+            pos_max = std::max(pos_max, e.pos);
+        }
+        for (const auto & e : pyramidkv_c1_paged_lists[0][0][seq_id]) {
+            recent += e.pos + static_cast<int32_t>(pyramidkv_c1_config.recent_window) > pos_max;
+        }
+    }
+    LLAMA_LOG_INFO("%s: PyramidKV paged selection seq=%d kept_cells=%zu freed_cells=%u longest_list=%zu pos=[%d,%d] recent_l0h0=%zu\n",
         __func__, (int) seq_id, static_cast<size_t>(std::count(kept.begin(), kept.end(), 1)), freed,
-        pyramidkv_c1_paged_list_size(seq_id));
+        pyramidkv_c1_paged_list_size(seq_id), pos_min, pos_max, recent);
     return true;
 }
 
@@ -1489,7 +1506,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // maintenance counter stands. Only a selection recorded before this
         // call is stale; a full removal was reinitialized above and already
         // requested its graph reset.
-        pyramidkv_c1_selection_stale = true;
+        if (pyramidkv_c1_paged()) {
+            if (pyramidkv_c1_selection_stale_seqs.size() != n_seq_max) {
+                pyramidkv_c1_selection_stale_seqs.assign(n_seq_max, 0);
+            }
+            if (seq_id >= 0 && static_cast<uint32_t>(seq_id) < n_seq_max) {
+                pyramidkv_c1_selection_stale_seqs[seq_id] = 1;
+            } else {
+                std::fill(pyramidkv_c1_selection_stale_seqs.begin(), pyramidkv_c1_selection_stale_seqs.end(), 1);
+            }
+        } else {
+            pyramidkv_c1_selection_stale = true;
+        }
         if (!pyramidkv_c1_compacted) {
             pyramidkv_c1_tokens_since_compact = 0;
         }
@@ -1750,6 +1778,75 @@ llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     const auto & cells = v_cells[seq_to_stream[seq_id]];
 
     return cells.seq_pos_min(seq_id);
+}
+
+int64_t llama_kv_cache::seq_n_cells(llama_seq_id seq_id) const {
+    if (other) {
+        return other->seq_n_cells(seq_id);
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    int64_t n = 0;
+    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+        n += !cells.is_empty(i) && cells.seq_has(i, seq_id);
+    }
+    return n;
+}
+
+int32_t llama_kv_cache::seq_positions(llama_seq_id seq_id, llama_pos * pos, int32_t cap) const {
+    if (other) {
+        return other->seq_positions(seq_id, pos, cap);
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || cap < 0) {
+        return -1;
+    }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    std::vector<llama_pos> found;
+    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+            found.push_back(cells.pos_get(i));
+        }
+    }
+    std::sort(found.begin(), found.end());
+    const int32_t n = (int32_t) std::min<size_t>(found.size(), (size_t) cap);
+    if (pos != nullptr) {
+        std::copy(found.begin(), found.begin() + n, pos);
+    }
+    return (int32_t) found.size();
+}
+
+bool llama_kv_cache::seq_keep_positions(llama_seq_id seq_id, const llama_pos * pos, int32_t n) {
+    if (other) {
+        return true;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || (n > 0 && pos == nullptr)) {
+        return false;
+    }
+    // The bounded C1 layouts track cells through their own maps/lists; only a
+    // plain cache (draft contexts) takes a cell-wise removal here.
+    if (pyramidkv_c1_hot_enabled || pyramidkv_c1_compacted || pyramidkv_c1_paged()) {
+        return false;
+    }
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    auto & head  = v_heads[seq_to_stream[seq_id]];
+    uint32_t new_head = cells.size();
+    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+            continue;
+        }
+        if (std::binary_search(pos, pos + n, cells.pos_get(i))) {
+            continue;
+        }
+        if (cells.seq_rm(i, seq_id) && new_head == cells.size()) {
+            new_head = i;
+        }
+    }
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+    return true;
 }
 
 llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
@@ -5304,10 +5401,12 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
         const uint32_t heads = state.kv_heads;
         const uint32_t cold_scratch = state.cold_row_capacity - 1;
         const uint32_t hot_scratch = state.hot_row_capacity - 1;
+        // A live cell owned by exactly one sequence - any sequence. The old
+        // seq-0-only test sent every hot write of a second sequence to the
+        // scratch row, so paged multi-sequence decodes read stale hot rows.
         const auto valid_cell = [&](size_t logical) {
             return logical < active && logical < cells.size() && !cells.is_empty(static_cast<uint32_t>(logical)) &&
-                cells.seq_count(static_cast<uint32_t>(logical)) == 1 &&
-                cells.seq_has(static_cast<uint32_t>(logical), 0);
+                cells.seq_count(static_cast<uint32_t>(logical)) == 1;
         };
         const auto cold_row = [&](uint32_t head, size_t logical) {
             const auto & map = state.cold_heads[head];

@@ -394,7 +394,7 @@ llama_context::llama_context(
             params.type_k == GGML_TYPE_TURBO4_0 &&
             params.type_v == GGML_TYPE_TURBO4_0 &&
             cparams.flash_attn && cparams.causal_attn &&
-            cparams.n_seq_max == 1 &&
+            (cparams.n_seq_max == 1 || cparams.pyramidkv_c1.paged) &&
             // Recurrent rollback planes (n_rs_seq) belong to the recurrent
             // memory; the compacted attention cache handles a rejected draft
             // tail as a partial seq_rm, so an embedded MTP drafter is allowed.
@@ -1077,6 +1077,18 @@ llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
 
+void llama_context::pyramidkv_c1_drop_stale_paged(const std::vector<llama_seq_id> & stale) {
+    if (stale.empty() || pyramidkv_c1_pending_paged.empty()) {
+        return;
+    }
+    pyramidkv_c1_pending_paged.erase(
+        std::remove_if(pyramidkv_c1_pending_paged.begin(), pyramidkv_c1_pending_paged.end(),
+            [&](const auto & pending) {
+                return std::find(stale.begin(), stale.end(), pending.first) != stale.end();
+            }),
+        pyramidkv_c1_pending_paged.end());
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -1095,10 +1107,32 @@ bool llama_context::memory_update(bool optimize) {
         if (c1_kv->pyramidkv_c1_take_selection_stale()) {
             // Rows were removed after this selection was recorded.
             pyramidkv_c1_pending.clear();
+            pyramidkv_c1_pending_paged.clear();
         }
+        pyramidkv_c1_drop_stale_paged(c1_kv->pyramidkv_c1_take_stale_seqs());
     }
 
     bool pyramidkv_c1_applied = false;
+    if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending_paged.empty()) {
+        auto * kv = llama_context_attention_cache(memory.get());
+        if (kv == nullptr) {
+            pyramidkv_c1_pending_paged.clear();
+            return false;
+        }
+        // Bookkeeping only: lists per layer/head, freed cells. The arena and
+        // the graph tensors stay; no reserve.
+        for (auto & pending : pyramidkv_c1_pending_paged) {
+            std::string error;
+            if (!kv->pyramidkv_c1_paged_apply_selection(pending.first, pending.second, error)) {
+                LLAMA_LOG_ERROR("%s: C1 paged selection rejected: %s\n", __func__, error.c_str());
+                kv->pyramidkv_c1_fail_transition(error);
+                pyramidkv_c1_pending_paged.clear();
+                throw std::runtime_error("PyramidKV C1 paged selection failed: " + error);
+            }
+        }
+        pyramidkv_c1_pending_paged.clear();
+        pyramidkv_c1_applied = true;
+    }
     if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending.empty()) {
         auto * kv = llama_context_attention_cache(memory.get());
         if (kv == nullptr) {
@@ -1108,18 +1142,6 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         std::string error;
-        if (kv->pyramidkv_c1_paged()) {
-            // Bookkeeping only: lists per layer/head, freed cells. The
-            // arena and the graph tensors stay; no reserve.
-            if (!kv->pyramidkv_c1_paged_apply_selection(pyramidkv_c1_pending_seq, pyramidkv_c1_pending, error)) {
-                LLAMA_LOG_ERROR("%s: C1 paged selection rejected: %s\n", __func__, error.c_str());
-                kv->pyramidkv_c1_fail_transition(error);
-                pyramidkv_c1_pending.clear();
-                throw std::runtime_error("PyramidKV C1 paged selection failed: " + error);
-            }
-            pyramidkv_c1_pending.clear();
-            return true;
-        }
         // Drop graph handles before compaction synchronizes and replaces the KV buffers.
         gf_res_prev->reset();
         gf_res_reserve->reset();
@@ -1784,12 +1806,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // recorded selection names cells that may be gone. The layout is
             // intact, so no reserve; the maintenance counter re-requests it.
             pyramidkv_c1_pending.clear();
+            pyramidkv_c1_pending_paged.clear();
         }
+        pyramidkv_c1_drop_stale_paged(c1_kv->pyramidkv_c1_take_stale_seqs());
     }
 
     // Commit the previous observation before a later ubatch can overwrite
     // hot rows, including ubatches inside the same long decode call.
-    if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending.empty()) {
+    if (cparams.pyramidkv_c1.enabled && (!pyramidkv_c1_pending.empty() || !pyramidkv_c1_pending_paged.empty())) {
         if (!memory_update(false)) {
             if (auto * kv = llama_context_attention_cache(memory.get())) {
                 kv->pyramidkv_c1_fail_transition("PyramidKV C1 pending update did not complete");
@@ -1819,10 +1843,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     bool pyramidkv_observer = true;
     if (cparams.pyramidkv_c1.enabled) {
         if (auto * c1_kv = llama_context_attention_cache(memory.get())) {
-            pyramidkv_observer = !c1_kv->pyramidkv_c1_is_compacted() &&
-                ubatch.output != nullptr &&
-                std::any_of(ubatch.output, ubatch.output + ubatch.n_tokens,
-                    [](int8_t output) { return output != 0; });
+            if (c1_kv->pyramidkv_c1_paged()) {
+                // Paged: only an unselected sequence's prompt end (an output
+                // token of a sequence without lists) needs the observer;
+                // decode tokens of selected sequences never do.
+                pyramidkv_observer = false;
+                if (ubatch.output != nullptr && ubatch.seq_id != nullptr && ubatch.n_seq_id != nullptr) {
+                    for (uint32_t i = 0; i < ubatch.n_tokens && !pyramidkv_observer; ++i) {
+                        pyramidkv_observer = ubatch.output[i] != 0 && ubatch.n_seq_id[i] > 0 &&
+                            !c1_kv->pyramidkv_c1_paged_seq_compacted(ubatch.seq_id[i][0]);
+                    }
+                }
+            } else {
+                pyramidkv_observer = !c1_kv->pyramidkv_c1_is_compacted() &&
+                    ubatch.output != nullptr &&
+                    std::any_of(ubatch.output, ubatch.output + ubatch.n_tokens,
+                        [](int8_t output) { return output != 0; });
+            }
         }
     }
 
@@ -3278,28 +3315,33 @@ bool llama_context::extract_pyramidkv_scores(
         // drafter reads; the observer graph is unaffected by it.
         return fail("C1 requires Qwen2 or Qwen35 attention without SWA or a shared context");
     }
-    if (paged && ubatch.n_seqs_unq != 1) {
-        // Paged C1 selects one sequence per observed ubatch (its prompt end).
-        // Two prompts ending in the same ubatch stay on the arena path until
-        // one of them is observed alone; nothing is lost, only not pruned.
-        pyramidkv_c1_pending.clear();
-        return true;
-    }
     // Qwen35 text broadcasts each position across its four M-RoPE axes.
     // Image positions and unsupported memory layouts remain rejected.
     if (ubatch.n_tokens == 0 || ubatch.n_pos == 0 ||
             (ubatch.n_pos != 1 && !(model.arch == LLM_ARCH_QWEN35 && ubatch.token && ubatch.n_pos == 4)) ||
-            ubatch.n_seqs_unq != 1 || ubatch.pos == nullptr ||
+            (ubatch.n_seqs_unq != 1 && !paged) || ubatch.n_seqs_unq == 0 || ubatch.pos == nullptr ||
             ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
         return fail("C1 requires one active sequence with one-dimensional positions");
     }
-    const llama_seq_id observed_seq = paged ? ubatch.seq_id_unq[0] : 0;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr ||
-                ubatch.seq_id[i][0] != observed_seq || ubatch.pos[i] < 0 ||
-                (i != 0 && ubatch.pos[i] <= ubatch.pos[i - 1])) {
-            return fail("C1 requires strictly increasing positions for one sequence");
+    if (paged) {
+        // Every sequence's tokens are contiguous and position-ordered (equal
+        // split); the observer scores each unselected prompt end separately.
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr || ubatch.pos[i] < 0 ||
+                    (i != 0 && ubatch.seq_id[i][0] == ubatch.seq_id[i - 1][0] && ubatch.pos[i] <= ubatch.pos[i - 1])) {
+                return fail("C1 paged requires position-ordered tokens per sequence");
+            }
         }
+    } else {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr ||
+                    ubatch.seq_id[i][0] != 0 || ubatch.pos[i] < 0 ||
+                    (i != 0 && ubatch.pos[i] <= ubatch.pos[i - 1])) {
+                return fail("C1 requires strictly increasing positions for sequence 0");
+            }
+        }
+    }
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
             if (ubatch.pos[axis * ubatch.n_tokens + i] != ubatch.pos[i]) {
                 return fail("C1 only accepts broadcast text positions for Qwen35 M-RoPE");
@@ -3319,11 +3361,91 @@ bool llama_context::extract_pyramidkv_scores(
     const bool has_output = ubatch.output != nullptr &&
         std::any_of(ubatch.output, ubatch.output + ubatch.n_tokens,
             [](int8_t output) { return output != 0; });
-    if (paged && kv->pyramidkv_c1_paged_seq_compacted(observed_seq)) {
-        // Selected sequences need no maintenance: the arena copy of every
+    if (paged) {
+        // Selected sequences need no maintenance (the arena copy of every
         // decode token exists from its ubatch on, the lists grow in
-        // prepare_batch_rows.
+        // prepare_batch_rows). Unselected prompt ends were scored by their
+        // own observer window; nothing pending means nothing ended here.
         pyramidkv_c1_pending.clear();
+        pyramidkv_c1_pending_paged.clear();
+        const auto & score_nodes = res->get_pyramidkv_scores();
+        if (score_nodes.empty()) {
+            return true;
+        }
+        synchronize();
+        const auto attention_layers = kv->get_layer_ids();
+        std::vector<llama_seq_id> seqs;
+        for (const auto & node : score_nodes) {
+            if (node.seq_id >= 0 && std::find(seqs.begin(), seqs.end(), node.seq_id) == seqs.end()) {
+                seqs.push_back(node.seq_id);
+            }
+        }
+        for (const llama_seq_id seq : seqs) {
+            if (kv->pyramidkv_c1_paged_seq_compacted(seq)) {
+                continue;
+            }
+            auto config = cparams.pyramidkv_c1;
+            std::vector<llama_pyramidkv_c1_layer_selection> selections;
+            for (const auto & node : score_nodes) {
+                if (node.seq_id != seq) {
+                    continue;
+                }
+                const auto layer = std::find(attention_layers.begin(), attention_layers.end(), node.il);
+                if (node.tensor == nullptr || node.il < 0 || layer == attention_layers.end() ||
+                    node.tensor->type != GGML_TYPE_F32 || node.tensor->ne[0] != (int64_t) node.key_stride ||
+                    node.tensor->ne[1] != (int64_t) node.kv_heads || node.key_stride == 0 ||
+                    node.kv_heads == 0 || node.query_heads == 0 || node.query_heads % node.kv_heads != 0 ||
+                    node.query_tokens == 0 || node.query_start > ubatch.n_tokens ||
+                    node.query_tokens > ubatch.n_tokens - node.query_start) {
+                    return fail("score observer tensor geometry is not the reduced native C1 layout");
+                }
+                const size_t n_elements = ggml_nelements(node.tensor);
+                if (n_elements == 0 || n_elements > config.observer_max_bytes / sizeof(float)) {
+                    return fail("score observer tensor exceeds the bounded host extraction limit");
+                }
+                llama_pyramidkv_c1_score score;
+                score.il = node.il;
+                score.query_heads = node.query_heads;
+                score.kv_heads = node.kv_heads;
+                score.query_tokens = node.query_tokens;
+                score.key_stride = node.key_stride;
+                score.observation_window = config.observation_window;
+                score.head_scores.resize(n_elements);
+                ggml_backend_tensor_get(node.tensor, score.head_scores.data(), 0, n_elements * sizeof(float));
+                uint32_t active_tokens = 0;
+                if (!kv->pyramidkv_c1_key_positions(node.il, static_cast<uint32_t>(node.key_tokens),
+                        score.key_positions_per_head, score.key_cells_per_head,
+                        score.key_score_slots_per_head, active_tokens, error, seq)) {
+                    return fail(error);
+                }
+                score.key_tokens = 0;
+                for (const auto & head_positions : score.key_positions_per_head) {
+                    score.key_tokens = std::max(score.key_tokens, head_positions.size());
+                }
+                score.logical_key_tokens = active_tokens;
+                score.query_positions.resize(score.query_tokens);
+                for (size_t i = 0; i < score.query_tokens; ++i) {
+                    score.query_positions[i] = ubatch.pos[node.query_start + i];
+                }
+                config.layer_index = static_cast<std::size_t>(layer - attention_layers.begin());
+                llama_pyramidkv_c1_layer_selection selection;
+                if (!llama_pyramidkv_c1_select(score, config, selection, error)) {
+                    return fail(error);
+                }
+                selections.push_back(std::move(selection));
+            }
+            if (selections.size() != attention_layers.size()) {
+                return fail("C1 did not observe every cached attention layer for a sequence");
+            }
+            const bool any_would_compact = std::any_of(selections.begin(), selections.end(),
+                [](const llama_pyramidkv_c1_layer_selection & selection) { return selection.would_compact; });
+            const auto & first = *std::find_if(score_nodes.begin(), score_nodes.end(),
+                [&](const llm_graph_pyramidkv_score & n) { return n.seq_id == seq; });
+            LLAMA_LOG_INFO("%s: PyramidKV fixed-prefill selection; prompt_positions=%d observed_queries=%zu attention_layers=%zu pruned=%d seq=%d ubatch_tokens=%u\n",
+                func, ubatch.pos[first.query_start + first.query_tokens - 1] + 1,
+                first.query_tokens, attention_layers.size(), any_would_compact ? 1 : 0, (int) seq, ubatch.n_tokens);
+            pyramidkv_c1_pending_paged.emplace_back(seq, std::move(selections));
+        }
         return true;
     }
     if (kv->pyramidkv_c1_is_compacted()) {
@@ -3412,8 +3534,7 @@ bool llama_context::extract_pyramidkv_scores(
         uint32_t active_tokens = 0;
         if (!kv->pyramidkv_c1_key_positions(node.il, static_cast<uint32_t>(node.key_tokens),
                 score.key_positions_per_head, score.key_cells_per_head,
-                score.key_score_slots_per_head, active_tokens, error,
-                paged ? observed_seq : -1)) {
+                score.key_score_slots_per_head, active_tokens, error)) {
             return fail(error);
         }
         score.key_tokens = 0;
@@ -3440,11 +3561,10 @@ bool llama_context::extract_pyramidkv_scores(
 
     const bool any_would_compact = std::any_of(selections.begin(), selections.end(),
         [](const llama_pyramidkv_c1_layer_selection & selection) { return selection.would_compact; });
-    LLAMA_LOG_INFO("%s: PyramidKV fixed-prefill selection; prompt_positions=%d observed_queries=%zu attention_layers=%zu pruned=%d seq=%d\n",
+    LLAMA_LOG_INFO("%s: PyramidKV fixed-prefill selection; prompt_positions=%d observed_queries=%zu attention_layers=%zu pruned=%d\n",
         func, ubatch.pos[ubatch.n_tokens - 1] + 1,
-        score_nodes.front().query_tokens, attention_layers.size(), any_would_compact ? 1 : 0, (int) observed_seq);
+        score_nodes.front().query_tokens, attention_layers.size(), any_would_compact ? 1 : 0);
     pyramidkv_c1_pending = std::move(selections);
-    pyramidkv_c1_pending_seq = observed_seq;
     return true;
 }
 //
@@ -5141,6 +5261,40 @@ llama_pos llama_memory_seq_pos_min(
     }
 
     return mem->seq_pos_min(seq_id);
+}
+
+int64_t llama_memory_seq_n_cells(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->seq_n_cells(seq_id);
+}
+
+int32_t llama_memory_seq_positions(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos * pos,
+               int32_t cap) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->seq_positions(seq_id, pos, cap);
+}
+
+bool llama_memory_seq_keep_positions(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+       const llama_pos * pos,
+               int32_t n) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_keep_positions(seq_id, pos, n);
 }
 
 llama_pos llama_memory_seq_pos_max(

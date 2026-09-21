@@ -147,6 +147,9 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    int64_t   seq_n_cells(llama_seq_id seq_id) const override;
+    int32_t   seq_positions(llama_seq_id seq_id, llama_pos * pos, int32_t cap) const override;
+    bool      seq_keep_positions(llama_seq_id seq_id, const llama_pos * pos, int32_t n) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -250,6 +253,20 @@ public:
         const bool stale = pyramidkv_c1_selection_stale;
         pyramidkv_c1_selection_stale = false;
         return stale;
+    }
+    // Paged: a partial seq_rm only touches that sequence's cells, so only its
+    // pending selection is stale; another sequence's prompt-end selection in
+    // the same batch stays valid (a draft rollback per step would otherwise
+    // starve every later prompt of its selection). Returns and clears the set.
+    std::vector<llama_seq_id> pyramidkv_c1_take_stale_seqs() {
+        std::vector<llama_seq_id> out;
+        for (size_t s = 0; s < pyramidkv_c1_selection_stale_seqs.size(); ++s) {
+            if (pyramidkv_c1_selection_stale_seqs[s]) {
+                out.push_back(static_cast<llama_seq_id>(s));
+                pyramidkv_c1_selection_stale_seqs[s] = 0;
+            }
+        }
+        return out;
     }
     bool pyramidkv_c1_reset_failed(std::string & error) const;
     void pyramidkv_c1_fail_transition(const std::string & error);
@@ -439,6 +456,7 @@ private:
     // init_batch and context scheduling use it as a fail-closed gate.
     bool pyramidkv_c1_graph_reset_needed = false;
     bool pyramidkv_c1_selection_stale = false;
+    std::vector<uint8_t> pyramidkv_c1_selection_stale_seqs; // paged: per sequence
     bool pyramidkv_c1_reset_failed_flag = false;
     std::string pyramidkv_c1_reset_error;
 
@@ -645,6 +663,7 @@ public:
     bool pyramidkv_hybrid_ready(int32_t il) const;
     // Paged C1: the current ubatch runs the paged operator.
     bool pyramidkv_paged_ready() const;
+    bool pyramidkv_seq_compacted(llama_seq_id seq_id) const { return kv->pyramidkv_c1_paged_seq_compacted(seq_id); }
     ggml_tensor * get_k_paged(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_paged(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_hot_ring(ggml_context * ctx, int32_t il) const { return kv->get_k_hot_ring(ctx, il); }

@@ -70,6 +70,9 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    int64_t   seq_n_cells(llama_seq_id seq_id) const override;
+    int32_t   seq_positions(llama_seq_id seq_id, llama_pos * pos, int32_t cap) const override;
+    bool      seq_keep_positions(llama_seq_id seq_id, const llama_pos * pos, int32_t n) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

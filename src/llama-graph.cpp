@@ -1263,6 +1263,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
+    // A paged C1 graph (per-sequence lists, no logical mask) and a plain
+    // graph (arena attention with the logical mask) are different graphs.
+    const bool built_paged = std::any_of(inp_attn->pyramidkv_inputs.begin(), inp_attn->pyramidkv_inputs.end(),
+        [](const llm_graph_pyramidkv_inputs & in) { return in.k_list != nullptr; });
+    res &= built_paged == mctx->get_attn()->pyramidkv_paged_ready();
+
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -2693,6 +2699,17 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+// The attention half of the current memory context (plain or hybrid).
+static const llama_kv_cache_context * llama_graph_attention_memory_context(const llama_memory_context_i * mctx) {
+    if (const auto * kv = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+        return kv;
+    }
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid_context *>(mctx)) {
+        return hybrid->get_attn();
+    }
+    return nullptr;
+}
+
 void llm_graph_context::build_pyramidkv_observer(
         ggml_tensor * q,
         ggml_tensor * k_cold,
@@ -2832,9 +2849,62 @@ void llm_graph_context::build_pyramidkv_observer(
     }
     // observer_k == nullptr: score per decoded key tile below.
 
-    const std::size_t query_start = query_tokens_all > observer_config.observation_window
-        ? query_tokens_all - observer_config.observation_window : 0;
-    const std::size_t query_tokens = query_tokens_all - query_start;
+    // Observation windows: one sequence's last queries in the ubatch. A
+    // paged cache observes every unselected sequence whose prompt ends in
+    // this ubatch (tokens of one sequence are contiguous in an equal split),
+    // the single-sequence cache the ubatch tail as before.
+    struct observer_window {
+        std::size_t query_start;
+        std::size_t query_tokens;
+        llama_seq_id seq_id;
+    };
+    std::vector<observer_window> windows;
+    if (cparams.pyramidkv_c1.paged && ubatch.n_seqs_unq > 0 && ubatch.seq_id != nullptr &&
+            ubatch.n_seq_id != nullptr && ubatch.output != nullptr) {
+        const auto * kv_ctx = llama_graph_attention_memory_context(mctx);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq = ubatch.seq_id_unq[s];
+            if (kv_ctx != nullptr && kv_ctx->pyramidkv_seq_compacted(seq)) {
+                continue;
+            }
+            std::size_t begin = query_tokens_all, end = 0;
+            bool has_output = false;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i][0] != seq) {
+                    continue;
+                }
+                begin = std::min<std::size_t>(begin, i);
+                end = std::max<std::size_t>(end, i + 1);
+                has_output = has_output || ubatch.output[i] != 0;
+            }
+            if (!has_output || begin >= end) {
+                continue;
+            }
+            if (end - begin != static_cast<std::size_t>(std::count_if(ubatch.seq_id, ubatch.seq_id + ubatch.n_tokens,
+                    [&](const llama_seq_id * ids) { return ids != nullptr && ids[0] == seq; }))) {
+                throw std::runtime_error("PyramidKV C1 paged observer requires contiguous per-sequence tokens");
+            }
+            const std::size_t count = end - begin;
+            const std::size_t w = std::min(count, observer_config.observation_window);
+            windows.push_back({ end - w, w, seq });
+        }
+    } else {
+        const std::size_t start = query_tokens_all > observer_config.observation_window
+            ? query_tokens_all - observer_config.observation_window : 0;
+        windows.push_back({ start, query_tokens_all - start, -1 });
+    }
+    if (windows.empty()) {
+        return;
+    }
+    // Windows run one after another; the allocator reuses a window's
+    // intermediates for the next one, so the layer budget holds the widest
+    // window, not the sum (the retained outputs are summed separately).
+    const std::size_t windows_base_bytes = layer_bytes;
+    std::size_t windows_peak_bytes = 0;
+    for (const observer_window & window : windows) {
+    layer_bytes = windows_base_bytes;
+    const std::size_t query_start = window.query_start;
+    const std::size_t query_tokens = window.query_tokens;
     bool observer_size_ok = true;
     const std::size_t per_query_bytes =
         key_tokens > std::numeric_limits<std::size_t>::max() / query_heads ?
@@ -2981,8 +3051,12 @@ void llm_graph_context::build_pyramidkv_observer(
         /*.key_tokens          =*/ key_tokens,
         /*.key_stride          =*/ key_tokens,
         /*.observation_window  =*/ observer_config.observation_window,
+        /*.seq_id              =*/ window.seq_id,
     });
     ggml_build_forward_expand(gf, reduced);
+    windows_peak_bytes = std::max(windows_peak_bytes, layer_bytes - windows_base_bytes);
+    layer_bytes = windows_base_bytes + windows_peak_bytes;
+    } // windows
 }
 
 ggml_tensor * llm_graph_context::build_attn_mha(

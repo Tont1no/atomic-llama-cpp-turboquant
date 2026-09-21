@@ -124,6 +124,23 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // number of attention cells the sequence occupies; -1 when the memory
+    // type does not track cells (recurrent-only). A PyramidKV C1 paged
+    // selection frees cells, so this can be below the position count.
+    virtual int64_t seq_n_cells(llama_seq_id seq_id) const { (void) seq_id; return -1; }
+
+    // positions the sequence occupies (ascending), at most cap; -1 when untracked
+    virtual int32_t seq_positions(llama_seq_id seq_id, llama_pos * pos, int32_t cap) const {
+        (void) seq_id; (void) pos; (void) cap; return -1;
+    }
+
+    // drop every attention cell of the sequence whose position is not in the
+    // ascending list (mirrors a PyramidKV C1 paged selection onto a plain
+    // cache, e.g. an MTP/DFlash draft context). false when unsupported.
+    virtual bool seq_keep_positions(llama_seq_id seq_id, const llama_pos * pos, int32_t n) {
+        (void) seq_id; (void) pos; (void) n; return false;
+    }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

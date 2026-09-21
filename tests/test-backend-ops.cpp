@@ -7595,7 +7595,115 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
             q_meta, k_list, k_list_len, 1.0f/sqrtf((float) d), logit_softcap);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
         ggml_set_name(out, "pg_out");
-        return out;
+        if (perf_only) {
+            return out;
+        }
+        // Correctness: the graph output is paged - naive host reference, so a
+        // shared misreading of the list layout in the CPU and CUDA kernels
+        // cannot hide behind backend agreement.
+        ggml_tensor * ref = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nh, nq, 1);
+        ggml_set_name(ref, "pg_ref");
+        ggml_tensor * diff = ggml_sub(ctx, out, ref);
+        ggml_set_name(diff, "pg_diff");
+        return diff;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (perf_only) {
+            return test_case::err(a, b, n);
+        }
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+                return INFINITY;
+            }
+            max_abs = std::max(max_abs, (double) fabsf(a[i]));
+            max_abs = std::max(max_abs, (double) fabsf(b[i]));
+        }
+        return max_abs;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    void build_host_reference(ggml_context * ctx) {
+        auto find_tensor = [&](const char * name) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                if (strcmp(t->name, name) == 0) {
+                    return t;
+                }
+            }
+            return (ggml_tensor *) nullptr;
+        };
+        ggml_tensor * q = find_tensor("pg_q");
+        ggml_tensor * k_cold = find_tensor("pg_k_cold");
+        ggml_tensor * v_cold = find_tensor("pg_v_cold");
+        ggml_tensor * k_hot = find_tensor("pg_k_hot");
+        ggml_tensor * v_hot = find_tensor("pg_v_hot");
+        ggml_tensor * q_meta = find_tensor("pg_q_meta");
+        ggml_tensor * k_list = find_tensor("pg_k_list");
+        ggml_tensor * k_list_len = find_tensor("pg_k_list_len");
+        ggml_tensor * ref = find_tensor("pg_ref");
+        GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len && ref);
+        auto get_bytes = [](const ggml_tensor * t) {
+            std::vector<uint8_t> bytes(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
+            return bytes;
+        };
+        const auto qb = get_bytes(q), kcb = get_bytes(k_cold), vcb = get_bytes(v_cold);
+        const auto khb = get_bytes(k_hot), vhb = get_bytes(v_hot);
+        const auto mb = get_bytes(q_meta), lb = get_bytes(k_list), lenb = get_bytes(k_list_len);
+        const ggml_to_float_t to_float = ggml_get_type_traits(GGML_TYPE_TURBO4_0)->to_float;
+        const int32_t * meta = (const int32_t *) mb.data();
+        const int32_t * lists = (const int32_t *) lb.data();
+        const int32_t * lens = (const int32_t *) lenb.data();
+        std::vector<float> out(ggml_nelements(ref), 0.0f);
+        std::vector<float> kf(d), vf(d);
+        const float scale = 1.0f/sqrtf((float) d);
+        for (int64_t token = 0; token < nq; ++token) {
+            const int32_t q_pos = meta[2*token], q_seq = meta[2*token + 1];
+            for (int64_t head = 0; head < nh; ++head) {
+                const int64_t kv_head = head/(nh/nkv);
+                const float * qrow = (const float *) (qb.data() + token*q->nb[1] + head*q->nb[2]);
+                std::vector<double> acc(d, 0.0);
+                double M = -INFINITY, S = 0.0;
+                if (q_seq >= 0 && q_seq < nseq) {
+                    const int64_t n = std::min<int64_t>(lens[kv_head + nkv*q_seq], list_len);
+                    const int32_t * list = lists + 2*list_len*(kv_head + nkv*q_seq);
+                    for (int64_t i = 0; i < n; ++i) {
+                        const int32_t code = list[2*i], pos = list[2*i + 1];
+                        if (code < 0 || pos < 0 || q_pos < pos) {
+                            continue;
+                        }
+                        const bool hot = (code & 0x40000000) != 0;
+                        const int64_t row = code & 0x3fffffff;
+                        if (row >= (hot ? n_hot : n_arena)) {
+                            continue;
+                        }
+                        if (hot) {
+                            const ggml_fp16_t * kh = (const ggml_fp16_t *) (khb.data() + row*k_hot->nb[1] + kv_head*k_hot->nb[2]);
+                            const ggml_fp16_t * vh = (const ggml_fp16_t *) (vhb.data() + row*v_hot->nb[1] + kv_head*v_hot->nb[2]);
+                            for (int64_t e = 0; e < d; ++e) { kf[e] = ggml_fp16_to_fp32(kh[e]); vf[e] = ggml_fp16_to_fp32(vh[e]); }
+                        } else {
+                            to_float(kcb.data() + row*k_cold->nb[1] + kv_head*k_cold->nb[2], kf.data(), d);
+                            to_float(vcb.data() + row*v_cold->nb[1] + kv_head*v_cold->nb[2], vf.data(), d);
+                        }
+                        double dot = 0.0;
+                        for (int64_t e = 0; e < d; ++e) { dot += (double) qrow[e]*kf[e]; }
+                        double score = dot*scale;
+                        if (logit_softcap != 0.0f) { score = logit_softcap*tanh(score/logit_softcap); }
+                        const double M_new = std::max(M, score);
+                        const double old_scale = S == 0.0 ? 0.0 : exp(M - M_new);
+                        const double w = exp(score - M_new);
+                        for (int64_t e = 0; e < d; ++e) { acc[e] = acc[e]*old_scale + vf[e]*w; }
+                        S = S*old_scale + w;
+                        M = M_new;
+                    }
+                }
+                float * dst = out.data() + d*(head + nh*token);
+                for (int64_t e = 0; e < d; ++e) { dst[e] = S == 0.0 ? 0.0f : (float) (acc[e]/S); }
+            }
+        }
+        ggml_backend_tensor_set(ref, out.data(), 0, out.size()*sizeof(float));
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -7650,9 +7758,12 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
-            } else {
+            } else if (strcmp(t->name, "pg_ref") != 0 && strcmp(t->name, "pg_diff") != 0) {
                 init_tensor_uniform(t, -1.0f, 1.0f);
             }
+        }
+        if (!perf_only) {
+            build_host_reference(ctx);
         }
     }
 };

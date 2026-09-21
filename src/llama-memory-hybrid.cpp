@@ -178,6 +178,19 @@ llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
 }
 
+int64_t llama_memory_hybrid::seq_n_cells(llama_seq_id seq_id) const {
+    return mem_attn->seq_n_cells(seq_id);
+}
+
+int32_t llama_memory_hybrid::seq_positions(llama_seq_id seq_id, llama_pos * pos, int32_t cap) const {
+    return mem_attn->seq_positions(seq_id, pos, cap);
+}
+
+bool llama_memory_hybrid::seq_keep_positions(llama_seq_id seq_id, const llama_pos * pos, int32_t n) {
+    // the recurrent state is a single slot per sequence and stays as it is
+    return mem_attn->seq_keep_positions(seq_id, pos, n);
+}
+
 llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     // the max of the total cache is the min of the two caches' max values
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));

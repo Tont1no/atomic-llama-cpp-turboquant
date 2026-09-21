@@ -859,6 +859,31 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Number of attention cells the sequence occupies, or -1 when the memory
+    // does not track cells. A PyramidKV C1 paged selection frees cells, so this
+    // can be smaller than the number of resident positions.
+    LLAMA_API int64_t llama_memory_seq_n_cells(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Positions the sequence occupies, ascending, at most `cap` written to
+    // `pos`. Returns the total count (may exceed cap) or -1 when untracked.
+    LLAMA_API int32_t llama_memory_seq_positions(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos * pos,
+                   int32_t cap);
+
+    // Remove every attention cell of the sequence whose position is not in
+    // the ascending list `pos` (n entries). Mirrors a PyramidKV C1 paged
+    // selection onto a plain cache such as a draft context. false when the
+    // memory does not support cell-wise removal.
+    LLAMA_API bool llama_memory_seq_keep_positions(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+           const llama_pos * pos,
+                   int32_t n);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
