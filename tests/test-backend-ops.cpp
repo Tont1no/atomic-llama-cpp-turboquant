@@ -7529,6 +7529,134 @@ struct test_flash_attn_ext_hybrid : public test_case {
     }
 };
 
+// Paged hybrid attention: each query token walks its sequence's per-KV-head
+// (row_code, position) list over a shared TQ4 arena plus an F16 hot ring.
+// The CPU backend carries the reference implementation, so the standard
+// backend comparison applies; the lists mix cold and hot rows, invalid
+// entries and positions beyond the query.
+struct test_flash_attn_ext_hybrid_paged : public test_case {
+    const int64_t d;
+    const int64_t nh;
+    const int64_t nkv;
+    const int64_t nq;
+    const int64_t n_arena;
+    const int64_t n_hot;
+    const int64_t nseq;
+    const int64_t list_len;
+    const float logit_softcap;
+    const bool perf_only;
+
+    std::string vars() override {
+        return VARS_TO_STR9(d, nh, nkv, nq, n_arena, n_hot, nseq, list_len, logit_softcap);
+    }
+
+    double max_nmse_err() override {
+        return 2e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*nh*nq*list_len*d;
+    }
+
+    test_flash_attn_ext_hybrid_paged(
+            int64_t d = 128,
+            int64_t nh = 8,
+            int64_t nkv = 2,
+            int64_t nq = 3,
+            int64_t n_arena = 64,
+            int64_t n_hot = 16,
+            int64_t nseq = 2,
+            int64_t list_len = 24,
+            float logit_softcap = 0.0f,
+            bool perf_only = false)
+        : d(d), nh(nh), nkv(nkv), nq(nq), n_arena(n_arena), n_hot(n_hot), nseq(nseq),
+          list_len(list_len), logit_softcap(logit_softcap), perf_only(perf_only) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nq, nh, 1);
+        ggml_set_name(q, "pg_q");
+        ggml_tensor * k_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_TURBO4_0, d, n_arena, nkv);
+        ggml_set_name(k_cold, "pg_k_cold");
+        ggml_tensor * v_cold = ggml_new_tensor_3d(ctx, GGML_TYPE_TURBO4_0, d, n_arena, nkv);
+        ggml_set_name(v_cold, "pg_v_cold");
+        ggml_tensor * k_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d, n_hot, nkv);
+        ggml_set_name(k_hot, "pg_k_hot");
+        ggml_tensor * v_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d, n_hot, nkv);
+        ggml_set_name(v_hot, "pg_v_hot");
+        ggml_tensor * q_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, nq);
+        ggml_set_name(q_meta, "pg_q_meta");
+        ggml_tensor * k_list = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, list_len, nkv, nseq);
+        ggml_set_name(k_list, "pg_k_list");
+        ggml_tensor * k_list_len = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nkv, nseq);
+        ggml_set_name(k_list_len, "pg_k_list_len");
+
+        ggml_tensor * out = ggml_flash_attn_ext_hybrid_paged(ctx, q, k_cold, v_cold, k_hot, v_hot,
+            q_meta, k_list, k_list_len, 1.0f/sqrtf((float) d), logit_softcap);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "pg_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(0x50414745u + (uint32_t) (d + nh*7 + nseq*13 + list_len*17));
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pg_q_meta") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (int64_t query = 0; query < nq; ++query) {
+                    // spread the queries over the sequences; positions land
+                    // inside the list range so some entries are causally
+                    // hidden and some visible. One query names no sequence.
+                    const int32_t seq = perf_only ? (int32_t) (query % nseq) :
+                        (query == nq - 1 && nq > 2 ? -1 : (int32_t) (query % nseq));
+                    values[2*query + 0] = (int32_t) (list_len/2 + query*3);
+                    values[2*query + 1] = seq;
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pg_k_list") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t), -1);
+                for (int64_t seq = 0; seq < nseq; ++seq) {
+                    for (int64_t head = 0; head < nkv; ++head) {
+                        int32_t * list = values.data() + 2*list_len*(head + nkv*seq);
+                        // rows of this sequence: a disjoint slice of the arena
+                        const int64_t arena_begin = (n_arena*seq)/nseq;
+                        const int64_t arena_end = (n_arena*(seq + 1))/nseq;
+                        int32_t position = 0;
+                        for (int64_t i = 0; i < list_len; ++i) {
+                            int32_t code;
+                            const int64_t roll = perf_only ? (i % 8) : (int64_t) (rng() % 10);
+                            if (roll == 7 && n_hot > 0) {
+                                code = 0x40000000 | (int32_t) ((head*3 + i + seq) % n_hot);
+                            } else if (!perf_only && roll == 8) {
+                                code = -1; // freed entry
+                            } else if (!perf_only && roll == 9) {
+                                code = (int32_t) n_arena + 5; // beyond the arena: skipped
+                            } else {
+                                code = (int32_t) (arena_begin + (i*(head + 2) + seq) % std::max<int64_t>(1, arena_end - arena_begin));
+                            }
+                            list[2*i + 0] = code;
+                            list[2*i + 1] = (!perf_only && i == 2) ? -1 : position;
+                            position += 1 + (int32_t) (head & 1);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pg_k_list_len") == 0) {
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (int64_t seq = 0; seq < nseq; ++seq) {
+                    for (int64_t head = 0; head < nkv; ++head) {
+                        // lists are ragged: the last sequence walks a shorter one
+                        values[head + nkv*seq] = (int32_t) (seq == nseq - 1 && !perf_only ? list_len - 3 : list_len);
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
 // Direct hybrid FA performance root.  The correctness cases above retain the
 // dense CPU reference and SUB output; this case returns hy_split itself so the
 // measured graph contains only the hybrid attention op.
@@ -10447,6 +10575,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 32, 4, 4, 4864, 1024, 1, true,  false, false));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 4, 1280, 1024, 1, true,  false, true));
 
+    // Paged lists (multi-sequence): small ragged lists with freed and
+    // out-of-range entries, D128 and D256, the verification width, long
+    // lists that need the key split, and a query that names no sequence.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 3, 64, 16, 2, 24));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 8, 4, 4, 96, 8, 3, 40, 30.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 16, 2, 1, 4096, 1024, 4, 2100));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 4, 8192, 1024, 8, 2100));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 4, 1, 5, 32, 4, 1, 7));
+
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -10881,6 +11018,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Embedded-MTP verification batch (depth 3): 4 query rows per head.
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf(32, 4,  4864, 1024, 4));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_perf(32, 4, 32768, 1024, 4));
+    // Paged lists: 8 users with 2K-row lists on a 256K arena (Qwen 27B
+    // geometry), single token and the verification width.
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 8, 262144, 1024, 8, 2048, 0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 32, 262144, 1024, 8, 2048, 0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 1, 262144, 1024, 1, 2048, 0.0f, true));
 
     // TURBO4_0 KV: decode (NQ=1, direct vector kernel) against prefill tiles
     // (NQ=256, MMA-F16 over a transient F16 copy) at the VibeThinker D128/2-KV-head

@@ -5621,6 +5621,65 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid(
 }
 
 
+struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_cold,
+        struct ggml_tensor  * v_cold,
+        struct ggml_tensor  * k_hot,
+        struct ggml_tensor  * v_hot,
+        struct ggml_tensor  * q_meta,
+        struct ggml_tensor  * k_list,
+        struct ggml_tensor  * k_list_len,
+        float                 scale,
+        float                 logit_softcap) {
+    GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
+    GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->nb[0] == sizeof(float));
+    GGML_ASSERT(k_cold->nb[0] == ggml_type_size(k_cold->type) && v_cold->nb[0] == ggml_type_size(v_cold->type));
+    GGML_ASSERT(k_hot->nb[0] == sizeof(ggml_fp16_t) && v_hot->nb[0] == sizeof(ggml_fp16_t));
+    GGML_ASSERT(q->ne[0] == 128 || q->ne[0] == 256);
+    GGML_ASSERT(q->ne[0] == k_cold->ne[0] && q->ne[0] == v_cold->ne[0]);
+    GGML_ASSERT(q->ne[0] == k_hot->ne[0] && q->ne[0] == v_hot->ne[0]);
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(k_cold->ne[1] > 0 && k_hot->ne[1] > 0);
+    GGML_ASSERT(k_cold->ne[1] == v_cold->ne[1] && k_hot->ne[1] == v_hot->ne[1]);
+    GGML_ASSERT(k_cold->ne[2] > 0 && k_cold->ne[2] == v_cold->ne[2]);
+    GGML_ASSERT(k_hot->ne[2] == v_hot->ne[2] && k_cold->ne[2] == k_hot->ne[2]);
+    GGML_ASSERT(q->ne[2] > 0 && q->ne[2] % k_cold->ne[2] == 0);
+    GGML_ASSERT(ggml_is_contiguous(q_meta) && ggml_is_contiguous(k_list) && ggml_is_contiguous(k_list_len));
+    GGML_ASSERT(q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[1]);
+    GGML_ASSERT(k_list->ne[0] == 2 && k_list->ne[1] > 0 && k_list->ne[2] == k_cold->ne[2] && k_list->ne[3] > 0);
+    GGML_ASSERT(k_list_len->ne[0] == k_cold->ne[2] && k_list_len->ne[1] == k_list->ne[3]);
+
+    int64_t ne[4] = { v_hot->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 4, 1); // hybrid mode: paged lists
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k_cold;
+    result->src[2] = v_cold;
+    result->src[5] = k_hot;
+    result->src[6] = v_hot;
+    result->src[7] = q_meta;
+    result->src[8] = k_list;
+    result->src[9] = k_list_len;
+
+    return result;
+}
+
+int32_t ggml_flash_attn_ext_hybrid_mode(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 4);
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

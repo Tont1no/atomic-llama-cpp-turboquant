@@ -2462,6 +2462,31 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // Paged hybrid KV attention: every query token attends the rows named
+    // by its own sequence's per-KV-head list instead of a dense [cold, hot]
+    // range. k_list is I32 [2, max_len, n_kv_heads, n_seq]; entry i of a
+    // list is (row_code, position): row_code >= 0 names a cold arena row,
+    // row_code with bit 31 set names a hot ring row (row & 0x7fffffff),
+    // position -1 or > the query position is skipped. k_list_len is I32
+    // [n_kv_heads, n_seq]. q_meta is I32 [2, n_q]: (position, seq index into
+    // the lists). Cold rows are TurboQuant4 [D, arena_rows, n_kv_heads], hot
+    // rows F16 [D, hot_rows, n_kv_heads]; q is [D, n_q, n_q_heads, 1].
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k_cold,
+            struct ggml_tensor  * v_cold,
+            struct ggml_tensor  * k_hot,
+            struct ggml_tensor  * v_hot,
+            struct ggml_tensor  * q_meta,
+            struct ggml_tensor  * k_list,
+            struct ggml_tensor  * k_list_len,
+            float                 scale,
+            float                 logit_softcap);
+
+    // 0: dense hybrid (k_positions per row), 1: paged lists.
+    GGML_API int32_t ggml_flash_attn_ext_hybrid_mode(const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

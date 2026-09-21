@@ -8877,6 +8877,142 @@ static void ggml_compute_forward_flash_attn_ext_hybrid(
     }
 }
 
+// Paged hybrid attention reference (ggml_flash_attn_ext_hybrid_paged): each
+// query token walks its sequence's per-KV-head (row_code, position) list.
+static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q          = dst->src[0];
+    const ggml_tensor * k_cold     = dst->src[1];
+    const ggml_tensor * v_cold     = dst->src[2];
+    const ggml_tensor * k_hot      = dst->src[5];
+    const ggml_tensor * v_hot      = dst->src[6];
+    const ggml_tensor * q_meta     = dst->src[7];
+    const ggml_tensor * k_list     = dst->src[8];
+    const ggml_tensor * k_list_len = dst->src[9];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
+    GGML_ASSERT(q_meta && k_list && k_list_len);
+    GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(q->ne[0] == k_cold->ne[0] && q->ne[0] == k_hot->ne[0]);
+    GGML_ASSERT(q->ne[0] <= 256);
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(q->ne[2] % k_cold->ne[2] == 0);
+    GGML_ASSERT(k_cold->ne[2] == k_hot->ne[2]);
+    GGML_ASSERT(q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[1]);
+    GGML_ASSERT(k_list->ne[0] == 2 && k_list->ne[2] == k_cold->ne[2]);
+    GGML_ASSERT(k_list_len->ne[0] == k_cold->ne[2] && k_list_len->ne[1] == k_list->ne[3]);
+
+    GGML_TENSOR_LOCALS(size_t, nbq, q, nb)
+    GGML_TENSOR_LOCALS(size_t, nbd, dst, nb)
+
+    const int64_t D = q->ne[0];
+    const int64_t n_q_rows = q->ne[1] * q->ne[2];
+    const int64_t n_kv_heads = k_cold->ne[2];
+    const int64_t n_seq = k_list->ne[3];
+    const int64_t max_len = k_list->ne[1];
+    const int64_t q_to_kv = q->ne[2] / n_kv_heads;
+    const int32_t hot_bit = 0x40000000;
+
+    float scale = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t dr = (n_q_rows + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, n_q_rows);
+    const ggml_to_float_t cold_to_float = ggml_get_type_traits(k_cold->type)->to_float;
+    GGML_ASSERT(cold_to_float);
+
+    const int32_t * meta = (const int32_t *) q_meta->data;
+    const int32_t * lists = (const int32_t *) k_list->data;
+    const int32_t * lens = (const int32_t *) k_list_len->data;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iq2 = ir / q->ne[1];
+        const int64_t iq1 = ir - iq2*q->ne[1];
+        const int64_t kv_head = iq2 / q_to_kv;
+
+        float qf[256];
+        float kf[256];
+        float vf[256];
+        float out[256] = {};
+        memcpy(qf, (const char *) q->data + iq1*nbq1 + iq2*nbq2, D*sizeof(float));
+
+        const int32_t q_position = meta[2*iq1 + 0];
+        const int32_t q_seq      = meta[2*iq1 + 1];
+
+        float M = -INFINITY;
+        float S = 0.0f;
+
+        if (q_seq >= 0 && q_seq < n_seq) {
+            const int64_t n_keys = MIN((int64_t) lens[kv_head + n_kv_heads*q_seq], max_len);
+            const int32_t * list = lists + 2*max_len*(kv_head + n_kv_heads*q_seq);
+            for (int64_t ik = 0; ik < n_keys; ++ik) {
+                const int32_t code = list[2*ik + 0];
+                const int32_t key_pos = list[2*ik + 1];
+                if (code < 0 || key_pos < 0 || q_position < key_pos) {
+                    continue;
+                }
+                const bool hot = (code & hot_bit) != 0;
+                const int64_t local_key = code & (hot_bit - 1);
+                const ggml_tensor * kt = hot ? k_hot : k_cold;
+                const ggml_tensor * vt = hot ? v_hot : v_cold;
+                if (local_key >= kt->ne[1]) {
+                    continue;
+                }
+                const char * k_data = (const char *) kt->data + local_key*kt->nb[1] + kv_head*kt->nb[2];
+                const char * v_data = (const char *) vt->data + local_key*vt->nb[1] + kv_head*vt->nb[2];
+                if (hot) {
+                    const ggml_fp16_t * kh = (const ggml_fp16_t *) k_data;
+                    const ggml_fp16_t * vh = (const ggml_fp16_t *) v_data;
+                    for (int64_t d = 0; d < D; ++d) {
+                        kf[d] = GGML_CPU_FP16_TO_FP32(kh[d]);
+                        vf[d] = GGML_CPU_FP16_TO_FP32(vh[d]);
+                    }
+                } else {
+                    cold_to_float(k_data, kf, D);
+                    cold_to_float(v_data, vf, D);
+                }
+
+                float score = 0.0f;
+                for (int64_t d = 0; d < D; ++d) {
+                    score += qf[d] * kf[d];
+                }
+                score *= scale;
+                if (logit_softcap != 0.0f) {
+                    score = logit_softcap*tanhf(score);
+                }
+
+                const float M_new = fmaxf(M, score);
+                const float old_scale = S == 0.0f ? 0.0f : expf(M - M_new);
+                const float weight = expf(score - M_new);
+                for (int64_t d = 0; d < D; ++d) {
+                    out[d] = out[d]*old_scale + vf[d]*weight;
+                }
+                S = S*old_scale + weight;
+                M = M_new;
+            }
+        }
+
+        float * dst_row = (float *) ((char *) dst->data + iq2*nbd1 + iq1*nbd2);
+        const float inv = S == 0.0f ? 0.0f : 1.0f/S;
+        for (int64_t d = 0; d < D; ++d) {
+            dst_row[d] = out[d]*inv;
+        }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9377,7 +9513,11 @@ void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     if (dst->src[5]) {
-        ggml_compute_forward_flash_attn_ext_hybrid(params, dst);
+        if (ggml_flash_attn_ext_hybrid_mode(dst) == 1) {
+            ggml_compute_forward_flash_attn_ext_hybrid_paged(params, dst);
+        } else {
+            ggml_compute_forward_flash_attn_ext_hybrid(params, dst);
+        }
         return;
     }
 

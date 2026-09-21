@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <type_traits>
 
 // One TQ4 element of a cold row. The centroid comes from the warp-resident
 // table (see ggml_cuda_turbo4_centroid_shfl): every lane calls this with the
@@ -464,5 +465,227 @@ void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tenso
             k_positions ? k_positions->ne[2] : 1,
             scale, max_bias, logit_softcap, nullptr, nullptr, 1);
         CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paged hybrid attention (ggml_flash_attn_ext_hybrid_paged).
+//
+// Every query token attends the rows named by its own sequence's per-KV-head
+// list: entry i of list (head, seq) is (row_code, position). A row_code with
+// the hot bit set names a hot F16 ring row, otherwise a cold TurboQuant4
+// arena row. Rows of other sequences never enter the walk, so a decode token
+// of a compacted sequence touches ~2K rows while another sequence's 256K
+// prompt sits in the same arena. One warp per (query row, key split); the
+// merge kernel above reduces the splits.
+// ---------------------------------------------------------------------------
+
+static constexpr int32_t ggml_cuda_hybrid_paged_hot_bit = 0x40000000;
+
+template<bool split_k_path>
+static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
+        const float * q,
+        const char * k_cold,
+        const char * v_cold,
+        const char * k_hot,
+        const char * v_hot,
+        const int32_t * q_meta,      // [2, NQ]: position, seq
+        const int32_t * k_list,      // [2, max_len, NKV_HEADS, NSEQ]
+        const int32_t * k_list_len,  // [NKV_HEADS, NSEQ]
+        float * dst,
+        const int64_t D,
+        const int64_t NQ,
+        const int64_t NQ_HEADS,
+        const int64_t NKV_HEADS,
+        const int64_t NSEQ,
+        const int64_t max_len,
+        const int64_t n_cold_rows,
+        const int64_t n_hot_rows,
+        const size_t q_nb1,
+        const size_t q_nb2,
+        const size_t dst_nb1,
+        const size_t dst_nb2,
+        const size_t kc_nb1,
+        const size_t kc_nb2,
+        const size_t vc_nb1,
+        const size_t vc_nb2,
+        const size_t kh_nb1,
+        const size_t kh_nb2,
+        const size_t vh_nb1,
+        const size_t vh_nb2,
+        const float scale,
+        const float logit_softcap,
+        float * partial_o,
+        float2 * partial_meta,
+        const int split_k) {
+    const int64_t blocks_per_row = split_k_path ? split_k : 1;
+    const int64_t block = (int64_t) blockIdx.x;
+    const int64_t row = block / blocks_per_row;
+    const int64_t split = block % blocks_per_row;
+    const int64_t rows = NQ*NQ_HEADS;
+    if (row >= rows) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const float lane_centroid = ggml_cuda_turbo4_centroid_lane();
+
+    // row = iq2*NQ + iq1 (head-major, like the dense kernel with NSEQ == 1)
+    const int64_t iq2 = row/NQ;
+    const int64_t iq1 = row - iq2*NQ;
+    const int64_t kv_head = iq2/(NQ_HEADS/NKV_HEADS);
+
+    const int32_t q_position = q_meta[2*iq1 + 0];
+    const int32_t q_seq      = q_meta[2*iq1 + 1];
+
+    float output[8] = {};
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + iq2*q_nb2);
+
+    if (q_seq >= 0 && q_seq < NSEQ) {
+        const int64_t n_keys = min((int64_t) k_list_len[kv_head + NKV_HEADS*q_seq], max_len);
+        const int32_t * list = k_list + 2*max_len*(kv_head + NKV_HEADS*q_seq);
+        const int64_t key_begin = split_k_path ? (n_keys*split)/split_k : 0;
+        const int64_t key_end   = split_k_path ? (n_keys*(split + 1))/split_k : n_keys;
+        for (int64_t key_index = key_begin; key_index < key_end; ++key_index) {
+            const int32_t code = list[2*key_index + 0];
+            const int32_t key_position = list[2*key_index + 1];
+            if (code < 0 || key_position < 0 || q_position < key_position) {
+                continue;
+            }
+            const bool hot = (code & ggml_cuda_hybrid_paged_hot_bit) != 0;
+            const int64_t local_key = code & (ggml_cuda_hybrid_paged_hot_bit - 1);
+            if (local_key >= (hot ? n_hot_rows : n_cold_rows)) {
+                continue;
+            }
+            const char * k_row = hot
+                ? k_hot + local_key*kh_nb1 + kv_head*kh_nb2
+                : k_cold + local_key*kc_nb1 + kv_head*kc_nb2;
+            const char * v_row = hot
+                ? v_hot + local_key*vh_nb1 + kv_head*vh_nb2
+                : v_cold + local_key*vc_nb1 + kv_head*vc_nb2;
+
+            float dot = 0.0f;
+            for (int64_t d = lane; d < D; d += 32) {
+                const float key = hot
+                    ? __half2float(*(const half *) (k_row + d*sizeof(half)))
+                    : ggml_cuda_hybrid_turbo4_value(k_row, (int) d, lane_centroid);
+                dot += q_row[d]*key;
+            }
+            dot = ggml_cuda_hybrid_warp_sum(dot);
+            float score = dot*scale;
+            if (logit_softcap != 0.0f) {
+                score = logit_softcap*tanhf(score);
+            }
+
+            const float M_new = fmaxf(M, score);
+            const float old_scale = S == 0.0f ? 0.0f : expf(M - M_new);
+            const float weight = expf(score - M_new);
+            for (int64_t d = lane; d < D; d += 32) {
+                const float value = hot
+                    ? __half2float(*(const half *) (v_row + d*sizeof(half)))
+                    : ggml_cuda_hybrid_turbo4_value(v_row, (int) d, lane_centroid);
+                output[d/32] = output[d/32]*old_scale + value*weight;
+            }
+            S = S*old_scale + weight;
+            M = M_new;
+        }
+    }
+
+    if constexpr (!split_k_path) {
+        float * dst_row = (float *) ((char *) dst + iq2*dst_nb1 + iq1*dst_nb2);
+        const float inv = S == 0.0f ? 0.0f : 1.0f/S;
+        for (int64_t d = lane; d < D; d += 32) {
+            dst_row[d] = output[d/32]*inv;
+        }
+    } else {
+        float * partial_row = partial_o + (row*split_k + split)*D;
+        for (int64_t d = lane; d < D; d += 32) {
+            partial_row[d] = output[d/32];
+        }
+        if (lane == 0) {
+            partial_meta[row*split_k + split] = make_float2(M, S);
+        }
+    }
+}
+
+void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k_cold = dst->src[1];
+    const ggml_tensor * v_cold = dst->src[2];
+    const ggml_tensor * k_hot = dst->src[5];
+    const ggml_tensor * v_hot = dst->src[6];
+    const ggml_tensor * q_meta = dst->src[7];
+    const ggml_tensor * k_list = dst->src[8];
+    const ggml_tensor * k_list_len = dst->src[9];
+
+    GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
+    GGML_ASSERT(q->ne[0] == k_cold->ne[0] && (q->ne[0] == 128 || q->ne[0] == 256));
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(k_hot->nb[0] == sizeof(half) && v_hot->nb[0] == sizeof(half));
+    GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(q_meta) && ggml_is_contiguous(k_list) && ggml_is_contiguous(k_list_len));
+    GGML_ASSERT(q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[1]);
+    GGML_ASSERT(k_list->ne[0] == 2 && k_list->ne[2] == k_cold->ne[2]);
+    GGML_ASSERT(k_list_len->ne[0] == k_cold->ne[2] && k_list_len->ne[1] == k_list->ne[3]);
+
+    const uint64_t n_rows = (uint64_t) q->ne[1]*q->ne[2];
+    GGML_ASSERT(n_rows > 0 && n_rows <= std::numeric_limits<unsigned int>::max());
+
+    float scale = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    // The split count follows the longest list any query in this batch can
+    // walk; short lists simply leave splits empty (the merge handles S == 0).
+    const int64_t max_len = k_list->ne[1];
+    const int split_k = ggml_cuda_hybrid_split_count(max_len, n_rows, q->ne[0]);
+
+    const auto launch = [&](auto split_tag, float * partial_o, float2 * partial_meta) {
+        constexpr bool split_path = decltype(split_tag)::value;
+        const unsigned int blocks = (unsigned int) (split_path ? n_rows*split_k : n_rows);
+        ggml_cuda_flash_attn_ext_hybrid_paged_kernel<split_path><<<blocks, 32, 0, ctx.stream()>>>(
+            (const float *) q->data,
+            (const char *) k_cold->data, (const char *) v_cold->data,
+            (const char *) k_hot->data, (const char *) v_hot->data,
+            (const int32_t *) q_meta->data, (const int32_t *) k_list->data, (const int32_t *) k_list_len->data,
+            (float *) dst->data,
+            q->ne[0], q->ne[1], q->ne[2], k_cold->ne[2], k_list->ne[3], max_len,
+            k_cold->ne[1], k_hot->ne[1],
+            q->nb[1], q->nb[2], dst->nb[1], dst->nb[2],
+            k_cold->nb[1], k_cold->nb[2], v_cold->nb[1], v_cold->nb[2],
+            k_hot->nb[1], k_hot->nb[2], v_hot->nb[1], v_hot->nb[2],
+            scale, logit_softcap, partial_o, partial_meta, split_path ? split_k : 1);
+        CUDA_CHECK(cudaGetLastError());
+    };
+
+    if (split_k > 1) {
+        const uint64_t partial_rows = n_rows*(uint64_t) split_k;
+        ggml_cuda_pool & pool = ctx.pool();
+        ggml_cuda_pool_alloc<float> partial_o_alloc(pool, (size_t) partial_rows*(size_t) q->ne[0]);
+        ggml_cuda_pool_alloc<float2> partial_meta_alloc(pool, (size_t) partial_rows);
+        launch(std::true_type{}, partial_o_alloc.get(), partial_meta_alloc.get());
+        const dim3 merge_blocks((unsigned int) n_rows, 1, 1);
+        if (q->ne[0] == 128) {
+            ggml_cuda_flash_attn_ext_hybrid_merge_kernel<128><<<merge_blocks, 32, 0, ctx.stream()>>>(
+                partial_o_alloc.get(), partial_meta_alloc.get(), nullptr,
+                (float *) dst->data, q->ne[1], q->ne[2], 1, dst->nb[1], dst->nb[2], dst->nb[3], split_k);
+        } else {
+            ggml_cuda_flash_attn_ext_hybrid_merge_kernel<256><<<merge_blocks, 32, 0, ctx.stream()>>>(
+                partial_o_alloc.get(), partial_meta_alloc.get(), nullptr,
+                (float *) dst->data, q->ne[1], q->ne[2], 1, dst->nb[1], dst->nb[2], dst->nb[3], split_k);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        launch(std::false_type{}, nullptr, nullptr);
     }
 }

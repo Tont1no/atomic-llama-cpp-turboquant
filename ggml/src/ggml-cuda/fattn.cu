@@ -375,6 +375,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
     BEST_FATTN_KERNEL_HYBRID  = 500,
+    BEST_FATTN_KERNEL_HYBRID_PAGED = 501,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -415,6 +416,34 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V_hot = dst->src[6];
     const ggml_tensor * q_pos = dst->src[7];
     const ggml_tensor * k_pos = dst->src[8];
+
+    if (K_hot != nullptr && ggml_flash_attn_ext_hybrid_mode(dst) == 1) {
+        // Paged lists: q_pos is q_meta [2, n_q], k_pos is k_list
+        // [2, max_len, n_kv_heads, n_seq], src[9] is k_list_len [n_kv_heads, n_seq].
+        const ggml_tensor * k_len = dst->src[9];
+        if (Q == nullptr || K == nullptr || V == nullptr || V_hot == nullptr ||
+                q_pos == nullptr || k_pos == nullptr || k_len == nullptr ||
+                dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
+                K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
+                K_hot->type != GGML_TYPE_F16 || V_hot->type != GGML_TYPE_F16 ||
+                q_pos->type != GGML_TYPE_I32 || k_pos->type != GGML_TYPE_I32 || k_len->type != GGML_TYPE_I32 ||
+                !ggml_is_contiguous(q_pos) || !ggml_is_contiguous(k_pos) || !ggml_is_contiguous(k_len) ||
+                (Q->ne[0] != 128 && Q->ne[0] != 256) || Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] ||
+                Q->ne[0] != K_hot->ne[0] || Q->ne[0] != V_hot->ne[0] || Q->ne[3] != 1 ||
+                K->ne[1] <= 0 || K_hot->ne[1] <= 0 || K->ne[1] != V->ne[1] || K_hot->ne[1] != V_hot->ne[1] ||
+                K->ne[2] <= 0 || K->ne[2] != V->ne[2] || K->ne[2] != K_hot->ne[2] || K_hot->ne[2] != V_hot->ne[2] ||
+                Q->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 ||
+                q_pos->ne[0] != 2 || q_pos->ne[1] != Q->ne[1] ||
+                k_pos->ne[0] != 2 || k_pos->ne[1] <= 0 || k_pos->ne[2] != K->ne[2] || k_pos->ne[3] <= 0 ||
+                k_len->ne[0] != K->ne[2] || k_len->ne[1] != k_pos->ne[3] ||
+                Q->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+                K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type) ||
+                K_hot->nb[0] != sizeof(ggml_fp16_t) || V_hot->nb[0] != sizeof(ggml_fp16_t) ||
+                mask != nullptr || sinks != nullptr) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_HYBRID_PAGED;
+    }
 
     if (K_hot != nullptr || V_hot != nullptr || q_pos != nullptr || k_pos != nullptr) {
         const bool positions_ok = (q_pos == nullptr && k_pos == nullptr) ||
@@ -681,6 +710,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
         case BEST_FATTN_KERNEL_HYBRID:
+        case BEST_FATTN_KERNEL_HYBRID_PAGED:
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
@@ -708,6 +738,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_HYBRID:
             ggml_cuda_flash_attn_ext_hybrid(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_HYBRID_PAGED:
+            ggml_cuda_flash_attn_ext_hybrid_paged(ctx, dst);
             break;
     }
 }
