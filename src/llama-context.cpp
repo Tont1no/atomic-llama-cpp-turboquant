@@ -558,6 +558,15 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * LLAMA_GRAPH_POOL = getenv("LLAMA_GRAPH_POOL");
+        if (LLAMA_GRAPH_POOL) {
+            const int requested = atoi(LLAMA_GRAPH_POOL);
+            graph_pool_size = requested < 1 ? 1 : requested > 4 ? 4 : (uint32_t) requested;
+            if (graph_pool_size > 1) {
+                LLAMA_LOG_INFO("%s: graph pool = %u entries\n", __func__, graph_pool_size);
+            }
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -942,13 +951,18 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    // the scheduler and previous-graph result of the active pair; a spare pair
+    // (graph pool) is created the same way further down
+    const auto create_current = [&]() {
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (c1_kv != nullptr) {
-        c1_kv->pyramidkv_c1_graph_reset_complete();
-    }
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        if (c1_kv != nullptr) {
+            c1_kv->pyramidkv_c1_graph_reset_complete();
+        }
+    };
+    create_current();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -981,6 +995,8 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    // reserve the active pair for every worst case; repeated per graph pool entry below
+    const auto reserve_current = [&]() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(),
@@ -1043,6 +1059,19 @@ void llama_context::sched_reserve() {
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
+    }
+    };
+
+    reserve_current();
+    graph_pool_spare.clear();
+    graph_pool_next = 0;
+    for (uint32_t i = 1; i < graph_pool_size; ++i) {
+        graph_pool_entry spare;
+        std::swap(spare.sched, sched);
+        std::swap(spare.res, gf_res_prev);
+        create_current();
+        reserve_current();
+        graph_pool_spare.push_back(std::move(spare));
     }
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1236,6 +1265,34 @@ bool llama_context::pyramidkv_c1_apply_pending_paged() {
     return true;
 }
 
+void llama_context::graph_pool_select(const llm_graph_params & probe) {
+    // the active pair fits: nothing to do
+    if (gf_res_prev->can_reuse(probe)) {
+        return;
+    }
+    // a spare fits: make it active (the displaced pair keeps its graph)
+    for (auto & spare : graph_pool_spare) {
+        if (spare.res->can_reuse(probe)) {
+            std::swap(spare.sched, sched);
+            std::swap(spare.res, gf_res_prev);
+            return;
+        }
+    }
+    // nothing fits: rebuild into the spare used longest ago, so the active
+    // graph survives the next alternation
+    auto & victim = graph_pool_spare[graph_pool_next % graph_pool_spare.size()];
+    graph_pool_next++;
+    std::swap(victim.sched, sched);
+    std::swap(victim.res, gf_res_prev);
+}
+
+void llama_context::graph_pool_reset_all() {
+    gf_res_prev->reset();
+    for (auto & spare : graph_pool_spare) {
+        spare.res->reset();
+    }
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -1270,7 +1327,7 @@ bool llama_context::memory_update(bool optimize) {
 
         std::string error;
         // Drop graph handles before compaction synchronizes and replaces the KV buffers.
-        gf_res_prev->reset();
+        graph_pool_reset_all();
         gf_res_reserve->reset();
         try {
             if (!kv->pyramidkv_c1_compact(this, pyramidkv_c1_pending, error)) {
@@ -1311,7 +1368,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        graph_pool_reset_all();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2000,6 +2057,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 #endif
+
+    if (!graph_pool_spare.empty() && !graph_reuse_disable) {
+        graph_pool_select(graph_params(gf_res_prev.get(), ubatch, mctx, gtype, pyramidkv_observer));
+    }
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();

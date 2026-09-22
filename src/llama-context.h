@@ -390,6 +390,21 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // Graph pool (LLAMA_GRAPH_POOL=N, default 1): spare (scheduler, previous
+    // graph) pairs. Ubatch shapes that alternate - paged C1 decode next to a
+    // local prefill, or two prompts prefilling - keep their built graphs and
+    // CUDA graphs instead of rebuilding every switch. Each spare owns its own
+    // compute buffers.
+    struct graph_pool_entry {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::vector<graph_pool_entry> graph_pool_spare;
+    uint32_t graph_pool_size = 1;
+    uint32_t graph_pool_next = 0;
+    void graph_pool_select(const llm_graph_params & probe);
+    void graph_pool_reset_all();
+
     // Replaced on every completed C1 graph.  memory_update() consumes it at
     // the synchronized point before reserving the next graph.
     std::vector<llama_pyramidkv_c1_layer_selection> pyramidkv_c1_pending;
