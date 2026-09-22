@@ -432,7 +432,11 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
         GGML_TYPE_TURBO3_5 = 44, // Experimental KV: WHT128 + 64x4-bit/64x3-bit payload
-        GGML_TYPE_COUNT   = 45,
+        // PrismML weight type: Q2_0's block layout at group size 128 (upstream
+        // Q2_0 is group 64). Its id comes from the prism fork so Bonsai GGUFs
+        // read back unchanged; 45..141 stay unused and type_traits is sparse.
+        GGML_TYPE_PQ2_0   = 142,
+        GGML_TYPE_COUNT   = 143,
     };
 
     // precision
@@ -479,6 +483,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0 = 128, // except 1d tensors (PrismML group-128 Q2_0)
     };
 
     // available tensor operations:

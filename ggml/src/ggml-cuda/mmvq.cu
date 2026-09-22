@@ -292,6 +292,11 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // PQ2_0 has no quantised tile kernels here yet, so it takes the
+    // dequantise + cuBLAS route instead of aborting in the dispatcher.
+    if (type == GGML_TYPE_PQ2_0) {
+        return false;
+    }
     if (cc == GGML_CUDA_CC_BLACKWELL) {
         // Experimental dense-batch crossover. Unset preserves the tuned defaults.
         static const int max_batch = []() {
