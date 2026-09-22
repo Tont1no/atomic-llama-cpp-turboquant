@@ -842,9 +842,12 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
     // walk; short lists simply leave splits empty (the merge handles S == 0).
     const int64_t max_len = k_list->ne[1];
     const int split_k = ggml_cuda_hybrid_split_count(max_len, n_rows, q->ne[0]);
+    // On by default: Qwen3.5 27B paged decode with 4 users x MTP3 measured
+    // 244 -> 269 tok/s and 8 users plain 199 -> 216 (64K prompts, RTX 5090),
+    // bit-identical results. GGML_CUDA_PAGED_GQA6=0 restores the per-row path.
     static const bool gqa6_enabled = []() {
         const char * value = std::getenv("GGML_CUDA_PAGED_GQA6");
-        return value && value[0] == '1' && value[1] == '\0';
+        return !(value && value[0] == '0' && value[1] == '\0');
     }();
     // A single query exposes too few groups on large GPUs; retain its baseline.
     const bool use_gqa6 = gqa6_enabled && q->ne[1] >= 8 &&
