@@ -297,6 +297,12 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    // Hadamard transforms this context's graphs consult: the model's own plus
+    // those of a target whose tensors a drafter borrows via ctx_other. Keyed by
+    // tensor pointer, so borrowed target tensors stay distinct.
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
