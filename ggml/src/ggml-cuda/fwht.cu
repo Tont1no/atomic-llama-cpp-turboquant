@@ -137,6 +137,11 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
         case 512:
             ggml_cuda_kernel_launch(fwht_cuda<512>, launch_params, src_d, dst_d, rows, scale);
             return true;
+        case 1024:
+            // prism.hadamard weight folding (Bonsai 2) rotates in 1024 blocks;
+            // 32 values per lane still fit in registers
+            ggml_cuda_kernel_launch(fwht_cuda<1024>, launch_params, src_d, dst_d, rows, scale);
+            return true;
         default:
             return false;
     }
