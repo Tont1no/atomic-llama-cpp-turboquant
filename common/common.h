@@ -331,6 +331,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // Internal opt-in after validating that every drafter layer uses STANDARD SWA.
+    // Zero preserves full-history drafters and all existing server defaults.
+    uint32_t swa_history_window = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

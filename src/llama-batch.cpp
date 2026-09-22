@@ -512,7 +512,8 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail,
+        const std::function<bool(llama_seq_id)> & seq_filter, bool single_seq) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -526,6 +527,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (used[i]) {
+            continue;
+        }
+
+        if (seq_filter && !std::all_of(batch.seq_id[i], batch.seq_id[i] + batch.n_seq_id[i], seq_filter)) {
             continue;
         }
 
@@ -549,7 +554,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
             last_seq_id = batch.seq_id[i][0];
 
-            if (cur_seq_set.size() > n_ubatch) {
+            if (single_seq || cur_seq_set.size() > n_ubatch) {
                 break;
             }
         }
@@ -611,7 +616,7 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     //   n_keep_tail tokens remaining for a future ubatch, so that the trailing n_keep_tail tokens
     //   of each seq are never split across ubatches
     if (n_keep_tail > 0) {
-        GGML_ASSERT(n_ubatch > n_keep_tail);
+        GGML_ASSERT(n_ubatch >= n_keep_tail);
 
         auto n_remaining = [&](uint32_t s) {
             return (uint32_t) (seq_set_map[cur_seq_set[s]].size() - cur_idx[s]);

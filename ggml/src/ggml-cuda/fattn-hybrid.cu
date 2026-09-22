@@ -21,6 +21,17 @@ static __device__ __forceinline__ float ggml_cuda_hybrid_turbo4_value(
     return ggml_cuda_turbo4_centroid_shfl(code, lane_centroid) * __half2float(block->norm);
 }
 
+// Both packed formats share the same rotation, causal sources and reductions.
+template<ggml_type type>
+static __device__ __forceinline__ float ggml_cuda_hybrid_turbo_value(
+        const char * row, const int index, const float lane_centroid) {
+    if constexpr (type == GGML_TYPE_TURBO3_5) {
+        return ggml_cuda_turbo35_dequant_value_lane(row, index, lane_centroid);
+    } else {
+        return ggml_cuda_hybrid_turbo4_value(row, index, lane_centroid);
+    }
+}
+
 static __device__ __forceinline__ float ggml_cuda_hybrid_warp_sum(float value) {
     constexpr unsigned int warp_mask = 0xffffffffu;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -41,7 +52,7 @@ static __device__ __forceinline__ bool ggml_cuda_hybrid_is_finite(float value) {
     return value == value && value != INFINITY && value != -INFINITY;
 }
 
-template<bool split_k_path>
+template<ggml_type type, bool split_k_path>
 static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
         const float * q,
         const char * k_cold,
@@ -109,7 +120,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
     }
     const int lane = threadIdx.x & 31;
     constexpr unsigned int warp_mask = 0xffffffffu;
-    const float lane_centroid = ggml_cuda_turbo4_centroid_lane();
+    const float lane_centroid = type == GGML_TYPE_TURBO3_5
+        ? ggml_cuda_turbo35_centroid_lane() : ggml_cuda_turbo4_centroid_lane();
 
     const int64_t iq3 = row/(NQ_HEADS*NQ);
     const int64_t iq2 = (row - iq3*NQ_HEADS*NQ)/NQ;
@@ -172,7 +184,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
         for (int64_t d = lane; d < D; d += 32) {
             const float key = hot
                 ? __half2float(*(const half *) (k_row + d*sizeof(half)))
-                : ggml_cuda_hybrid_turbo4_value(k_row, (int) d, lane_centroid);
+                : ggml_cuda_hybrid_turbo_value<type>(k_row, (int) d, lane_centroid);
             dot += q_row[d]*key;
         }
         dot = ggml_cuda_hybrid_warp_sum(dot);
@@ -192,7 +204,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
         for (int64_t d = lane; d < D; d += 32) {
             const float value = hot
                 ? __half2float(*(const half *) (v_row + d*sizeof(half)))
-                : ggml_cuda_hybrid_turbo4_value(v_row, (int) d, lane_centroid);
+                : ggml_cuda_hybrid_turbo_value<type>(v_row, (int) d, lane_centroid);
             output[d/32] = output[d/32]*old_scale + value*weight;
         }
         S = S*old_scale + weight;
@@ -333,7 +345,8 @@ static int ggml_cuda_hybrid_split_count(const int64_t n_keys, const uint64_t n_r
     return std::max(1, std::min(max_split_k, requested));
 }
 
-void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template<ggml_type type>
+static void ggml_cuda_flash_attn_ext_hybrid_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k_cold = dst->src[1];
     const ggml_tensor * v_cold = dst->src[2];
@@ -347,7 +360,7 @@ void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tenso
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot);
     const int64_t n_keys = k_cold->ne[1] + k_hot->ne[1];
     GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_cold->type == type && v_cold->type == type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->ne[0] == k_cold->ne[0] && (q->ne[0] == 128 || q->ne[0] == 256));
     GGML_ASSERT(k_cold->ne[0] == v_cold->ne[0] && k_hot->ne[0] == v_hot->ne[0]);
@@ -400,7 +413,7 @@ void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tenso
         ggml_cuda_pool & pool = ctx.pool();
         ggml_cuda_pool_alloc<float> partial_o_alloc(pool, (size_t) partial_rows*(size_t) q->ne[0]);
         ggml_cuda_pool_alloc<float2> partial_meta_alloc(pool, (size_t) partial_rows);
-        ggml_cuda_flash_attn_ext_hybrid_kernel<true><<<(unsigned int) (n_rows*split_k), 32, 0, ctx.stream()>>>(
+        ggml_cuda_flash_attn_ext_hybrid_kernel<type, true><<<(unsigned int) (n_rows*split_k), 32, 0, ctx.stream()>>>(
             (const float *) q->data,
             (const char *) k_cold->data,
             (const char *) v_cold->data,
@@ -439,7 +452,7 @@ void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tenso
         }
         CUDA_CHECK(cudaGetLastError());
     } else {
-        ggml_cuda_flash_attn_ext_hybrid_kernel<false><<<(unsigned int) n_rows, 32, 0, ctx.stream()>>>(
+        ggml_cuda_flash_attn_ext_hybrid_kernel<type, false><<<(unsigned int) n_rows, 32, 0, ctx.stream()>>>(
             (const float *) q->data,
             (const char *) k_cold->data,
             (const char *) v_cold->data,
@@ -472,17 +485,15 @@ void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tenso
 // Paged hybrid attention (ggml_flash_attn_ext_hybrid_paged).
 //
 // Every query token attends the rows named by its own sequence's per-KV-head
-// list: entry i of list (head, seq) is (row_code, position). A row_code with
-// the hot bit set names a hot F16 ring row, otherwise a cold TurboQuant4
-// arena row. Rows of other sequences never enter the walk, so a decode token
+// list: entry i is (arena row, position, hot row). The query's recent window
+// selects F16; older positions always read the TurboQuant4 arena.
+// Rows of other sequences never enter the walk, so a decode token
 // of a compacted sequence touches ~2K rows while another sequence's 256K
 // prompt sits in the same arena. One warp per (query row, key split); the
 // merge kernel above reduces the splits.
 // ---------------------------------------------------------------------------
 
-static constexpr int32_t ggml_cuda_hybrid_paged_hot_bit = 0x40000000;
-
-template<bool split_k_path>
+template<ggml_type type, bool split_k_path>
 static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         const float * q,
         const char * k_cold,
@@ -490,7 +501,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         const char * k_hot,
         const char * v_hot,
         const int32_t * q_meta,      // [2, NQ]: position, seq
-        const int32_t * k_list,      // [2, max_len, NKV_HEADS, NSEQ]
+        const int32_t * k_list,      // [3, max_len, NKV_HEADS, NSEQ]
         const int32_t * k_list_len,  // [NKV_HEADS, NSEQ]
         float * dst,
         const int64_t D,
@@ -515,6 +526,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         const size_t vh_nb2,
         const float scale,
         const float logit_softcap,
+        const int32_t recent_window,
         float * partial_o,
         float2 * partial_meta,
         const int split_k) {
@@ -527,7 +539,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         return;
     }
     const int lane = threadIdx.x & 31;
-    const float lane_centroid = ggml_cuda_turbo4_centroid_lane();
+    const float lane_centroid = type == GGML_TYPE_TURBO3_5
+        ? ggml_cuda_turbo35_centroid_lane() : ggml_cuda_turbo4_centroid_lane();
 
     // row = iq2*NQ + iq1 (head-major, like the dense kernel with NSEQ == 1)
     const int64_t iq2 = row/NQ;
@@ -544,21 +557,34 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
     const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + iq2*q_nb2);
 
     if (q_seq >= 0 && q_seq < NSEQ) {
-        const int64_t n_keys = min((int64_t) k_list_len[kv_head + NKV_HEADS*q_seq], max_len);
-        const int32_t * list = k_list + 2*max_len*(kv_head + NKV_HEADS*q_seq);
+        const int64_t list_len = min((int64_t) k_list_len[kv_head + NKV_HEADS*q_seq], max_len);
+        const int32_t * list = k_list + 3*max_len*(kv_head + NKV_HEADS*q_seq);
+        int64_t first = 0, last = list_len;
+        while (first < last) {
+            const int64_t middle = first + (last - first)/2;
+            if (list[3*middle + 1] <= q_position) {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        // Future draft rows must not change an earlier query's reduction groups.
+        const int64_t n_keys = first;
         const int64_t key_begin = split_k_path ? (n_keys*split)/split_k : 0;
         const int64_t key_end   = split_k_path ? (n_keys*(split + 1))/split_k : n_keys;
         for (int64_t key_index = key_begin; key_index < key_end; ++key_index) {
-            const int32_t code = list[2*key_index + 0];
-            const int32_t key_position = list[2*key_index + 1];
-            if (code < 0 || key_position < 0 || q_position < key_position) {
+            const int32_t cold_row = list[3*key_index + 0];
+            const int32_t key_position = list[3*key_index + 1];
+            const int32_t hot_row = list[3*key_index + 2];
+            if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
                 continue;
             }
-            const bool hot = (code & ggml_cuda_hybrid_paged_hot_bit) != 0;
-            const int64_t local_key = code & (ggml_cuda_hybrid_paged_hot_bit - 1);
-            if (local_key >= (hot ? n_hot_rows : n_cold_rows)) {
-                continue;
+            const bool hot = (int64_t) q_position - key_position < recent_window;
+            if (hot && (hot_row < 0 || hot_row >= n_hot_rows)) {
+                __trap();
+                return;
             }
+            const int64_t local_key = hot ? hot_row : cold_row;
             const char * k_row = hot
                 ? k_hot + local_key*kh_nb1 + kv_head*kh_nb2
                 : k_cold + local_key*kc_nb1 + kv_head*kc_nb2;
@@ -570,7 +596,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
             for (int64_t d = lane; d < D; d += 32) {
                 const float key = hot
                     ? __half2float(*(const half *) (k_row + d*sizeof(half)))
-                    : ggml_cuda_hybrid_turbo4_value(k_row, (int) d, lane_centroid);
+                    : ggml_cuda_hybrid_turbo_value<type>(k_row, (int) d, lane_centroid);
                 dot += q_row[d]*key;
             }
             dot = ggml_cuda_hybrid_warp_sum(dot);
@@ -585,8 +611,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
             for (int64_t d = lane; d < D; d += 32) {
                 const float value = hot
                     ? __half2float(*(const half *) (v_row + d*sizeof(half)))
-                    : ggml_cuda_hybrid_turbo4_value(v_row, (int) d, lane_centroid);
-                output[d/32] = output[d/32]*old_scale + value*weight;
+                    : ggml_cuda_hybrid_turbo_value<type>(v_row, (int) d, lane_centroid);
+                output[d/32] = __fmaf_rn(value, weight, __fmul_rn(output[d/32], old_scale));
             }
             S = S*old_scale + weight;
             M = M_new;
@@ -610,7 +636,170 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
     }
 }
 
-void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// One query position and all six Q heads of one KV head share each K/V decode.
+// Per-head reductions keep the scalar F32 order and the existing split layout.
+template<ggml_type type, bool split_k_path>
+static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
+        const float * q,
+        const char * k_cold,
+        const char * v_cold,
+        const char * k_hot,
+        const char * v_hot,
+        const int32_t * q_meta,
+        const int32_t * k_list,
+        const int32_t * k_list_len,
+        float * dst,
+        const int64_t D,
+        const int64_t NQ,
+        const int64_t NQ_HEADS,
+        const int64_t NKV_HEADS,
+        const int64_t NSEQ,
+        const int64_t max_len,
+        const int64_t n_cold_rows,
+        const int64_t n_hot_rows,
+        const size_t q_nb1,
+        const size_t q_nb2,
+        const size_t dst_nb1,
+        const size_t dst_nb2,
+        const size_t kc_nb1,
+        const size_t kc_nb2,
+        const size_t vc_nb1,
+        const size_t vc_nb2,
+        const size_t kh_nb1,
+        const size_t kh_nb2,
+        const size_t vh_nb1,
+        const size_t vh_nb2,
+        const float scale,
+        const float logit_softcap,
+        const int32_t recent_window,
+        float * partial_o,
+        float2 * partial_meta,
+        const int split_k) {
+    constexpr int n_heads = 6;
+    constexpr int n_values = 256/32;
+    const int64_t blocks_per_group = split_k_path ? split_k : 1;
+    const int64_t block = (int64_t) blockIdx.x;
+    const int64_t group = block/blocks_per_group;
+    const int64_t split = block%blocks_per_group;
+    if (group >= NQ*(NQ_HEADS/n_heads)) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const float lane_centroid = type == GGML_TYPE_TURBO3_5
+        ? ggml_cuda_turbo35_centroid_lane() : ggml_cuda_turbo4_centroid_lane();
+    const int64_t kv_head = group/NQ;
+    const int64_t iq1 = group - kv_head*NQ;
+    const int64_t head0 = kv_head*n_heads;
+    const int32_t q_position = q_meta[2*iq1 + 0];
+    const int32_t q_seq = q_meta[2*iq1 + 1];
+
+    float output[n_heads][n_values] = {};
+    float M[n_heads];
+    float S[n_heads] = {};
+#pragma unroll
+    for (int h = 0; h < n_heads; ++h) {
+        M[h] = -INFINITY;
+    }
+
+    if (q_seq >= 0 && q_seq < NSEQ) {
+        const int64_t list_len = min((int64_t) k_list_len[kv_head + NKV_HEADS*q_seq], max_len);
+        const int32_t * list = k_list + 3*max_len*(kv_head + NKV_HEADS*q_seq);
+        int64_t first = 0, last = list_len;
+        while (first < last) {
+            const int64_t middle = first + (last - first)/2;
+            if (list[3*middle + 1] <= q_position) {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        const int64_t n_keys = first;
+        const int64_t key_begin = split_k_path ? (n_keys*split)/split_k : 0;
+        const int64_t key_end = split_k_path ? (n_keys*(split + 1))/split_k : n_keys;
+        for (int64_t key_index = key_begin; key_index < key_end; ++key_index) {
+            const int32_t cold_row = list[3*key_index + 0];
+            const int32_t key_position = list[3*key_index + 1];
+            const int32_t hot_row = list[3*key_index + 2];
+            if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
+                continue;
+            }
+            const bool hot = (int64_t) q_position - key_position < recent_window;
+            if (hot && (hot_row < 0 || hot_row >= n_hot_rows)) {
+                __trap();
+                return;
+            }
+            const int64_t local_key = hot ? hot_row : cold_row;
+            const char * k_row = hot
+                ? k_hot + local_key*kh_nb1 + kv_head*kh_nb2
+                : k_cold + local_key*kc_nb1 + kv_head*kc_nb2;
+            const char * v_row = hot
+                ? v_hot + local_key*vh_nb1 + kv_head*vh_nb2
+                : v_cold + local_key*vc_nb1 + kv_head*vc_nb2;
+
+            float keys[n_values];
+            float values[n_values];
+#pragma unroll
+            for (int i = 0; i < n_values; ++i) {
+                const int d = lane + 32*i;
+                keys[i] = hot
+                    ? __half2float(*(const half *) (k_row + d*sizeof(half)))
+                    : ggml_cuda_hybrid_turbo_value<type>(k_row, d, lane_centroid);
+                values[i] = hot
+                    ? __half2float(*(const half *) (v_row + d*sizeof(half)))
+                    : ggml_cuda_hybrid_turbo_value<type>(v_row, d, lane_centroid);
+            }
+#pragma unroll
+            for (int h = 0; h < n_heads; ++h) {
+                const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + (head0 + h)*q_nb2);
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < n_values; ++i) {
+                    dot += q_row[lane + 32*i]*keys[i];
+                }
+                dot = ggml_cuda_hybrid_warp_sum(dot);
+                float score = dot*scale;
+                if (logit_softcap != 0.0f) {
+                    score = logit_softcap*tanhf(score);
+                }
+                const float M_new = fmaxf(M[h], score);
+                const float old_scale = S[h] == 0.0f ? 0.0f : expf(M[h] - M_new);
+                const float weight = expf(score - M_new);
+#pragma unroll
+                for (int i = 0; i < n_values; ++i) {
+                    output[h][i] = __fmaf_rn(values[i], weight, __fmul_rn(output[h][i], old_scale));
+                }
+                S[h] = S[h]*old_scale + weight;
+                M[h] = M_new;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < n_heads; ++h) {
+        const int64_t iq2 = head0 + h;
+        const int64_t row = iq2*NQ + iq1;
+        if constexpr (!split_k_path) {
+            float * dst_row = (float *) ((char *) dst + iq2*dst_nb1 + iq1*dst_nb2);
+            const float inv = S[h] == 0.0f ? 0.0f : 1.0f/S[h];
+#pragma unroll
+            for (int i = 0; i < n_values; ++i) {
+                dst_row[lane + 32*i] = output[h][i]*inv;
+            }
+        } else {
+            float * partial_row = partial_o + (row*split_k + split)*D;
+#pragma unroll
+            for (int i = 0; i < n_values; ++i) {
+                partial_row[lane + 32*i] = output[h][i];
+            }
+            if (lane == 0) {
+                partial_meta[row*split_k + split] = make_float2(M[h], S[h]);
+            }
+        }
+    }
+}
+
+template<ggml_type type>
+static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k_cold = dst->src[1];
     const ggml_tensor * v_cold = dst->src[2];
@@ -622,7 +811,7 @@ void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml
 
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_cold->type == type && v_cold->type == type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->ne[0] == k_cold->ne[0] && (q->ne[0] == 128 || q->ne[0] == 256));
     GGML_ASSERT(q->ne[3] == 1);
@@ -631,11 +820,15 @@ void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml
     GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(q_meta) && ggml_is_contiguous(k_list) && ggml_is_contiguous(k_list_len));
     GGML_ASSERT(q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[1]);
-    GGML_ASSERT(k_list->ne[0] == 2 && k_list->ne[2] == k_cold->ne[2]);
+    GGML_ASSERT(k_list->ne[0] == 3 && k_list->ne[2] == k_cold->ne[2]);
     GGML_ASSERT(k_list_len->ne[0] == k_cold->ne[2] && k_list_len->ne[1] == k_list->ne[3]);
 
     const uint64_t n_rows = (uint64_t) q->ne[1]*q->ne[2];
     GGML_ASSERT(n_rows > 0 && n_rows <= std::numeric_limits<unsigned int>::max());
+
+    int32_t recent_window;
+    memcpy(&recent_window, (const int32_t *) dst->op_params + 5, sizeof(recent_window));
+    GGML_ASSERT(recent_window > 0);
 
     float scale = 1.0f;
     float logit_softcap = 0.0f;
@@ -649,11 +842,36 @@ void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml
     // walk; short lists simply leave splits empty (the merge handles S == 0).
     const int64_t max_len = k_list->ne[1];
     const int split_k = ggml_cuda_hybrid_split_count(max_len, n_rows, q->ne[0]);
+    static const bool gqa6_enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_PAGED_GQA6");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    // A single query exposes too few groups on large GPUs; retain its baseline.
+    const bool use_gqa6 = gqa6_enabled && q->ne[1] >= 8 &&
+        q->ne[0] == 256 && q->ne[2] == 24 && k_cold->ne[2] == 4;
 
     const auto launch = [&](auto split_tag, float * partial_o, float2 * partial_meta) {
         constexpr bool split_path = decltype(split_tag)::value;
+        if (use_gqa6) {
+            const uint64_t n_groups = n_rows/6;
+            const unsigned int blocks = (unsigned int) (split_path ? n_groups*split_k : n_groups);
+            ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel<type, split_path><<<blocks, 32, 0, ctx.stream()>>>(
+                (const float *) q->data,
+                (const char *) k_cold->data, (const char *) v_cold->data,
+                (const char *) k_hot->data, (const char *) v_hot->data,
+                (const int32_t *) q_meta->data, (const int32_t *) k_list->data, (const int32_t *) k_list_len->data,
+                (float *) dst->data,
+                q->ne[0], q->ne[1], q->ne[2], k_cold->ne[2], k_list->ne[3], max_len,
+                k_cold->ne[1], k_hot->ne[1],
+                q->nb[1], q->nb[2], dst->nb[1], dst->nb[2],
+                k_cold->nb[1], k_cold->nb[2], v_cold->nb[1], v_cold->nb[2],
+                k_hot->nb[1], k_hot->nb[2], v_hot->nb[1], v_hot->nb[2],
+                scale, logit_softcap, recent_window, partial_o, partial_meta, split_path ? split_k : 1);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const unsigned int blocks = (unsigned int) (split_path ? n_rows*split_k : n_rows);
-        ggml_cuda_flash_attn_ext_hybrid_paged_kernel<split_path><<<blocks, 32, 0, ctx.stream()>>>(
+        ggml_cuda_flash_attn_ext_hybrid_paged_kernel<type, split_path><<<blocks, 32, 0, ctx.stream()>>>(
             (const float *) q->data,
             (const char *) k_cold->data, (const char *) v_cold->data,
             (const char *) k_hot->data, (const char *) v_hot->data,
@@ -664,7 +882,7 @@ void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml
             q->nb[1], q->nb[2], dst->nb[1], dst->nb[2],
             k_cold->nb[1], k_cold->nb[2], v_cold->nb[1], v_cold->nb[2],
             k_hot->nb[1], k_hot->nb[2], v_hot->nb[1], v_hot->nb[2],
-            scale, logit_softcap, partial_o, partial_meta, split_path ? split_k : 1);
+            scale, logit_softcap, recent_window, partial_o, partial_meta, split_path ? split_k : 1);
         CUDA_CHECK(cudaGetLastError());
     };
 
@@ -687,5 +905,27 @@ void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml
         CUDA_CHECK(cudaGetLastError());
     } else {
         launch(std::false_type{}, nullptr, nullptr);
+    }
+}
+
+void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_TURBO4_0:
+            return ggml_cuda_flash_attn_ext_hybrid_impl<GGML_TYPE_TURBO4_0>(ctx, dst);
+        case GGML_TYPE_TURBO3_5:
+            return ggml_cuda_flash_attn_ext_hybrid_impl<GGML_TYPE_TURBO3_5>(ctx, dst);
+        default:
+            GGML_ABORT("unsupported hybrid TurboQuant cache type");
+    }
+}
+
+void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_TURBO4_0:
+            return ggml_cuda_flash_attn_ext_hybrid_paged_impl<GGML_TYPE_TURBO4_0>(ctx, dst);
+        case GGML_TYPE_TURBO3_5:
+            return ggml_cuda_flash_attn_ext_hybrid_paged_impl<GGML_TYPE_TURBO3_5>(ctx, dst);
+        default:
+            GGML_ABORT("unsupported hybrid TurboQuant cache type");
     }
 }

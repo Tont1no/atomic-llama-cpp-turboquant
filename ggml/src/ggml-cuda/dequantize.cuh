@@ -127,6 +127,13 @@ static __device__ __forceinline__ void dequantize_turbo4_0(const void * vx, cons
     v.y = ggml_cuda_turbo4_dequant_element(&x[ib], iqs + 1, norm);
 }
 
+static __device__ __forceinline__ void dequantize_turbo3_5(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_turbo3_5 * x = (const block_turbo3_5 *) vx;
+    const float norm = __half2float(x[ib].norm);
+    v.x = ggml_cuda_turbo35_dequant_element(&x[ib], iqs + 0, norm);
+    v.y = ggml_cuda_turbo35_dequant_element(&x[ib], iqs + 1, norm);
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

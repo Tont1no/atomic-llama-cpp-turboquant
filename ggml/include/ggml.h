@@ -431,7 +431,8 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_TURBO4_0 = 43, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_TURBO3_5 = 44, // Experimental KV: WHT128 + 64x4-bit/64x3-bit payload
+        GGML_TYPE_COUNT   = 45,
     };
 
     // precision
@@ -444,6 +445,8 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_SRC0_IS_TURBO_FORWARD = 2,
+        GGML_HINT_SRC0_IS_TURBO_INVERSE = 3,
     };
 
     // model file types
@@ -1674,6 +1677,12 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
+    // Gather packed Turbo4/Turbo3.5 rows without decoding or applying a second rotation.
+    GGML_API struct ggml_tensor * ggml_get_rows_quantized(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
@@ -2464,10 +2473,12 @@ extern "C" {
 
     // Paged hybrid KV attention: every query token attends the rows named
     // by its own sequence's per-KV-head list instead of a dense [cold, hot]
-    // range. k_list is I32 [2, max_len, n_kv_heads, n_seq]; entry i of a
-    // list is (row_code, position): row_code >= 0 names a cold arena row,
-    // row_code with bit 31 set names a hot ring row (row & 0x7fffffff),
-    // position -1 or > the query position is skipped. k_list_len is I32
+    // range. k_list is I32 [3, max_len, n_kv_heads, n_seq]; entry i is
+    // (cold arena row, position, hot ring row or -1), ordered by position.
+    // A causal key uses F16
+    // exactly when query_position - key_position < recent_window; its hot
+    // row must exist in that case. Older keys always use the cold arena row.
+    // Negative rows/positions and future positions are skipped. k_list_len is I32
     // [n_kv_heads, n_seq]. q_meta is I32 [2, n_q]: (position, seq index into
     // the lists). Cold rows are TurboQuant4 [D, arena_rows, n_kv_heads], hot
     // rows F16 [D, hot_rows, n_kv_heads]; q is [D, n_q, n_q_heads, 1].
@@ -2482,7 +2493,8 @@ extern "C" {
             struct ggml_tensor  * k_list,
             struct ggml_tensor  * k_list_len,
             float                 scale,
-            float                 logit_softcap);
+            float                 logit_softcap,
+            int32_t               recent_window);
 
     // 0: dense hybrid (k_positions per row), 1: paged lists.
     GGML_API int32_t ggml_flash_attn_ext_hybrid_mode(const struct ggml_tensor * a);

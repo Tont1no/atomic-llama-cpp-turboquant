@@ -75,29 +75,34 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
 
-        while (true) {
-            llama_ubatch ubatch;
+        if (mem_attn->pyramidkv_c1_paged()) {
+            const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+            ubatches = mem_attn->pyramidkv_c1_split_batch(balloc, n_ubatch, n_rs_seq > 0 ? n_rs_seq + 1 : 0, embd_all);
+        } else {
+            while (true) {
+                llama_ubatch ubatch;
 
-            if (embd_all) {
-                // if all tokens are output, split by sequence
-                ubatch = balloc.split_seq(n_ubatch);
-            } else {
-                // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
-                const bool unified = (mem_attn->get_n_stream() == 1);
+                if (embd_all) {
+                    // if all tokens are output, split by sequence
+                    ubatch = balloc.split_seq(n_ubatch);
+                } else {
+                    // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
+                    const bool unified = (mem_attn->get_n_stream() == 1);
 
-                // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
-                //   so that the rollback snapshots remain valid
-                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+                    // [TAG_RECURRENT_ROLLBACK_SPLITS]
+                    // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+                    //   so that the rollback snapshots remain valid
+                    const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                    ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                }
+
+                if (ubatch.n_tokens == 0) {
+                    break;
+                }
+
+                ubatches.push_back(std::move(ubatch)); // NOLINT
             }
-
-            if (ubatch.n_tokens == 0) {
-                break;
-            }
-
-            ubatches.push_back(std::move(ubatch)); // NOLINT
         }
 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {

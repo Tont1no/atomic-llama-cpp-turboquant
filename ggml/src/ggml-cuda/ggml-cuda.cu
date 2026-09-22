@@ -2166,6 +2166,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (tensor->op == GGML_OP_MUL_MAT && ggml_cuda_mmq_batch_invariant(src0->type, cc, src1->ne[1])) {
+        return false;
+    }
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
@@ -2201,6 +2204,9 @@ static bool ggml_cuda_should_fuse_blackwell_batched_swiglu(
     }
     const ggml_tensor * weights = up->src[0];
     const ggml_tensor * input = up->src[1];
+    if (ggml_cuda_mmq_batch_invariant(weights->type, cc, input->ne[1])) {
+        return false;
+    }
     if ((weights->type != GGML_TYPE_IQ2_S && weights->type != GGML_TYPE_IQ3_S) ||
             input->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
             gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
@@ -2232,6 +2238,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
+    if ((hint == GGML_HINT_SRC0_IS_TURBO_FORWARD || hint == GGML_HINT_SRC0_IS_TURBO_INVERSE) &&
+        src0->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+        ne00 == 128 && ne01 == 128 && ne02 == 1 && ne03 == 1 &&
+        ggml_cuda_op_fwht(ctx, src1, dst, (ggml_op_hint) hint)) {
+        return;
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -2246,6 +2258,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    if (ggml_cuda_mmq_batch_invariant(src0->type, cc, ne11)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -5299,40 +5315,63 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
     }
 
-    // TQ4 is deliberately kept out of the generic CUDA operation families.
+    // Rotated KV formats are kept out of the generic CUDA operation families.
     // Its rotated representation must only be written by the explicit encoder
     // paths below and must not pass through a decode/modify/re-encode sequence.
-    bool has_turbo4 = op->type == GGML_TYPE_TURBO4_0;
-    for (int i = 0; i < GGML_MAX_SRC && !has_turbo4; i++) {
-        has_turbo4 = op->src[i] && op->src[i]->type == GGML_TYPE_TURBO4_0;
+    const auto is_turbo = [](ggml_type type) {
+        return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
+    };
+    const auto packed_rows = [&](const ggml_tensor * tensor) {
+        return tensor && is_turbo(tensor->type) &&
+            tensor->ne[0] > 0 && tensor->ne[0] % GGML_TURBO4_QK == 0 &&
+            tensor->nb[0] == ggml_type_size(tensor->type);
+    };
+    bool has_turbo = is_turbo(op->type);
+    for (int i = 0; i < GGML_MAX_SRC && !has_turbo; i++) {
+        has_turbo = op->src[i] && is_turbo(op->src[i]->type);
     }
-    if (has_turbo4) {
+    if (has_turbo) {
         switch (op->op) {
             case GGML_OP_NONE:
             case GGML_OP_VIEW:
             case GGML_OP_RESHAPE:
             case GGML_OP_PERMUTE:
             case GGML_OP_TRANSPOSE:
-                return op->type == GGML_TYPE_TURBO4_0;
+                return is_turbo(op->type);
             case GGML_OP_CPY: {
                 const ggml_type src0_type = op->src[0]->type;
                 const ggml_type src1_type = op->src[1]->type;
                 const bool rows_aligned = op->src[0]->ne[0] % GGML_TURBO4_QK == 0 &&
                                           op->src[1]->ne[0] % GGML_TURBO4_QK == 0;
                 return rows_aligned &&
-                       ((src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_TURBO4_0) ||
-                        (src0_type == GGML_TYPE_TURBO4_0 && src1_type == GGML_TYPE_F32) ||
-                        (src0_type == GGML_TYPE_TURBO4_0 && src1_type == GGML_TYPE_TURBO4_0 &&
-                         ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])));
+                       ((src0_type == GGML_TYPE_F32 && packed_rows(op->src[1])) ||
+                        (packed_rows(op->src[0]) && src1_type == GGML_TYPE_F32) ||
+                        (src0_type == src1_type && packed_rows(op->src[0]) && packed_rows(op->src[1])));
             }
             case GGML_OP_DUP:
             case GGML_OP_CONT:
-                return op->type == GGML_TYPE_TURBO4_0 &&
-                       op->src[0] && op->src[0]->type == GGML_TYPE_TURBO4_0 &&
-                       ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+                return packed_rows(op) && packed_rows(op->src[0]) && op->src[0]->type == op->type;
+            case GGML_OP_GET_ROWS:
+                return is_turbo(op->type) &&
+                       op->src[0] && op->src[0]->type == op->type &&
+                       op->src[1] && op->src[1]->type == GGML_TYPE_I32 &&
+                       op->src[0]->ne[0] > 0 && op->src[0]->ne[0] % GGML_TURBO4_QK == 0 &&
+                       op->src[0]->nb[0] == ggml_type_size(op->type) &&
+                       op->src[0]->nb[1] >= ggml_row_size(op->type, op->src[0]->ne[0]) &&
+                       op->src[1]->nb[0] == sizeof(int32_t) &&
+                       op->src[1]->nb[1] % sizeof(int32_t) == 0 &&
+                       op->src[1]->nb[2] % sizeof(int32_t) == 0 &&
+                       op->src[1]->ne[0] > 0 && op->src[1]->ne[1] > 0 && op->src[1]->ne[2] > 0 &&
+                       op->src[1]->ne[3] == 1 &&
+                       op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                       op->src[0]->ne[3] == op->src[1]->ne[2] &&
+                       op->ne[0] == op->src[0]->ne[0] && op->ne[1] == op->src[1]->ne[0] &&
+                       op->ne[2] == op->src[1]->ne[1] && op->ne[3] == op->src[1]->ne[2] &&
+                       ggml_is_contiguous(op);
             case GGML_OP_SET_ROWS:
-                return op->type == GGML_TYPE_TURBO4_0 &&
+                return packed_rows(op) &&
                        op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[0]->nb[0] == sizeof(float) &&
                        op->src[0]->ne[0] % GGML_TURBO4_QK == 0 && op->ne[0] % GGML_TURBO4_QK == 0 &&
                        op->src[1] && (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64);
             case GGML_OP_FLASH_ATTN_EXT:

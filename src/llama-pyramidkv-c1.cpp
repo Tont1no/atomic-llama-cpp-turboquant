@@ -73,6 +73,7 @@ bool llama_pyramidkv_c1_make_config(
         const llama_pyramidkv_c1_params & params,
         std::size_t layer_count,
         std::size_t continuation_headroom,
+        std::size_t n_seq_max,
         llama_pyramidkv_c1_config & output,
         std::string & error) {
     output = {};
@@ -83,8 +84,8 @@ bool llama_pyramidkv_c1_make_config(
         error = "invalid attention layer count";
         return false;
     }
-    if (continuation_headroom == 0) {
-        error = "PyramidKV C1 requires a non-zero effective ubatch headroom";
+    if (continuation_headroom == 0 || n_seq_max == 0) {
+        error = "PyramidKV C1 requires non-zero sequence capacity and effective ubatch headroom";
         return false;
     }
 
@@ -107,28 +108,42 @@ bool llama_pyramidkv_c1_make_config(
         !copy_c1_value("pyramidkv_c1.transition_max_bytes", params.transition_max_bytes,
             kMinTransitionBytes, kMaxTransitionBytes, output.transition_max_bytes, error) ||
         !copy_c1_value("pyramidkv_c1.hot_capacity", params.hot_capacity,
-            2, kMaxHotCapacity, output.hot_capacity, error)) {
+            2, kMaxHotCapacity, output.hot_capacity, error) ||
+        !copy_c1_value("pyramidkv_c1.rollback_headroom", params.rollback_headroom,
+            0, kMaxHotCapacity, output.rollback_headroom, error)) {
         return false;
     }
     output.continuation_headroom = continuation_headroom;
+
+    if (!copy_c1_value("pyramidkv_c1.max_prefill_cells", params.max_prefill_cells,
+            0, kMaxTokens, output.max_prefill_cells, error)) {
+        return false;
+    }
 
     if ((output.pooling_kernel & 1u) == 0 ||
         output.max_capacity_prompt <= output.recent_window) {
         error = "PyramidKV C1 requires odd pooling and capacity > recent";
         return false;
     }
-    if (output.recent_window > std::numeric_limits<std::size_t>::max() -
+    output.paged = params.paged;
+    const std::size_t protected_per_seq = output.recent_window +
+        (output.paged ? output.rollback_headroom : 0);
+    bool capacity_ok = true;
+    const std::size_t protected_rows = checked_mul(protected_per_seq,
+        output.paged ? n_seq_max : 1, capacity_ok);
+    if (!capacity_ok || protected_rows > std::numeric_limits<std::size_t>::max() -
             output.continuation_headroom) {
-        error = "PyramidKV C1 recent window plus effective ubatch headroom overflows";
+        error = "PyramidKV C1 protected hot rows plus effective ubatch headroom overflow";
         return false;
     }
     const std::size_t minimum_hot_capacity =
-        output.recent_window + output.continuation_headroom;
+        protected_rows + output.continuation_headroom;
     if (output.hot_capacity < minimum_hot_capacity) {
-        error = "PyramidKV C1 hot_capacity must cover recent_window plus effective ubatch headroom";
+        error = output.paged
+            ? "PyramidKV C1 hot_capacity must cover n_seq_max * (recent_window + rollback_headroom) plus effective ubatch headroom"
+            : "PyramidKV C1 hot_capacity must cover recent_window plus effective ubatch headroom";
         return false;
     }
-    output.paged = params.paged;
     if (output.paged) {
         if (!copy_c1_value("pyramidkv_c1.list_capacity", params.list_capacity,
                 1, kMaxListCapacity, output.list_capacity, error)) {
@@ -143,6 +158,26 @@ bool llama_pyramidkv_c1_make_config(
             return false;
         }
     }
+    return true;
+}
+
+bool llama_pyramidkv_c1_prefill_rows(
+        const llama_pyramidkv_c1_config & config,
+        uint32_t arena_cells,
+        std::size_t live_cells,
+        uint32_t & rows,
+        std::string & error) {
+    rows = 0;
+    const std::size_t limit = config.max_prefill_cells == 0 ? arena_cells :
+        std::min<std::size_t>(arena_cells, config.max_prefill_cells);
+    if (live_cells == 0 || live_cells > limit) {
+        error = "PyramidKV local prefill live cells must be in [1, " + std::to_string(limit) + "]";
+        return false;
+    }
+    // Widen before rounding so even an arena near UINT32_MAX cannot wrap.
+    const uint64_t padded = ((static_cast<uint64_t>(live_cells) + 4095u)/4096u)*4096u;
+    rows = static_cast<uint32_t>(std::min<uint64_t>(arena_cells, padded));
+    error.clear();
     return true;
 }
 

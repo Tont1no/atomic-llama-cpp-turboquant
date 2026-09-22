@@ -30,8 +30,8 @@
 #include <string>
 #include <unordered_set>
 
-static bool llama_graph_type_is_turbo4(ggml_type type) {
-    return type == GGML_TYPE_TURBO4_0;
+static bool llama_graph_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
 }
 
 static ggml_backend_t llama_graph_backend_for_buft(
@@ -66,7 +66,7 @@ static int64_t llama_graph_turbo4_padded_head(int64_t head_dim) {
     return 0;
 }
 
-static ggml_tensor * llama_graph_turbo4_rotate(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * rotation) {
+static ggml_tensor * llama_graph_turbo4_rotate(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * rotation, bool inverse = false) {
     if (rotation == nullptr || rotation->ne[0] != GGML_TURBO4_QK || rotation->ne[1] != GGML_TURBO4_QK) {
         throw std::runtime_error("TurboQuant4 graph rotation matrix is unavailable");
     }
@@ -85,8 +85,9 @@ static ggml_tensor * llama_graph_turbo4_rotate(ggml_context * ctx, ggml_tensor *
         ggml_cont_2d(ctx, cur, GGML_TURBO4_QK, n/GGML_TURBO4_QK);
 
     ggml_tensor * rotated = ggml_mul_mat(ctx, rotation, flat);
-    // Preserve the orthogonal transform in single-token CUDA matrix-vector kernels.
+    // Keep the matrix fallback in F32; CUDA uses a fixed-order signed WHT.
     ggml_mul_mat_set_prec(rotated, GGML_PREC_F32);
+    ggml_mul_mat_set_hint(rotated, inverse ? GGML_HINT_SRC0_IS_TURBO_INVERSE : GGML_HINT_SRC0_IS_TURBO_FORWARD);
     return ggml_reshape_4d(ctx, rotated, ne0, ne1, ne2, ne3);
 }
 
@@ -600,6 +601,9 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_idxs && self_v_idxs->buffer) {
         mctx->set_input_v_idxs(self_v_idxs, ubatch);
     }
+    if (self_prefill_idxs && self_prefill_idxs->buffer) {
+        mctx->set_input_prefill_idxs(self_prefill_idxs);
+    }
     mctx->set_input_pyramidkv_indices(ubatch);
 
     // the mask is left unallocated when the graph only stores K/V without attending
@@ -636,6 +640,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     const bool built_paged = std::any_of(pyramidkv_inputs.begin(), pyramidkv_inputs.end(),
         [](const llm_graph_pyramidkv_inputs & in) { return in.k_list != nullptr; });
     res &= built_paged == next_mctx->pyramidkv_paged_ready();
+    res &= (self_prefill_idxs != nullptr) == next_mctx->pyramidkv_local_prefill_ready();
+    if (self_prefill_idxs != nullptr) {
+        res &= self_prefill_idxs->ne[0] == next_mctx->get_n_kv();
+        res &= params.ubatch.n_seqs_unq == 1 && params.ubatch.seq_id_unq[0] == prefill_seq_id;
+    }
 
     return res;
 }
@@ -1268,6 +1277,11 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     const bool built_paged = std::any_of(inp_attn->pyramidkv_inputs.begin(), inp_attn->pyramidkv_inputs.end(),
         [](const llm_graph_pyramidkv_inputs & in) { return in.k_list != nullptr; });
     res &= built_paged == mctx->get_attn()->pyramidkv_paged_ready();
+    res &= (inp_attn->self_prefill_idxs != nullptr) == mctx->get_attn()->pyramidkv_local_prefill_ready();
+    if (inp_attn->self_prefill_idxs != nullptr) {
+        res &= inp_attn->self_prefill_idxs->ne[0] == mctx->get_attn()->get_n_kv();
+        res &= params.ubatch.n_seqs_unq == 1 && params.ubatch.seq_id_unq[0] == inp_attn->prefill_seq_id;
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2710,6 +2724,25 @@ static const llama_kv_cache_context * llama_graph_attention_memory_context(const
     return nullptr;
 }
 
+static ggml_backend_t llama_graph_pyramidkv_backend(ggml_backend_sched_t sched, const ggml_tensor * tensor) {
+    const ggml_tensor * cache_root = tensor;
+    while (cache_root->view_src != nullptr ||
+            (cache_root->op == GGML_OP_GET_ROWS && llama_graph_type_is_turbo(cache_root->type))) {
+        cache_root = cache_root->view_src != nullptr ? cache_root->view_src : cache_root->src[0];
+    }
+    if (cache_root->buffer == nullptr || ggml_backend_buffer_is_host(cache_root->buffer)) {
+        throw std::runtime_error("PyramidKV C1 requires allocated GPU KV storage");
+    }
+    const auto kv_device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cache_root->buffer));
+    for (int index = 0; index < ggml_backend_sched_get_n_backends(sched); ++index) {
+        auto backend = ggml_backend_sched_get_backend(sched, index);
+        if (ggml_backend_get_device(backend) == kv_device) {
+            return backend;
+        }
+    }
+    throw std::runtime_error("PyramidKV C1 has no backend for its KV device");
+}
+
 void llm_graph_context::build_pyramidkv_observer(
         ggml_tensor * q,
         ggml_tensor * k_cold,
@@ -2719,6 +2752,7 @@ void llm_graph_context::build_pyramidkv_observer(
         ggml_tensor * sinks,
                 int   il) const {
     const auto & observer_config = cparams.pyramidkv_c1;
+    const auto * kv_ctx = llama_graph_attention_memory_context(mctx);
     if (q == nullptr || k_cold == nullptr || q->ne[0] != k_cold->ne[0] ||
             q->ne[3] != k_cold->ne[3]) {
         throw std::runtime_error("PyramidKV C1 observer has incompatible Q/K shapes");
@@ -2752,26 +2786,7 @@ void llm_graph_context::build_pyramidkv_observer(
         }
     }
 
-    const ggml_tensor * cache_root = k_cold;
-    while (cache_root->view_src != nullptr) {
-        cache_root = cache_root->view_src;
-    }
-    if (cache_root->buffer == nullptr || ggml_backend_buffer_is_host(cache_root->buffer)) {
-        throw std::runtime_error("PyramidKV C1 observer requires allocated GPU KV storage");
-    }
-    const auto kv_device = ggml_backend_buft_get_device(
-        ggml_backend_buffer_get_type(cache_root->buffer));
-    ggml_backend_t observer_backend = nullptr;
-    for (int index = 0; index < ggml_backend_sched_get_n_backends(sched); ++index) {
-        auto candidate = ggml_backend_sched_get_backend(sched, index);
-        if (ggml_backend_get_device(candidate) == kv_device) {
-            observer_backend = candidate;
-            break;
-        }
-    }
-    if (observer_backend == nullptr) {
-        throw std::runtime_error("PyramidKV C1 observer has no backend for its KV device");
-    }
+    ggml_backend_t observer_backend = llama_graph_pyramidkv_backend(sched, k_cold);
 
     const size_t alignment = std::max<size_t>(1, ggml_backend_buft_get_alignment(
         ggml_backend_get_default_buffer_type(observer_backend)));
@@ -2861,7 +2876,6 @@ void llm_graph_context::build_pyramidkv_observer(
     std::vector<observer_window> windows;
     if (cparams.pyramidkv_c1.paged && ubatch.n_seqs_unq > 0 && ubatch.seq_id != nullptr &&
             ubatch.n_seq_id != nullptr && ubatch.output != nullptr) {
-        const auto * kv_ctx = llama_graph_attention_memory_context(mctx);
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq = ubatch.seq_id_unq[s];
             if (kv_ctx != nullptr && kv_ctx->pyramidkv_seq_compacted(seq)) {
@@ -2934,10 +2948,16 @@ void llm_graph_context::build_pyramidkv_observer(
     // Query tiles run one after another; everything a tile allocates except its
     // [key, kv_head] contribution to `reduced` is dead before the next tile
     // starts, so the layer budget holds the largest tile, not the sum of tiles.
+    const std::size_t chunk_base_bytes = layer_bytes;
     std::size_t chunk_peak_bytes = 0;
     for (std::size_t query_offset = 0; query_offset < query_tokens;
             query_offset += chunk) {
-        const std::size_t chunk_base_bytes = layer_bytes;
+        // Start each tile from the common live inputs, not the preceding
+        // tile's peak. Its reduced accumulator survives until the ADD below.
+        layer_bytes = chunk_base_bytes;
+        if (reduced != nullptr) {
+            charge_observer(ggml_nbytes(reduced));
+        }
         const std::size_t tile_tokens = std::min(chunk, query_tokens - query_offset);
         const size_t q_offset = (query_start + query_offset) * q->nb[1];
         ggml_tensor * q_tile = ggml_view_4d(ctx0, q, q->ne[0], tile_tokens,
@@ -3033,8 +3053,8 @@ void llm_graph_context::build_pyramidkv_observer(
 
         reduced = reduced == nullptr ? by_query : observer_op(ggml_add(ctx0, reduced, by_query));
         chunk_peak_bytes = std::max(chunk_peak_bytes, layer_bytes - chunk_base_bytes);
-        layer_bytes = chunk_base_bytes + chunk_peak_bytes;
     }
+    layer_bytes = chunk_base_bytes + chunk_peak_bytes;
 
     reduced = observer_op(ggml_cont(ctx0, reduced));
     // The reduced scores of every layer stay allocated until extraction.
@@ -3052,6 +3072,7 @@ void llm_graph_context::build_pyramidkv_observer(
         /*.key_stride          =*/ key_tokens,
         /*.observation_window  =*/ observer_config.observation_window,
         /*.seq_id              =*/ window.seq_id,
+        /*.sequence_local      =*/ k_hot == nullptr && kv_ctx != nullptr && kv_ctx->pyramidkv_local_prefill_ready(),
     });
     ggml_build_forward_expand(gf, reduced);
     windows_peak_bytes = std::max(windows_peak_bytes, layer_bytes - windows_base_bytes);
@@ -3085,7 +3106,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     const bool use_pyramidkv_c1 = cparams.pyramidkv_c1.enabled;
     const bool c1_dense_types =
-        (k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0) ||
+        (llama_graph_type_is_turbo(k->type) && v->type == k->type) ||
         ((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) &&
          (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32));
     const bool qwen35_c1_geometry = use_pyramidkv_c1 &&
@@ -3102,7 +3123,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         throw std::runtime_error(
             "PyramidKV C1 requires a single-stream Qwen2 or target Qwen35 dense FlashAttention graph");
     }
-    if ((llama_graph_type_is_turbo4(k->type) || llama_graph_type_is_turbo4(v->type)) && !use_flash_attn) {
+    if ((llama_graph_type_is_turbo(k->type) || llama_graph_type_is_turbo(v->type)) && !use_flash_attn) {
         throw std::runtime_error("TurboQuant4 requires FlashAttention without a separate KQ bias tensor");
     }
     if (use_flash_attn) {
@@ -3317,6 +3338,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
+        if (mctx_cur->pyramidkv_local_prefill_ready()) {
+            inp->self_prefill_idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->get_n_kv());
+            ggml_set_input(inp->self_prefill_idxs);
+            ggml_set_name(inp->self_prefill_idxs, "pyramidkv_prefill_rows");
+            inp->prefill_seq_id = ubatch.n_seqs_unq == 1 ? ubatch.seq_id_unq[0] : -1;
+        }
+
         // The compacted hybrid operator applies causal and validity checks
         // from original q/k positions. Building the old logical mask here
         // would allocate against the full logical context again.
@@ -3355,12 +3383,12 @@ ggml_tensor * llm_graph_context::build_attn(
     GGML_ASSERT(v_mla == nullptr);
 
     const auto * mctx_cur = inp->mctx;
-    const bool turbo4_k = llama_graph_type_is_turbo4(mctx_cur->type_k());
-    const bool turbo4_v = llama_graph_type_is_turbo4(mctx_cur->type_v());
+    const bool turbo4_k = llama_graph_type_is_turbo(mctx_cur->type_k());
+    const bool turbo4_v = llama_graph_type_is_turbo(mctx_cur->type_v());
     bool turbo4_q_rotated = false;
     ggml_tensor * k_hot_cur = nullptr;
     ggml_tensor * v_hot_cur = nullptr;
-    if (turbo4_k != turbo4_v) {
+    if ((turbo4_k || turbo4_v) && mctx_cur->type_k() != mctx_cur->type_v()) {
         throw std::runtime_error("TurboQuant4 requires symmetric K/V cache types");
     }
 
@@ -3453,6 +3481,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // Paged C1: every sequence of this ubatch is selected, the arena keeps
     // receiving every token and attention walks the per-sequence lists.
     const bool use_pyramidkv_paged = use_pyramidkv_c1 && mctx_cur->pyramidkv_paged_ready();
+    const bool use_pyramidkv_prefill = use_pyramidkv_c1 && mctx_cur->pyramidkv_local_prefill_ready();
     const bool use_pyramidkv_hybrid = use_pyramidkv_c1 && !use_pyramidkv_paged &&
         mctx_cur->pyramidkv_hybrid_ready(il);
 
@@ -3491,10 +3520,25 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = use_pyramidkv_hybrid
         ? mctx_cur->get_k_hybrid(ctx0, il) : use_pyramidkv_paged
-        ? mctx_cur->get_k_paged(ctx0, il) : mctx_cur->get_k(ctx0, il);
+        ? mctx_cur->get_k_paged(ctx0, il) : use_pyramidkv_prefill
+        ? mctx_cur->get_k_prefill(ctx0, il, inp->self_prefill_idxs) : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_pyramidkv_hybrid
         ? mctx_cur->get_v_hybrid(ctx0, il) : use_pyramidkv_paged
-        ? mctx_cur->get_v_paged(ctx0, il) : mctx_cur->get_v(ctx0, il);
+        ? mctx_cur->get_v_paged(ctx0, il) : use_pyramidkv_prefill
+        ? mctx_cur->get_v_prefill(ctx0, il, inp->self_prefill_idxs) : mctx_cur->get_v(ctx0, il);
+
+    if (use_pyramidkv_prefill) {
+        for (ggml_tensor * gathered : { k, v }) {
+            while (gathered->view_src != nullptr) {
+                gathered = gathered->view_src;
+            }
+            auto backend = llama_graph_pyramidkv_backend(sched, gathered);
+            if (gathered->op != GGML_OP_GET_ROWS || !ggml_backend_supports_op(backend, gathered)) {
+                throw std::runtime_error("PyramidKV local prefill requires packed TurboQuant row gather on the KV device");
+            }
+            ggml_backend_sched_set_tensor_backend(sched, gathered, backend);
+        }
+    }
 
     ggml_tensor * kq_mask = use_pyramidkv_hybrid || use_pyramidkv_paged
         ? nullptr : inp->get_kq_mask(ctx0, il);
@@ -3519,7 +3563,8 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = ggml_flash_attn_ext_hybrid_paged(ctx0, q_paged, k, v, k_hot, v_hot,
             mctx_cur->get_q_meta(ctx0, il, ubatch.n_tokens),
             mctx_cur->get_k_list(ctx0, il), mctx_cur->get_k_list_len(ctx0, il), kq_scale,
-            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
+            static_cast<int32_t>(cparams.pyramidkv_c1.recent_window));
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
@@ -3554,7 +3599,7 @@ ggml_tensor * llm_graph_context::build_attn(
     if (turbo4_v) {
         const int64_t logical_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
-        cur = llama_graph_turbo4_rotate(ctx0, cur, mctx_cur->get_turbo_rotation_inv());
+        cur = llama_graph_turbo4_rotate(ctx0, cur, mctx_cur->get_turbo_rotation_inv(), true);
         cur = llama_graph_turbo4_cut_v(ctx0, cur, logical_v_head, padded_v_head, hparams.n_head(il));
     } else if (inp->self_v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
@@ -3631,7 +3676,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx;
-    if (llama_graph_type_is_turbo4(mctx_cur->type_k())) {
+    if (llama_graph_type_is_turbo(mctx_cur->type_k())) {
         throw std::runtime_error("TurboQuant4 KV cache does not support MLA/K-only attention");
     }
 
@@ -3693,7 +3738,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_build_forward_expand(gf, k_cur);
 
     const auto * mctx_cur = inp->mctx->get_mla();
-    if (llama_graph_type_is_turbo4(mctx_cur->type_k())) {
+    if (llama_graph_type_is_turbo(mctx_cur->type_k())) {
         throw std::runtime_error("TurboQuant4 KV cache does not support DSA/MLA attention");
     }
 
@@ -3767,9 +3812,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
-    const bool turbo4_k = llama_graph_type_is_turbo4(mctx_cur->type_k());
-    const bool turbo4_v = llama_graph_type_is_turbo4(mctx_cur->type_v());
-    if (turbo4_k != turbo4_v) {
+    const bool turbo4_k = llama_graph_type_is_turbo(mctx_cur->type_k());
+    const bool turbo4_v = llama_graph_type_is_turbo(mctx_cur->type_v());
+    if ((turbo4_k || turbo4_v) && mctx_cur->type_k() != mctx_cur->type_v()) {
         throw std::runtime_error("TurboQuant4 requires symmetric K/V cache types");
     }
 
@@ -3834,7 +3879,7 @@ ggml_tensor * llm_graph_context::build_attn(
     if (turbo4_v) {
         const int64_t logical_v_head = hparams.n_embd_head_v(il);
         const int64_t padded_v_head = v->ne[0];
-        cur = llama_graph_turbo4_rotate(ctx0, cur, mctx_cur->get_turbo_rotation_inv());
+        cur = llama_graph_turbo4_rotate(ctx0, cur, mctx_cur->get_turbo_rotation_inv(), true);
         cur = llama_graph_turbo4_cut_v(ctx0, cur, logical_v_head, padded_v_head, hparams.n_head(il));
     } else if (v_rot) {
         cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
@@ -3874,7 +3919,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
-    if (llama_graph_type_is_turbo4(mctx_cur->type_k())) {
+    if (llama_graph_type_is_turbo(mctx_cur->type_k())) {
         throw std::runtime_error("TurboQuant4 KV cache does not support MLA/K-only attention");
     }
 

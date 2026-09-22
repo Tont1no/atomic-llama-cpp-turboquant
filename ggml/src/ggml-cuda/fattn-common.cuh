@@ -21,6 +21,10 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+static constexpr __host__ __device__ bool ggml_cuda_fattn_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
+}
+
 static inline bool ggml_cuda_fattn_q4_batch_invariant_enabled() {
     static const bool enabled = []() {
         const char * value = std::getenv("GGML_CUDA_FA_Q4_BATCH_INVARIANT");
@@ -400,6 +404,35 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     return sum;
 }
 
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_5(
+        const char * __restrict__ K_c, const void * __restrict__ Q_v,
+        const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_ne = ggml_cuda_get_max_cpy_bytes()/sizeof(float);
+    const float lane_centroid = ggml_cuda_turbo35_centroid_lane();
+    float sum = 0.0f;
+#pragma unroll
+    for (int i0 = 0; i0 < D/2; i0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int i1 = 0; i1 < cpy_ne; ++i1) {
+            const int element = 2*(i0 + (threadIdx.x % nthreads)*cpy_ne + i1);
+            const float2 kv = make_float2(
+                ggml_cuda_turbo35_dequant_value_lane(K_c, element, lane_centroid),
+                ggml_cuda_turbo35_dequant_value_lane(K_c, element + 1, lane_centroid));
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const half2 qv = ((const half2 *) Q_v)[i0/nthreads + i1];
+            ggml_cuda_mad(sum, kv, __half22float2(qv));
+#else
+            const float2 qv = ((const float2 *) Q_v)[i0/nthreads + i1];
+            sum += kv.x*qv.x + kv.y*qv.y;
+#endif
+        }
+    }
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -733,6 +766,72 @@ static __device__ __forceinline__ void vec_dot_fattn_vec_KQ_turbo4_0_cols(
     }
 }
 
+template <int D, int ncols, typename Q_t>
+static __device__ __forceinline__ void vec_dot_fattn_vec_KQ_turbo3_5_cols(
+        const char * __restrict__ K_c, const Q_t * __restrict__ Q_sh, float * __restrict__ sums) {
+    const float lane_centroid = ggml_cuda_turbo35_centroid_lane();
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        sums[j] = 0.0f;
+    }
+#pragma unroll
+    for (int pair = 0; pair < D/2; ++pair) {
+        const float2 kv = make_float2(
+            ggml_cuda_turbo35_dequant_value_lane(K_c, 2*pair, lane_centroid),
+            ggml_cuda_turbo35_dequant_value_lane(K_c, 2*pair + 1, lane_centroid));
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            float2 qv;
+            if constexpr (std::is_same<Q_t, half2>::value) {
+                qv = __half22float2(Q_sh[j*(D/2) + pair]);
+            } else {
+                qv = Q_sh[j*(D/2) + pair];
+            }
+            sums[j] += kv.x*qv.x + kv.y*qv.y;
+        }
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_5_lane(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0, const float lane_centroid) {
+    static_assert(ne == 2 || ne == 4, "bad ne");
+#pragma unroll
+    for (int i = 0; i < ne; ++i) {
+        const float value = ggml_cuda_turbo35_dequant_value_lane(vx, i0 + i, lane_centroid);
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same<T, half>::value) {
+            ((half *) dst)[i] = __float2half(value);
+        } else
+#endif
+        if constexpr (std::is_same<T, float>::value) {
+            ((float *) dst)[i] = value;
+        } else {
+            static_assert(std::is_same<T, void>::value, "unsupported type");
+        }
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_5(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 2 || ne == 4, "bad ne");
+#pragma unroll
+    for (int i = 0; i < ne; ++i) {
+        const float value = ggml_cuda_turbo35_dequant_value(vx, i0 + i);
+#ifdef FP16_AVAILABLE
+        if constexpr (std::is_same<T, half>::value) {
+            ((half *) dst)[i] = __float2half(value);
+        } else
+#endif
+        if constexpr (std::is_same<T, float>::value) {
+            ((float *) dst)[i] = value;
+        } else {
+            static_assert(std::is_same<T, void>::value, "unsupported type");
+        }
+    }
+}
+
 // Same as dequantize_V_turbo4_0 below, with the centroid table shuffled from
 // a lane register instead of read from the serialising constant cache. The
 // flash-attention vector kernel calls it from uniform control flow.
@@ -807,6 +906,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_5) {
+        return vec_dot_fattn_vec_KQ_turbo3_5<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -831,6 +932,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_5) {
+        return dequantize_V_turbo3_5<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

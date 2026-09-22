@@ -359,6 +359,8 @@ public:
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+    ggml_tensor * self_prefill_idxs = nullptr; // I32 [local_n_kv], packed arena row gather
+    llama_seq_id prefill_seq_id = -1;
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -931,6 +933,7 @@ struct llm_graph_pyramidkv_score {
     // paged C1: the sequence this window scores (its last queries in the
     // ubatch); -1 for the single-sequence observer.
     llama_seq_id seq_id = -1;
+    bool sequence_local = false;
 };
 
 class llm_graph_result {

@@ -21,14 +21,15 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-static bool llama_context_type_is_turbo4(ggml_type type) {
-    return type == GGML_TYPE_TURBO4_0;
+static bool llama_context_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
 }
 
 static uint32_t llama_context_turbo4_padded_head(uint32_t head_dim) {
@@ -50,6 +51,75 @@ static llama_kv_cache * llama_context_attention_cache(llama_memory_i * memory) {
     }
     return nullptr;
 }
+
+// Diagnostic only: callback boundaries synchronize execution and can prevent graph/kernel fusion.
+struct llama_pyramidkv_layer_trace {
+    ggml_backend_sched_t sched;
+    void * previous_user_data;
+    llama_pos pos;
+    uint32_t batch;
+    uint32_t nodes = 0;
+    std::vector<float> row;
+
+    llama_pyramidkv_layer_trace(ggml_backend_sched_t sched, void * previous_user_data, llama_pos pos, uint32_t batch)
+        : sched(sched), previous_user_data(previous_user_data), pos(pos), batch(batch) {
+        std::fprintf(stderr, "pyramidkv_trace/v1 event=begin pos=%" PRId32 " batch=%" PRIu32 " row=0 diagnostic_callback_boundaries=1\n", pos, batch);
+        ggml_backend_sched_set_eval_callback(sched, eval, this);
+    }
+
+    ~llama_pyramidkv_layer_trace() {
+        ggml_backend_sched_set_eval_callback(sched, nullptr, previous_user_data);
+        std::fprintf(stderr, "pyramidkv_trace/v1 event=end pos=%" PRId32 " batch=%" PRIu32 " nodes=%" PRIu32 "\n", pos, batch, nodes);
+    }
+
+    static bool wanted(const ggml_tensor * tensor) {
+        if (!tensor || tensor->type != GGML_TYPE_F32 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
+                tensor->ne[2] != 1 || tensor->ne[3] != 1 || tensor->nb[0] != sizeof(float)) {
+            return false;
+        }
+        const char * name = tensor->name;
+        if (std::strcmp(name, "model.input_embed") == 0 || std::strcmp(name, "result_norm") == 0 ||
+                std::strcmp(name, "result_output") == 0) {
+            return true;
+        }
+        if (std::strncmp(name, "l_out-", 6) != 0) {
+            return false;
+        }
+        char * end = nullptr;
+        const long layer = std::strtol(name + 6, &end, 10);
+        return end != name + 6 && *end == '\0' && layer >= 0 && layer < 64;
+    }
+
+    static bool eval(ggml_tensor * tensor, bool ask, void * user_data) {
+        if (ask) {
+            return wanted(tensor);
+        }
+        auto & trace = *static_cast<llama_pyramidkv_layer_trace *>(user_data);
+        trace.row.resize(static_cast<size_t>(tensor->ne[0]));
+        const size_t bytes = trace.row.size() * sizeof(float);
+        ggml_backend_tensor_get(tensor, trace.row.data(), 0, bytes);
+        uint64_t fingerprint = UINT64_C(14695981039346656037);
+        const auto * raw = reinterpret_cast<const unsigned char *>(trace.row.data());
+        for (size_t i = 0; i < bytes; ++i) {
+            fingerprint = (fingerprint ^ raw[i]) * UINT64_C(1099511628211);
+        }
+        double sum = 0.0;
+        double max_abs = 0.0;
+        size_t nonfinite = 0;
+        for (const float value : trace.row) {
+            sum += value;
+            max_abs = std::max(max_abs, std::fabs(static_cast<double>(value)));
+            nonfinite += !std::isfinite(value);
+        }
+        ++trace.nodes;
+        std::fprintf(stderr,
+                "pyramidkv_trace/v1 event=node name=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] pos=%" PRId32
+                " batch=%" PRIu32 " row=0 bytes=%zu fnv1a64=%016" PRIx64 " max_abs=%.17g sum=%.17g nonfinite=%zu\n",
+                tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], trace.pos,
+                trace.batch, bytes, fingerprint, max_abs, sum, nonfinite);
+        return true;
+    }
+};
 //
 // llama_context
 //
@@ -110,9 +180,19 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-static ggml_backend_buffer_type_t llama_graph_tensor_buft(const ggml_tensor * tensor) {
-    while (tensor != nullptr && tensor->view_src != nullptr) {
-        tensor = tensor->view_src;
+static ggml_backend_buffer_type_t llama_graph_kv_source_buft(const ggml_tensor * tensor) {
+    while (tensor != nullptr) {
+        if (tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+        } else if (tensor->op == GGML_OP_GET_ROWS && llama_context_type_is_turbo(tensor->type) &&
+                tensor->src[0] != nullptr && tensor->src[0]->type == tensor->type) {
+            // Sequence-local prefill reads a byte-exact packed subset. Its
+            // scratch buffer is not allocated yet during graph reservation;
+            // device ownership still comes from the original KV storage.
+            tensor = tensor->src[0];
+        } else {
+            break;
+        }
     }
 
     return tensor != nullptr && tensor->buffer != nullptr ?
@@ -136,7 +216,7 @@ static ggml_backend_t llama_backend_for_device(
 }
 
 // Explicit KV storage must drive the operations that read or write that storage.
-// Keep this limited to the real FA path and cache SET_ROWS stores.
+// Keep this limited to real FA, packed cache gathers, and SET_ROWS stores.
 static bool llama_bind_explicit_kv_backend(
         ggml_backend_sched_t       sched,
         ggml_cgraph *              graph,
@@ -160,8 +240,8 @@ static bool llama_bind_explicit_kv_backend(
             // ggml_flash_attn_ext sources are Q, K, V, mask. Only bind FA
             // nodes whose K/V input belongs to the explicit KV buffer.
             const bool uses_kv_buft =
-                llama_graph_tensor_buft(node->src[1]) == kv_buft ||
-                llama_graph_tensor_buft(node->src[2]) == kv_buft;
+                llama_graph_kv_source_buft(node->src[1]) == kv_buft ||
+                llama_graph_kv_source_buft(node->src[2]) == kv_buft;
 
             if (!uses_kv_buft) {
                 continue;
@@ -180,15 +260,20 @@ static bool llama_bind_explicit_kv_backend(
 
         // ggml_set_rows has the legacy order src[0]=values, src[1]=indices,
         // src[2]=the destination cache tensor.
-        if (node->op == GGML_OP_SET_ROWS && llama_graph_tensor_buft(node->src[2]) == kv_buft) {
+        const bool stores_kv = node->op == GGML_OP_SET_ROWS &&
+            llama_graph_kv_source_buft(node->src[2]) == kv_buft;
+        const bool gathers_kv = node->op == GGML_OP_GET_ROWS && llama_context_type_is_turbo(node->type) &&
+            node->src[0] != nullptr && node->src[0]->type == node->type &&
+            llama_graph_kv_source_buft(node->src[0]) == kv_buft;
+        if (stores_kv || gathers_kv) {
             if (!ggml_backend_supports_op(backend, node)) {
-                LLAMA_LOG_ERROR("%s: target KV backend %s does not support SET_ROWS\n",
-                        __func__, ggml_backend_name(backend));
+                LLAMA_LOG_ERROR("%s: target KV backend %s does not support %s\n",
+                        __func__, ggml_backend_name(backend), ggml_op_name(node->op));
                 return false;
             }
 
-            // The destination is the preallocated K/V tensor. Pinning this
-            // node prevents scheduler fallback that would copy the full cache.
+            // Keep cache reads and writes on its device, avoiding scheduler
+            // fallback that would copy the full cache to another backend.
             ggml_backend_sched_set_tensor_backend(sched, node, backend);
         }
     }
@@ -384,15 +469,18 @@ llama_context::llama_context(
         c1_attention_layers += !hparams.is_recr(il);
     }
     if (!llama_pyramidkv_c1_make_config(params.pyramidkv_c1, c1_attention_layers,
-            std::max<std::size_t>(1, cparams.n_ubatch), cparams.pyramidkv_c1,
+            std::max<std::size_t>(1, cparams.n_ubatch), cparams.n_seq_max, cparams.pyramidkv_c1,
             c1_config_error)) {
         throw std::runtime_error(c1_config_error);
     }
     if (cparams.pyramidkv_c1.enabled) {
+        if (cparams.pyramidkv_c1.paged && cparams.pyramidkv_c1.rollback_headroom < cparams.n_rs_seq) {
+            throw std::runtime_error("PyramidKV C1 rollback_headroom must cover the recurrent rollback depth");
+        }
         const bool supported =
             (model.arch == LLM_ARCH_QWEN2 || model.arch == LLM_ARCH_QWEN35) &&
-            params.type_k == GGML_TYPE_TURBO4_0 &&
-            params.type_v == GGML_TYPE_TURBO4_0 &&
+            llama_context_type_is_turbo(params.type_k) &&
+            params.type_v == params.type_k &&
             cparams.flash_attn && cparams.causal_attn &&
             (cparams.n_seq_max == 1 || cparams.pyramidkv_c1.paged) &&
             // Recurrent rollback planes (n_rs_seq) belong to the recurrent
@@ -404,7 +492,7 @@ llama_context::llama_context(
             !cparams.embeddings && !hparams.is_swa_any();
         if (!supported) {
             throw std::runtime_error(
-                "PyramidKV C1 requires Qwen2 or Qwen35 attention, symmetric TQ4 K/V, causal FlashAttention, "
+                "PyramidKV C1 requires Qwen2 or Qwen35 attention, symmetric TQ4 or TQ3.5 K/V, causal FlashAttention, "
                 "one sequence, explicit KV buffer, no SWA/shared context, and embeddings=false");
         }
     }
@@ -848,6 +936,7 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_seqs_pp = c1_kv != nullptr && c1_kv->pyramidkv_c1_local_prefill() ? 1 : n_seqs;
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -875,7 +964,13 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
-    resolve_fused_ops(mctx.get(), n_seqs);
+    if (c1_kv != nullptr && c1_kv->pyramidkv_c1_local_prefill()) {
+        c1_kv->pyramidkv_c1_set_reserve_paged(true);
+        resolve_fused_ops(mctx.get(), n_seqs);
+        c1_kv->pyramidkv_c1_set_reserve_paged(false);
+    } else {
+        resolve_fused_ops(mctx.get(), n_seqs);
+    }
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -888,14 +983,14 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -908,7 +1003,13 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
+        if (c1_kv != nullptr && c1_kv->pyramidkv_c1_local_prefill()) {
+            c1_kv->pyramidkv_c1_set_reserve_paged(true);
+        }
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        if (c1_kv != nullptr && c1_kv->pyramidkv_c1_local_prefill()) {
+            c1_kv->pyramidkv_c1_set_reserve_paged(false);
+        }
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -934,7 +1035,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -1089,6 +1190,48 @@ void llama_context::pyramidkv_c1_drop_stale_paged(const std::vector<llama_seq_id
         pyramidkv_c1_pending_paged.end());
 }
 
+bool llama_context::pyramidkv_c1_apply_pending_paged() {
+    if (!cparams.pyramidkv_c1.enabled || pyramidkv_c1_pending_paged.empty()) {
+        return false;
+    }
+    auto * kv = llama_context_attention_cache(memory.get());
+    if (kv == nullptr) {
+        pyramidkv_c1_pending_paged.clear();
+        throw std::runtime_error("PyramidKV C1 paged selection has no attention cache");
+    }
+    std::string reset_error;
+    if (kv->pyramidkv_c1_reset_failed(reset_error)) {
+        pyramidkv_c1_pending_paged.clear();
+        throw std::runtime_error("PyramidKV C1 reset failed: " + reset_error);
+    }
+    if (kv->pyramidkv_c1_take_selection_stale()) {
+        pyramidkv_c1_pending.clear();
+        pyramidkv_c1_pending_paged.clear();
+        return false;
+    }
+    pyramidkv_c1_drop_stale_paged(kv->pyramidkv_c1_take_stale_seqs());
+    if (pyramidkv_c1_pending_paged.empty()) {
+        return false;
+    }
+
+    // Only lists and cell ownership change. Keep graph tensors and pending output copies intact.
+    try {
+        for (auto & pending : pyramidkv_c1_pending_paged) {
+            std::string error;
+            if (!kv->pyramidkv_c1_paged_apply_selection(pending.first, pending.second, error)) {
+                throw std::runtime_error("PyramidKV C1 paged selection failed: " + error);
+            }
+        }
+    } catch (const std::exception & ex) {
+        LLAMA_LOG_ERROR("%s: C1 paged selection rejected: %s\n", __func__, ex.what());
+        kv->pyramidkv_c1_fail_transition(ex.what());
+        pyramidkv_c1_pending_paged.clear();
+        throw;
+    }
+    pyramidkv_c1_pending_paged.clear();
+    return true;
+}
+
 bool llama_context::memory_update(bool optimize) {
     if (!memory) {
         return false;
@@ -1112,27 +1255,7 @@ bool llama_context::memory_update(bool optimize) {
         pyramidkv_c1_drop_stale_paged(c1_kv->pyramidkv_c1_take_stale_seqs());
     }
 
-    bool pyramidkv_c1_applied = false;
-    if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending_paged.empty()) {
-        auto * kv = llama_context_attention_cache(memory.get());
-        if (kv == nullptr) {
-            pyramidkv_c1_pending_paged.clear();
-            return false;
-        }
-        // Bookkeeping only: lists per layer/head, freed cells. The arena and
-        // the graph tensors stay; no reserve.
-        for (auto & pending : pyramidkv_c1_pending_paged) {
-            std::string error;
-            if (!kv->pyramidkv_c1_paged_apply_selection(pending.first, pending.second, error)) {
-                LLAMA_LOG_ERROR("%s: C1 paged selection rejected: %s\n", __func__, error.c_str());
-                kv->pyramidkv_c1_fail_transition(error);
-                pyramidkv_c1_pending_paged.clear();
-                throw std::runtime_error("PyramidKV C1 paged selection failed: " + error);
-            }
-        }
-        pyramidkv_c1_pending_paged.clear();
-        pyramidkv_c1_applied = true;
-    }
+    bool pyramidkv_c1_applied = pyramidkv_c1_apply_pending_paged();
     if (cparams.pyramidkv_c1.enabled && !pyramidkv_c1_pending.empty()) {
         auto * kv = llama_context_attention_cache(memory.get());
         if (kv == nullptr) {
@@ -1199,7 +1322,8 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const auto * c1_kv = llama_context_attention_cache(memory.get());
+        const uint32_t n_seqs = c1_kv != nullptr && c1_kv->pyramidkv_c1_local_prefill() ? 1 : cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -1990,7 +2114,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool phase_timing_enabled = cparams.pyramidkv_c1.enabled;
     const int64_t graph_compute_submit_start_us = phase_timing_enabled ? ggml_time_us() : 0;
 #endif
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = [&]() {
+        const char * trace_pos = std::getenv("LLAMA_PYRAMIDKV_TRACE_POS");
+        if (trace_pos && *trace_pos && model.arch == LLM_ARCH_QWEN35 &&
+                cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && gtype == LLM_GRAPH_TYPE_DEFAULT &&
+                cparams.pyramidkv_c1.enabled && cparams.n_seq_max == 1 &&
+                ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.n_tokens > 0 && ubatch.pos) {
+            char * end = nullptr;
+            const long long requested = std::strtoll(trace_pos, &end, 10);
+            if (end != trace_pos && *end == '\0' && requested >= 0 && requested == ubatch.pos[0]) {
+                if (cparams.cb_eval) {
+                    std::fprintf(stderr, "pyramidkv_trace/v1 event=disabled pos=%" PRId32 " reason=existing_cb_eval\n", ubatch.pos[0]);
+                } else if (!ubatch.output || !ubatch.output[0]) {
+                    std::fprintf(stderr, "pyramidkv_trace/v1 event=disabled pos=%" PRId32 " reason=first_token_has_no_output_row\n", ubatch.pos[0]);
+                } else {
+                    // Install per execution, including reused graphs. Read only the first contiguous F32 row.
+                    llama_pyramidkv_layer_trace trace(sched.get(), cparams.cb_eval_user_data, ubatch.pos[0], ubatch.n_tokens);
+                    return graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+                }
+            }
+        }
+        return graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    }();
 #if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
     if (phase_timing_enabled) {
         ++pyramidkv_c1_phase_timing_stats.graph_compute_submit_calls;
@@ -2669,6 +2814,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // Release paged prompt cells before admission waits for room for another sequence.
+    pyramidkv_c1_apply_pending_paged();
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -3127,6 +3275,11 @@ static void ubatch_prepare_reserve(
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     auto * c1_kv = llama_context_attention_cache(memory.get());
+    if (c1_kv != nullptr && c1_kv->pyramidkv_c1_local_prefill() &&
+            !c1_kv->pyramidkv_c1_reserve_paged_active() && n_seqs != 1) {
+        LLAMA_LOG_ERROR("%s: local prefill reserve requires one sequence\n", __func__);
+        return nullptr;
+    }
     if (c1_kv != nullptr) {
         std::string reset_error;
         if (c1_kv->pyramidkv_c1_reset_failed(reset_error)) {
@@ -3415,7 +3568,7 @@ bool llama_context::extract_pyramidkv_scores(
                 uint32_t active_tokens = 0;
                 if (!kv->pyramidkv_c1_key_positions(node.il, static_cast<uint32_t>(node.key_tokens),
                         score.key_positions_per_head, score.key_cells_per_head,
-                        score.key_score_slots_per_head, active_tokens, error, seq)) {
+                        score.key_score_slots_per_head, active_tokens, error, seq, node.sequence_local)) {
                     return fail(error);
                 }
                 score.key_tokens = 0;
@@ -4329,11 +4482,13 @@ void llama_context::pyramidkv_c1_phase_timing_print() const {
     const auto & context = pyramidkv_c1_phase_timing_stats;
     LLAMA_LOG_INFO("%s: C1 host-wall map_us=%" PRIu64 " calls=%" PRIu64
         " read=%" PRIu64 " hot_read=%" PRIu64 " write=%" PRIu64
-        " hot_write=%" PRIu64 " pos=%" PRIu64 " mask=%" PRIu64 "\n",
+        " hot_write=%" PRIu64 " pos=%" PRIu64 " mask=%" PRIu64
+        " list_upload_calls=%" PRIu64 " list_upload_bytes=%" PRIu64 "\n",
         __func__, cache.input_map_us, cache.input_map_calls,
         cache.input_map_read_elems, cache.input_map_hot_read_elems,
         cache.input_map_write_elems, cache.input_map_hot_write_elems,
-        cache.input_map_position_elems, cache.input_map_mask_elems);
+        cache.input_map_position_elems, cache.input_map_mask_elems,
+        cache.list_upload_calls, cache.list_upload_bytes);
     LLAMA_LOG_INFO("%s: C1 host-wall observer_events=%" PRIu64
         " sync_us=%" PRIu64 " readback_us=%" PRIu64 " readbacks=%" PRIu64
         " bytes=%" PRIu64 "\n",
@@ -4685,9 +4840,11 @@ llama_context_params llama_context_default_params() {
             /*.observer_chunk         =*/ 1,
             /*.transition_max_bytes  =*/ 8ull*1024ull*1024ull*1024ull,
             /*.hot_capacity           =*/ 384,
+            /*.rollback_headroom      =*/ 0,
             /*.paged                  =*/ false,
             /*.list_capacity          =*/ 0,
             /*.paged_union_factor     =*/ 4,
+            /*.max_prefill_cells      =*/ 0,
         },
         /*.tq4_key_center             =*/ false,
     };
@@ -4734,9 +4891,9 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    const bool turbo4_k = llama_context_type_is_turbo4(params.type_k);
-    const bool turbo4_v = llama_context_type_is_turbo4(params.type_v);
-    if (turbo4_k != turbo4_v) {
+    const bool turbo4_k = llama_context_type_is_turbo(params.type_k);
+    const bool turbo4_v = llama_context_type_is_turbo(params.type_v);
+    if ((turbo4_k || turbo4_v) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: TurboQuant4 requires symmetric K/V cache types\n", __func__);
         return nullptr;
     }

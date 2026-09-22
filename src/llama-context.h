@@ -393,9 +393,10 @@ private:
     // Replaced on every completed C1 graph.  memory_update() consumes it at
     // the synchronized point before reserving the next graph.
     std::vector<llama_pyramidkv_c1_layer_selection> pyramidkv_c1_pending;
-    // paged C1: one selection per sequence whose prompt ended in the ubatch
+    // Paged selections are committed before the next ubatch or before decode returns.
     std::vector<std::pair<llama_seq_id, std::vector<llama_pyramidkv_c1_layer_selection>>> pyramidkv_c1_pending_paged;
     void pyramidkv_c1_drop_stale_paged(const std::vector<llama_seq_id> & stale);
+    bool pyramidkv_c1_apply_pending_paged();
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

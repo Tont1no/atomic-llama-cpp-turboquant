@@ -29,6 +29,8 @@ struct llama_pyramidkv_c1_phase_timing {
     uint64_t input_map_hot_write_elems = 0;
     uint64_t input_map_position_elems = 0;
     uint64_t input_map_mask_elems = 0;
+    uint64_t list_upload_calls = 0;
+    uint64_t list_upload_bytes = 0;
 
     // Observer host wall-time while waiting for and reading scores.
     uint64_t observer_events = 0;
@@ -92,9 +94,11 @@ struct llama_pyramidkv_c1_config {
     std::size_t transition_max_bytes = 8ull*1024ull*1024ull*1024ull;
     std::size_t continuation_headroom = 1;
     std::size_t hot_capacity = 384;
+    std::size_t rollback_headroom = 0;
     bool paged = false;
     std::size_t list_capacity = 0;
     std::size_t paged_union_factor = 4;
+    std::size_t max_prefill_cells = 0;
 };
 
 struct llama_pyramidkv_c1_score {
@@ -139,7 +143,15 @@ bool llama_pyramidkv_c1_make_config(
         const llama_pyramidkv_c1_params & params,
         std::size_t layer_count,
         std::size_t continuation_headroom,
+        std::size_t n_seq_max,
         llama_pyramidkv_c1_config & output,
+        std::string & error);
+
+bool llama_pyramidkv_c1_prefill_rows(
+        const llama_pyramidkv_c1_config & config,
+        uint32_t arena_cells,
+        std::size_t live_cells,
+        uint32_t & rows,
         std::string & error);
 
 bool llama_pyramidkv_c1_select(

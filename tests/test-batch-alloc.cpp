@@ -411,6 +411,69 @@ static void test_split(testing & t) {
         t.assert_true("coupled sequences retain one index per input row", ba.get_input_ids() == std::vector<int32_t>({0, 1}));
     });
 
+    t.test("split_equal_selected_decode_and_single_prefill", [&](testing & t) {
+        batch_builder bb;
+        const llama_seq_id seqs[] = {1, 2, 3, 0};
+        const int lengths[] = {5, 2, 4, 2};
+        for (size_t s = 0; s < 4; ++s) {
+            for (int pos = 0; pos < lengths[s]; ++pos) {
+                bb.add(pos, {seqs[s]}, pos + 1 == lengths[s]);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        if (!t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false))) {
+            return;
+        }
+        const auto selected = [](llama_seq_id seq) { return seq == 0 || seq == 2; };
+        auto split = [&]() {
+            auto ub = ba.split_equal(4, false, 2, selected);
+            if (ub.n_tokens == 0) {
+                ub = ba.split_equal(4, false, 4, [&](llama_seq_id seq) { return !selected(seq); }, true);
+            }
+            return ub;
+        };
+
+        std::vector<float> hidden;
+        const uint32_t sizes[] = {4, 1, 4, 4};
+        for (size_t u = 0; u < 4; ++u) {
+            const auto ub = split();
+            if (!t.assert_equal(sizes[u], ub.n_tokens)) {
+                return;
+            }
+            t.assert_true(ub.equal_seqs());
+            t.assert_equal("decoders stay grouped; prefills stay separate", u == 0 ? 2u : 1u, ub.n_seqs_unq);
+            for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+                t.assert_true("no mixed attention phases", selected(ub.seq_id[i][0]) == (u == 0));
+            }
+            if (u == 0) {
+                t.assert_equal("both decoder rollback tails remain whole", 2u, ub.n_seq_tokens);
+            }
+            if (u == 2) {
+                t.assert_equal("final observer window starts before the prompt end", 1, ub.pos[0]);
+                t.assert_equal(4, ub.pos[3]);
+                t.assert_equal(1, (int) ub.output[3]);
+            }
+            hidden.insert(hidden.end(), ub.embd, ub.embd + (size_t) ub.n_tokens * bb.n_embd);
+        }
+        t.assert_equal(0u, split().n_tokens);
+        t.assert_equal(ba.get_n_tokens(), ba.get_n_used());
+        t.assert_true(ba.get_input_ids() == std::vector<int32_t>({5, 6, 11, 12, 0, 1, 2, 3, 4, 7, 8, 9, 10}));
+        t.assert_true("sparse logits follow extraction order", ba.get_out_ids() == std::vector<int32_t>({6, 12, 4, 10}));
+        llama_row_reorder reorder;
+        if (!t.assert_true(reorder.prepare(ba.get_input_ids(), ba.get_n_tokens()))) {
+            return;
+        }
+        t.assert_true(reorder.apply({{hidden.data(), hidden.size(), bb.n_embd}}));
+        t.assert_true("hidden rows recover the original batch order", hidden == bb.embd);
+
+        batch_builder shared;
+        shared.add(0, {0, 1}, true);
+        t.assert_true(ba.init(shared.make(), vocab, nullptr, shared.n_embd, 4, false));
+        t.assert_equal("a filter must select every owner of a shared row", 0u, ba.split_equal(4, false, 0, selected).n_tokens);
+        t.assert_equal(0u, ba.get_n_used());
+    });
+
     t.test("split_seq_per_sequence", [&](testing & t) {
         batch_builder bb;
         for (llama_seq_id s = 0; s < 3; ++s) {

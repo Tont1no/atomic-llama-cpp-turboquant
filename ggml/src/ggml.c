@@ -988,6 +988,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
     },
+    [GGML_TYPE_TURBO3_5] = {
+        .type_name                = "turbo3_5",
+        .blck_size                = GGML_TURBO3_5_QK,
+        .type_size                = sizeof(block_turbo3_5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_5,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_5_ref,
+    },
     [36] = { // GGML_TYPE_IQ4_NL_4_4
         .type_name                = "TYPE_IQ4_NL_4_4 REMOVED, use IQ4_NL with runtime repacking",
         .blck_size                = 0,
@@ -3975,6 +3983,25 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_get_rows_quantized(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_TURBO4_0 || a->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(a->ne[0] % ggml_blck_size(a->type) == 0);
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+    GGML_ASSERT(a->nb[1] >= ggml_row_size(a->type, a->ne[0]));
+    GGML_ASSERT(a->ne[2] == b->ne[1] && a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1 && b->type == GGML_TYPE_I32);
+    GGML_ASSERT(b->nb[0] == sizeof(int32_t) && b->nb[1] % sizeof(int32_t) == 0 && b->nb[2] % sizeof(int32_t) == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+    result->op = GGML_OP_GET_ROWS;
+    result->src[0] = a;
+    result->src[1] = b;
+    return result;
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(
@@ -5554,12 +5581,13 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid(
         float                 logit_softcap) {
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->nb[0] == sizeof(float));
     GGML_ASSERT(k_cold->nb[0] == ggml_type_size(k_cold->type) && v_cold->nb[0] == ggml_type_size(v_cold->type));
     GGML_ASSERT(k_hot->nb[0] == sizeof(ggml_fp16_t) && v_hot->nb[0] == sizeof(ggml_fp16_t));
-    // TQ4 stores 128 values per block. A logical D64 head is represented by
+    // Both rotated KV formats store 128 values per block. A logical D64 head is represented by
     // the padded D128 storage row; callers use scale = 1/sqrt(64).
     GGML_ASSERT(q->ne[0] == 128 || q->ne[0] == 256);
     GGML_ASSERT(q->ne[0] == k_cold->ne[0] && q->ne[0] == v_cold->ne[0]);
@@ -5632,10 +5660,12 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
         struct ggml_tensor  * k_list,
         struct ggml_tensor  * k_list_len,
         float                 scale,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        int32_t               recent_window) {
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);
     GGML_ASSERT(q->nb[0] == sizeof(float));
@@ -5652,8 +5682,9 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
     GGML_ASSERT(q->ne[2] > 0 && q->ne[2] % k_cold->ne[2] == 0);
     GGML_ASSERT(ggml_is_contiguous(q_meta) && ggml_is_contiguous(k_list) && ggml_is_contiguous(k_list_len));
     GGML_ASSERT(q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[1]);
-    GGML_ASSERT(k_list->ne[0] == 2 && k_list->ne[1] > 0 && k_list->ne[2] == k_cold->ne[2] && k_list->ne[3] > 0);
+    GGML_ASSERT(k_list->ne[0] == 3 && k_list->ne[1] > 0 && k_list->ne[2] == k_cold->ne[2] && k_list->ne[3] > 0);
     GGML_ASSERT(k_list_len->ne[0] == k_cold->ne[2] && k_list_len->ne[1] == k_list->ne[3]);
+    GGML_ASSERT(recent_window > 0);
 
     int64_t ne[4] = { v_hot->ne[0], q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -5661,6 +5692,7 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
     float params[] = { scale, 0.0f, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
     ggml_set_op_params_i32(result, 4, 1); // hybrid mode: paged lists
+    ggml_set_op_params_i32(result, 5, recent_window);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -8200,6 +8232,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TQ1_0:   result = quantize_tq1_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TQ2_0:   result = quantize_tq2_0  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO4_0: result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO3_5: result = quantize_turbo3_5(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XXS: result = quantize_iq2_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ2_XS:  result = quantize_iq2_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

@@ -1,5 +1,6 @@
 #include "speculative.h"
 #include "speculative-mtp-state.h"
+#include "speculative-dflash-state.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1213,11 +1214,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         return true;
     }
 
+    bool prune_history(llama_seq_id seq_id, const llama_pos * positions, int32_t count) {
+        return common_speculative_dflash_prune_history(seq_id, n_seq, params.swa_history_window,
+                positions, count, [&](int32_t owner, int32_t p0, int32_t p1) {
+                    const bool ok = llama_memory_seq_rm(llama_get_memory(params.ctx_dft), owner, p0, p1);
+                    if (!ok) {
+                        LOG_ERR("%s: drafter history trim failed for seq_id=%d range=[%d,%d)\n",
+                                __func__, owner, p0, p1);
+                    }
+                    return ok;
+                });
+    }
+
     bool inject_features(llama_seq_id seq_id, const float * rows, const llama_pos * positions, int32_t count,
             bool device = false, size_t row_offset = 0) {
         const int32_t quantum = (int32_t) llama_n_ubatch(params.ctx_dft);
         for (int32_t offset = 0; offset < count; offset += quantum) {
             const int32_t size = std::min(quantum, count - offset);
+            if (!prune_history(seq_id, positions + offset, size)) return false;
             batch_inject.n_tokens = size;
             if (!device) std::memcpy(batch_inject.embd, rows + (size_t) offset * n_embd_enc,
                     (size_t) size * n_embd_enc * sizeof(float));
@@ -1468,6 +1482,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                if (!prune_history(seq_id, batch_in.pos + i_batch_beg[seq_id] + offset, n_chunk)) return false;
 
                 {
                     common_time_meas timing(profile.feature_gather_cpu_wall_us, !profile.enabled);

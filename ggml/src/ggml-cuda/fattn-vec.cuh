@@ -88,10 +88,10 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr bool K_is_unquantized = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || type_K == GGML_TYPE_TURBO4_0;
-    constexpr bool V_is_unquantized = type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || type_V == GGML_TYPE_TURBO4_0;
-    constexpr bool K_is_turbo = type_K == GGML_TYPE_TURBO4_0;
-    constexpr bool V_is_turbo = type_V == GGML_TYPE_TURBO4_0;
+    constexpr bool K_is_unquantized = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || ggml_cuda_fattn_type_is_turbo(type_K);
+    constexpr bool V_is_unquantized = type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || ggml_cuda_fattn_type_is_turbo(type_V);
+    constexpr bool K_is_turbo = ggml_cuda_fattn_type_is_turbo(type_K);
+    constexpr bool V_is_turbo = ggml_cuda_fattn_type_is_turbo(type_V);
     constexpr int nthreads_KQ = K_is_turbo ? 1 : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
     constexpr int nthreads_V  = V_is_unquantized ? (V_is_turbo ? (nthreads_V_q/8 > 1 ? nthreads_V_q/8 : 1) : 128 / cpy_nb) : nthreads_V_q;
 
@@ -168,7 +168,9 @@ static __global__ void flash_attn_ext_vec(
     __builtin_assume(tid < nthreads);
 
     // TQ4 rows look their 4-bit codes up in a warp-resident centroid table.
-    const float lane_centroid = V_is_turbo || K_is_turbo ? ggml_cuda_turbo4_centroid_lane() : 0.0f;
+    const float lane_centroid = type_K == GGML_TYPE_TURBO3_5
+        ? ggml_cuda_turbo35_centroid_lane()
+        : (V_is_turbo || K_is_turbo ? ggml_cuda_turbo4_centroid_lane() : 0.0f);
 
     constexpr int ne_KQ      = ncols*D;
     constexpr int ne_combine = nwarps*V_cols_per_iter*D;
@@ -352,7 +354,11 @@ static __global__ void flash_attn_ext_vec(
 
             float sums[ncols];
             if constexpr (q_shared) {
-                vec_dot_fattn_vec_KQ_turbo4_0_cols<D, ncols, Q_sh_t>(K + i_KQ*nb11, Q_sh, sums);
+                if constexpr (type_K == GGML_TYPE_TURBO3_5) {
+                    vec_dot_fattn_vec_KQ_turbo3_5_cols<D, ncols, Q_sh_t>(K + i_KQ*nb11, Q_sh, sums);
+                } else {
+                    vec_dot_fattn_vec_KQ_turbo4_0_cols<D, ncols, Q_sh_t>(K + i_KQ*nb11, Q_sh, sums);
+                }
             } else {
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
@@ -435,9 +441,15 @@ static __global__ void flash_attn_ext_vec(
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else if constexpr (V_is_turbo) {
-                    dequantize_V_turbo4_0_lane<half, V_rows_per_thread>(V + k*nb21, tmp,
+                    if constexpr (type_V == GGML_TYPE_TURBO3_5) {
+                        dequantize_V_turbo3_5_lane<half, V_rows_per_thread>(V + k*nb21, tmp,
+                            2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread,
+                            lane_centroid);
+                    } else {
+                        dequantize_V_turbo4_0_lane<half, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread,
                         lane_centroid);
+                    }
                 } else {
                     dequantize_V(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
@@ -460,9 +472,15 @@ static __global__ void flash_attn_ext_vec(
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 float2 tmp[V_rows_per_thread/2];
                 if constexpr (V_is_turbo) {
-                    dequantize_V_turbo4_0_lane<float, V_rows_per_thread>(V + k*nb21, tmp,
+                    if constexpr (type_V == GGML_TYPE_TURBO3_5) {
+                        dequantize_V_turbo3_5_lane<float, V_rows_per_thread>(V + k*nb21, tmp,
+                            2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread,
+                            lane_centroid);
+                    } else {
+                        dequantize_V_turbo4_0_lane<float, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread,
                         lane_centroid);
+                    }
                 } else {
                     dequantize_V(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
@@ -675,7 +693,7 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if constexpr (type_K == GGML_TYPE_TURBO4_0 && type_V == GGML_TYPE_TURBO4_0) {
+    if constexpr (ggml_cuda_fattn_type_is_turbo(type_K) && type_K == type_V) {
         // Single-token decode with grouped query attention: bundle the Q heads
         // of a K/V head so the quantized rows are decoded once per group.
         const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -766,3 +784,6 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 
 EXTERN_DECL_FATTN_VEC_TURBO4(128)
 EXTERN_DECL_FATTN_VEC_TURBO4(256)
+
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_5, GGML_TYPE_TURBO3_5);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_5, GGML_TYPE_TURBO3_5);

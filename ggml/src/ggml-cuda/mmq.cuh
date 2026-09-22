@@ -9,6 +9,10 @@
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
+#define MMQ_BATCH_INVARIANT_COLS 32
+#define MMQ_BATCH_INVARIANT_J     8
+
+bool ggml_cuda_mmq_batch_invariant(ggml_type type, int cc, int64_t ncols);
 
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -1439,16 +1443,22 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const bool batch_invariant = !args.ids_dst && ggml_cuda_mmq_batch_invariant(type, cc, args.ncols_max);
+    // Split narrow projections only by weight shape, never by batch or sequence count.
+    // With grid = tiles * splits, the existing ordered fixup has the same K partitions for every tile.
+    const int batch_invariant_splits = batch_invariant && args.nrows_x <= 128 ?
+        int(std::max<int64_t>(1, std::min<int64_t>(8, args.ncols_x / MMQ_ITER_K))) : 1;
 
-    GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+    GGML_ASSERT(int64_t(ntiles_dst) * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+    const dim3 block_nums_stream_k(batch_invariant ? ntiles_dst * batch_invariant_splits :
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm), 1, 1);
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
     if (fixup_needed) {
-        tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
+        tmp_fixup.alloc(size_t(block_nums_stream_k.x) * config.J*config.I);
     }
 
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
@@ -1477,6 +1487,13 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+    if (!args.ids_dst && ggml_cuda_mmq_batch_invariant(type, cc, args.ncols_max)) {
+        const auto config = ggml_cuda_mmq_get_config(type, MMQ_BATCH_INVARIANT_J, fallback, cc);
+        GGML_ASSERT(config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo);
+        launch_mul_mat_q<type, MMQ_BATCH_INVARIANT_J, fallback>(ctx, args, stream);
+        return;
+    }
 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;

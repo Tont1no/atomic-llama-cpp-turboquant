@@ -84,6 +84,7 @@ typedef sycl::half2 ggml_half2;
 #endif // __cplusplus
 
 #include "ggml-turbo4.h"
+#include "ggml-turbo3_5.h"
 
 // QK = number of values after dequantization
 // QK_K = super-block size
@@ -296,6 +297,17 @@ typedef struct {
     uint8_t qs[GGML_TURBO4_PACKED_BYTES];
 } block_turbo4_0;
 static_assert(sizeof(block_turbo4_0) == GGML_TURBO4_BLOCK_BYTES, "wrong turbo4_0 block size/padding");
+
+// Experimental TurboQuant3.5: one WHT128 block, 3.5 payload bits/value.
+// Byte offsets: norm=0, rnorm=2, qs4=4, qs3=36. Reserved rnorm must be zero.
+typedef struct {
+    ggml_half norm;
+    ggml_half rnorm;
+    uint8_t qs4[GGML_TURBO3_5_QS4_BYTES];
+    uint8_t qs3[GGML_TURBO3_5_QS3_BYTES];
+} block_turbo3_5;
+static_assert(sizeof(block_turbo3_5) == GGML_TURBO3_5_BLOCK_BYTES, "wrong turbo3_5 block size/padding");
+static_assert(GGML_TURBO3_5_QK == GGML_TURBO4_QK, "turbo3_5 requires the TQ4 WHT128 basis");
 
 //
 // Super-block quantization structures

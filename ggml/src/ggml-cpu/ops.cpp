@@ -1264,6 +1264,7 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_5:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4811,6 +4812,7 @@ void ggml_compute_forward_set(
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_5:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5018,6 +5020,26 @@ void ggml_compute_forward_get_rows(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_5) {
+        const ggml_tensor * ids = dst->src[1];
+        GGML_ASSERT(src0->type == dst->type && ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(src0->ne[0] == dst->ne[0] && ggml_is_contiguous(dst));
+        GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
+        GGML_ASSERT(src0->ne[2] == ids->ne[1] && src0->ne[3] == ids->ne[2]);
+        const size_t row_bytes = ggml_row_size(src0->type, src0->ne[0]);
+        GGML_ASSERT(src0->nb[1] >= row_bytes);
+        for (int64_t row = params->ith; row < ggml_nelements(ids); row += params->nth) {
+            const int64_t i2 = row / (ids->ne[0] * ids->ne[1]);
+            const int64_t i1 = (row / ids->ne[0]) % ids->ne[1];
+            const int64_t i0 = row % ids->ne[0];
+            const int32_t index = *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1] + i2*ids->nb[2]);
+            GGML_ASSERT(index >= 0 && index < src0->ne[1]);
+            memcpy((char *) dst->data + row*row_bytes,
+                (const char *) src0->data + index*src0->nb[1] + i1*src0->nb[2] + i2*src0->nb[3], row_bytes);
+        }
+        return;
+    }
+
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -5037,6 +5059,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_5:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5795,6 +5818,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_5:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -8728,7 +8752,8 @@ static void ggml_compute_forward_flash_attn_ext_hybrid(
     const ggml_tensor * k_positions = dst->src[8];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->nb[0] == sizeof(float));
     GGML_ASSERT(k_cold->nb[0] == ggml_type_size(k_cold->type) && v_cold->nb[0] == ggml_type_size(v_cold->type));
@@ -8878,7 +8903,7 @@ static void ggml_compute_forward_flash_attn_ext_hybrid(
 }
 
 // Paged hybrid attention reference (ggml_flash_attn_ext_hybrid_paged): each
-// query token walks its sequence's per-KV-head (row_code, position) list.
+// query token walks its sequence's per-KV-head (arena row, position, hot row) list.
 static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -8892,7 +8917,8 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
     const ggml_tensor * k_list_len = dst->src[9];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 && v_cold->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q_meta && k_list && k_list_len);
     GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);
@@ -8904,7 +8930,7 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
     GGML_ASSERT(q->ne[2] % k_cold->ne[2] == 0);
     GGML_ASSERT(k_cold->ne[2] == k_hot->ne[2]);
     GGML_ASSERT(q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[1]);
-    GGML_ASSERT(k_list->ne[0] == 2 && k_list->ne[2] == k_cold->ne[2]);
+    GGML_ASSERT(k_list->ne[0] == 3 && k_list->ne[2] == k_cold->ne[2]);
     GGML_ASSERT(k_list_len->ne[0] == k_cold->ne[2] && k_list_len->ne[1] == k_list->ne[3]);
 
     GGML_TENSOR_LOCALS(size_t, nbq, q, nb)
@@ -8916,7 +8942,9 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
     const int64_t n_seq = k_list->ne[3];
     const int64_t max_len = k_list->ne[1];
     const int64_t q_to_kv = q->ne[2] / n_kv_heads;
-    const int32_t hot_bit = 0x40000000;
+    int32_t recent_window;
+    memcpy(&recent_window, (const int32_t *) dst->op_params + 5, sizeof(recent_window));
+    GGML_ASSERT(recent_window > 0);
 
     float scale = 1.0f;
     float logit_softcap = 0.0f;
@@ -8957,20 +8985,22 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
 
         if (q_seq >= 0 && q_seq < n_seq) {
             const int64_t n_keys = MIN((int64_t) lens[kv_head + n_kv_heads*q_seq], max_len);
-            const int32_t * list = lists + 2*max_len*(kv_head + n_kv_heads*q_seq);
+            const int32_t * list = lists + 3*max_len*(kv_head + n_kv_heads*q_seq);
             for (int64_t ik = 0; ik < n_keys; ++ik) {
-                const int32_t code = list[2*ik + 0];
-                const int32_t key_pos = list[2*ik + 1];
-                if (code < 0 || key_pos < 0 || q_position < key_pos) {
+                const int32_t cold_row = list[3*ik + 0];
+                const int32_t key_pos = list[3*ik + 1];
+                const int32_t hot_row = list[3*ik + 2];
+                if (q_position < key_pos) {
+                    break;
+                }
+                if (cold_row < 0 || cold_row >= k_cold->ne[1] || key_pos < 0) {
                     continue;
                 }
-                const bool hot = (code & hot_bit) != 0;
-                const int64_t local_key = code & (hot_bit - 1);
+                const bool hot = static_cast<int64_t>(q_position) - key_pos < recent_window;
+                GGML_ASSERT(!hot || (hot_row >= 0 && hot_row < k_hot->ne[1]));
+                const int64_t local_key = hot ? hot_row : cold_row;
                 const ggml_tensor * kt = hot ? k_hot : k_cold;
                 const ggml_tensor * vt = hot ? v_hot : v_cold;
-                if (local_key >= kt->ne[1]) {
-                    continue;
-                }
                 const char * k_data = (const char *) kt->data + local_key*kt->nb[1] + kv_head*kt->nb[2];
                 const char * v_data = (const char *) vt->data + local_key*vt->nb[1] + kv_head*vt->nb[2];
                 if (hot) {

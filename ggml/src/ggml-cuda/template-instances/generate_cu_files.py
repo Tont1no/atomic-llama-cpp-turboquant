@@ -75,6 +75,12 @@ for type_k in TYPES_KV:
         with open(f"fattn-vec-instance-{get_short_name(type_k)}-{get_short_name(type_v)}.cu", "w") as f:
             f.write(SOURCE_FATTN_VEC.format(type_k=type_k, type_v=type_v))
 
+# Rotated KV formats are symmetric and pad D64 to D128.
+for type_kv in ["GGML_TYPE_TURBO4_0", "GGML_TYPE_TURBO3_5"]:
+    source = SOURCE_FATTN_VEC.replace("DECL_FATTN_VEC_CASE( 64, {type_k}, {type_v});\n", "")
+    with open(f"fattn-vec-instance-{get_short_name(type_kv)}-{get_short_name(type_kv)}.cu", "w") as f:
+        f.write(source.format(type_k=type_kv, type_v=type_kv))
+
 for ncols in [8, 16, 32, 64]:
     for ncols2 in [1, 2, 4, 8, 16, 32]:
         if ncols2 > ncols:

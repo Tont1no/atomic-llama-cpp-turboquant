@@ -4,6 +4,29 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+
+bool ggml_cuda_mmq_batch_invariant(ggml_type type, int cc, int64_t ncols) {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_BATCH_INVARIANT_MMQ");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled || cc != GGML_CUDA_CC_BLACKWELL || ncols < 1 || ncols > MMQ_BATCH_INVARIANT_COLS) {
+        return false;
+    }
+    // These formats cover the current dense Qwen35 artifact.
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_S:
+            return ggml_cuda_should_use_mmq(type, cc, ncols, 0);
+        default:
+            return false;
+    }
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -133,8 +156,11 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
+        // Cooperative loads can read beyond the J8 tile; retain the full tail reserve.
+        const int pad_cols = ggml_cuda_mmq_batch_invariant(src0->type, cc, ne11) ?
+            MMQ_BATCH_INVARIANT_COLS : ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            pad_cols * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {

@@ -215,6 +215,9 @@ typedef pthread_t ggml_thread_t;
 static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
+static void ggml_vec_dot_turbo3_5_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
@@ -417,6 +420,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_TURBO4_0] = {
         .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_5] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_5_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_5_f32,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -3463,6 +3472,25 @@ static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
         for (int i = 0; i < GGML_TURBO4_QK; ++i) {
             const uint8_t index = (x[block].qs[i / 2] >> ((i & 1) * 4)) & 0x0f;
             sum += (centroids[index] * norm) * y[block * GGML_TURBO4_QK + i];
+        }
+    }
+    *s = sum;
+}
+
+static void ggml_vec_dot_turbo3_5_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1 && n % GGML_TURBO3_5_QK == 0);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    const block_turbo3_5 * x = (const block_turbo3_5 *) vx;
+    const float * y = (const float *) vy;
+    float sum = 0.0f;
+    for (int block = 0; block < n / GGML_TURBO3_5_QK; ++block) {
+        float values[GGML_TURBO3_5_QK];
+        dequantize_row_turbo3_5(x + block, values, GGML_TURBO3_5_QK);
+        for (int i = 0; i < GGML_TURBO3_5_QK; ++i) {
+            sum += values[i] * y[block * GGML_TURBO3_5_QK + i];
         }
     }
     *s = sum;

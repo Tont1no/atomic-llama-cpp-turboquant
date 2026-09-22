@@ -2,6 +2,33 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+static __global__ void k_get_rows_quantized(
+        const char * src0, const int32_t * src1, char * dst,
+        const size_t row_bytes, const int64_t src_rows, const int64_t dst_rows,
+        const int64_t ne10, const int64_t ne11,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+
+    for (int64_t row = blockIdx.x; row < dst_rows; row += gridDim.x) {
+        const int64_t i10 = row % ne10;
+        const int64_t i11 = (row / ne10) % ne11;
+        const int64_t i12 = row / (ne10 * ne11);
+        const int32_t i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        if (i01 < 0 || i01 >= src_rows) {
+            __trap();
+            return;
+        }
+
+        const char * src_row = src0 + i01*nb01 + i11*nb02 + i12*nb03;
+        char * dst_row = dst + row*row_bytes;
+        for (size_t i = threadIdx.x; i < row_bytes; i += blockDim.x) {
+            dst_row[i] = src_row[i];
+        }
+    }
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -344,6 +371,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_TURBO4_0:
+            get_rows_cuda_q<GGML_TURBO4_QK, 1, dequantize_turbo4_0>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TURBO3_5:
+            get_rows_cuda_q<GGML_TURBO3_5_QK, 1, dequantize_turbo3_5>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q2_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -453,6 +488,30 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_5) {
+        GGML_ASSERT(src0->type == dst->type);
+        GGML_ASSERT(ne00 > 0 && ne00 % GGML_TURBO4_QK == 0);
+        GGML_ASSERT(ne10 > 0 && ne11 > 0 && ne12 > 0);
+        GGML_ASSERT(ne02 == ne11 && ne03 == ne12);
+        GGML_ASSERT(ne0 == ne00 && ne1 == ne10 && ne2 == ne11 && ne3 == ne12);
+        GGML_ASSERT(nb11 % sizeof(int32_t) == 0 && nb12 % sizeof(int32_t) == 0);
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const size_t row_bytes = ggml_row_size(dst->type, ne0);
+        GGML_ASSERT(nb01 >= row_bytes);
+        const int64_t dst_rows = ggml_nrows(dst);
+        const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+        const dim3 block_nums(MIN(dst_rows, (int64_t) UINT16_MAX), 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+
+        // Preserve the rotated cache representation without decode/re-encode.
+        ggml_cuda_kernel_launch(k_get_rows_quantized, launch_params,
+            (const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data,
+            row_bytes, ne01, dst_rows, ne10, ne11, nb01, nb02, nb03,
+            nb10 / sizeof(int32_t), nb11 / sizeof(int32_t), nb12 / sizeof(int32_t));
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

@@ -301,6 +301,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_5, GGML_TYPE_TURBO3_5)
+    FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_5, GGML_TYPE_TURBO3_5)
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
@@ -394,6 +396,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_BF16:
             return true;
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO3_5:
             return true;
         default:
             return false;
@@ -419,12 +422,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (K_hot != nullptr && ggml_flash_attn_ext_hybrid_mode(dst) == 1) {
         // Paged lists: q_pos is q_meta [2, n_q], k_pos is k_list
-        // [2, max_len, n_kv_heads, n_seq], src[9] is k_list_len [n_kv_heads, n_seq].
+        // [3, max_len, n_kv_heads, n_seq], src[9] is k_list_len [n_kv_heads, n_seq].
         const ggml_tensor * k_len = dst->src[9];
+        int32_t recent_window;
+        memcpy(&recent_window, (const int32_t *) dst->op_params + 5, sizeof(recent_window));
         if (Q == nullptr || K == nullptr || V == nullptr || V_hot == nullptr ||
                 q_pos == nullptr || k_pos == nullptr || k_len == nullptr ||
                 dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
-                K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
+                !ggml_cuda_fattn_type_is_turbo(K->type) || V->type != K->type ||
                 K_hot->type != GGML_TYPE_F16 || V_hot->type != GGML_TYPE_F16 ||
                 q_pos->type != GGML_TYPE_I32 || k_pos->type != GGML_TYPE_I32 || k_len->type != GGML_TYPE_I32 ||
                 !ggml_is_contiguous(q_pos) || !ggml_is_contiguous(k_pos) || !ggml_is_contiguous(k_len) ||
@@ -434,7 +439,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 K->ne[2] <= 0 || K->ne[2] != V->ne[2] || K->ne[2] != K_hot->ne[2] || K_hot->ne[2] != V_hot->ne[2] ||
                 Q->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 ||
                 q_pos->ne[0] != 2 || q_pos->ne[1] != Q->ne[1] ||
-                k_pos->ne[0] != 2 || k_pos->ne[1] <= 0 || k_pos->ne[2] != K->ne[2] || k_pos->ne[3] <= 0 ||
+                k_pos->ne[0] != 3 || k_pos->ne[1] <= 0 || k_pos->ne[2] != K->ne[2] || k_pos->ne[3] <= 0 ||
+                recent_window <= 0 ||
                 k_len->ne[0] != K->ne[2] || k_len->ne[1] != k_pos->ne[3] ||
                 Q->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
                 K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type) ||
@@ -456,7 +462,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              (k_pos->ne[2] == 1 || k_pos->ne[2] == Q->ne[3]) && k_pos->ne[3] == 1);
         if (Q == nullptr || K == nullptr || V == nullptr || K_hot == nullptr || V_hot == nullptr ||
                 dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
-                K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
+                !ggml_cuda_fattn_type_is_turbo(K->type) || V->type != K->type ||
                 K_hot->type != GGML_TYPE_F16 || V_hot->type != GGML_TYPE_F16 ||
                 Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] || Q->ne[0] != K_hot->ne[0] ||
                 Q->ne[0] != V_hot->ne[0] || (Q->ne[0] != 128 && Q->ne[0] != 256) ||
@@ -484,12 +490,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_HYBRID;
     }
 
-    const bool has_turbo4_kv = K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool has_turbo4_kv = ggml_cuda_fattn_type_is_turbo(K->type) || ggml_cuda_fattn_type_is_turbo(V->type);
     if (has_turbo4_kv) {
         // Decode-sized Q tiles stay quantized through the direct vector kernel.
         // Returning NONE for unsupported shapes prevents the generic fallbacks.
         if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
-                K->type != GGML_TYPE_TURBO4_0 || V->type != GGML_TYPE_TURBO4_0 ||
+                !ggml_cuda_fattn_type_is_turbo(K->type) || V->type != K->type ||
                 (Q->ne[0] != 128 && Q->ne[0] != 256) ||
                 Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] ||
                 K->ne[1] <= 0 || K->ne[1] % FATTN_KQ_STRIDE != 0 ||

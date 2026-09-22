@@ -372,6 +372,8 @@ extern "C" {
         uint32_t observer_chunk;
         uint64_t transition_max_bytes;
         uint32_t hot_capacity;
+        // Maximum speculative tail rollback; zero still permits last-token replay.
+        uint32_t rollback_headroom;
         // Paged C1: the TQ4 arena keeps every sequence, the once-prefill
         // selection is bookkeeping (per layer/head row lists), decode of a
         // selected sequence runs ggml_flash_attn_ext_hybrid_paged, and
@@ -386,6 +388,8 @@ extern "C" {
         // than one list; 4 keeps the per-head selections intact on prompts
         // up to 4x the capacity and still frees a 256K prompt to ~4K cells.
         uint32_t paged_union_factor;
+        // Internal per-request prefill bound; zero uses the full arena.
+        uint32_t max_prefill_cells;
     };
 
     struct llama_context_params {

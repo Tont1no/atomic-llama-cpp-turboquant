@@ -120,7 +120,7 @@ public:
         llama_pyramidkv_c1_config pyramidkv_c1 = {},
         bool tq4_key_center = false);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -206,7 +206,8 @@ public:
             std::vector<std::vector<std::size_t>> & score_slots,
             uint32_t & active_tokens,
             std::string & error,
-            llama_seq_id seq_id = -1) const;
+            llama_seq_id seq_id = -1,
+            bool sequence_local = false) const;
     bool pyramidkv_c1_prepare_batch_rows(
             const slot_info & sinfo,
             const llama_ubatch & ubatch,
@@ -228,9 +229,12 @@ public:
     // (row lists), and decode of a selected sequence runs the paged hybrid
     // operator over its lists. No layout replacement ever happens.
     bool pyramidkv_c1_paged() const { return pyramidkv_c1_hot_enabled && pyramidkv_c1_config.paged; }
+    bool pyramidkv_c1_local_prefill() const;
     bool pyramidkv_c1_paged_seq_compacted(llama_seq_id seq_id) const;
     // Every sequence of the ubatch is selected: the ubatch runs the paged path.
     bool pyramidkv_c1_paged_ubatch_ready(const llama_ubatch & ubatch) const;
+    std::vector<llama_ubatch> pyramidkv_c1_split_batch(
+            llama_batch_allocr & balloc, uint32_t n_ubatch, uint32_t n_keep_tail, bool single_seq) const;
     bool pyramidkv_c1_paged_apply_selection(
             llama_seq_id seq_id,
             const std::vector<llama_pyramidkv_c1_layer_selection> & selections,
@@ -347,7 +351,8 @@ public:
 
     bool supports_compact_mask(const llama_ubatch & ubatch) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                             const std::vector<int32_t> * local_cells = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -529,7 +534,7 @@ private:
         ggml_tensor * k_positions    = nullptr; // I32 [pos_stride, n_layers]
         ggml_tensor * hot_write_idxs = nullptr; // I32 [hot_stride, n_layers]
         ggml_tensor * q_positions    = nullptr; // I32 [n_ubatch]
-        // paged lists: [2*list_capacity*heads_max*n_seq_max, n_layers],
+        // paged lists: [3*list_capacity*heads_max*n_seq_max, n_layers],
         // lengths [heads_max*n_seq_max, n_layers], q_meta [2*n_ubatch]
         ggml_tensor * k_list         = nullptr;
         ggml_tensor * k_list_len     = nullptr;
@@ -537,7 +542,7 @@ private:
         uint32_t pos_stride = 0;
         uint32_t hot_stride = 0;
         uint32_t n_ubatch   = 0;
-        uint32_t list_stride = 0; // entries (pairs) per layer
+        uint32_t list_stride = 0; // I32 elements (triples) per layer
         uint32_t len_stride  = 0;
         uint32_t heads_max   = 0;
         std::vector<int32_t> stage_pos;
@@ -551,11 +556,20 @@ private:
         // previous ubatch's graph, which may still be reading these tensors:
         // the buffer's synchronous tensor_set copies on a different stream.
         ggml_backend_t backend = nullptr;
+        ggml_backend_event_ptr upload_done;
+        bool upload_pending = false;
+
+        void wait_upload() {
+            if (upload_pending) {
+                ggml_backend_event_synchronize(upload_done.get());
+                upload_pending = false;
+            }
+        }
     };
     pyramidkv_c1_aux_tensors pyramidkv_c1_aux;
     bool pyramidkv_c1_aux_rebuild(std::string & error);
 public:
-    void pyramidkv_c1_bind_aux_backend(ggml_backend_t backend) { pyramidkv_c1_aux.backend = backend; }
+    void pyramidkv_c1_bind_aux_backend(ggml_backend_t backend);
 private:
 
     std::vector<kv_layer> layers;
@@ -653,6 +667,10 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    bool pyramidkv_local_prefill_ready() const;
+    ggml_tensor * get_k_prefill(ggml_context * ctx, int32_t il, ggml_tensor * read_idxs) const;
+    ggml_tensor * get_v_prefill(ggml_context * ctx, int32_t il, ggml_tensor * read_idxs) const;
+    void set_input_prefill_idxs(ggml_tensor * dst) const;
     ggml_tensor * get_k_hot(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v_hot(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_hybrid(ggml_context * ctx, int32_t il) const;
@@ -741,6 +759,11 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // Arena order is shared by the gather, mask and observer score mapping.
+    std::vector<int32_t> pyramidkv_prefill_cells;
+    uint32_t pyramidkv_prefill_n_kv = 0;
+    bool prepare_pyramidkv_prefill(std::string & error);
 
     using pyramidkv_graph_inputs = llm_graph_pyramidkv_inputs;
 

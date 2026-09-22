@@ -429,27 +429,39 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
-    // Turbo4 stores rotated KV coordinates. Generic decode/modify/re-encode
+    // Turbo KV formats store rotated coordinates. Generic decode/modify/re-encode
     // arithmetic would apply the encoder's rotation a second time.
-    bool uses_turbo4 = op->type == GGML_TYPE_TURBO4_0;
+    const auto is_turbo_kv = [](ggml_type type) {
+        return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
+    };
+    bool uses_turbo_kv = is_turbo_kv(op->type);
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        uses_turbo4 |= op->src[i] && op->src[i]->type == GGML_TYPE_TURBO4_0;
+        uses_turbo_kv |= op->src[i] && is_turbo_kv(op->src[i]->type);
     }
-    if (uses_turbo4) {
+    if (uses_turbo_kv) {
         switch (op->op) {
             case GGML_OP_CPY:
             case GGML_OP_DUP:
             case GGML_OP_CONT:
-                return (src0->type == GGML_TYPE_TURBO4_0 &&
-                        (op->type == GGML_TYPE_TURBO4_0 || op->type == GGML_TYPE_F32)) ||
-                       (src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_TURBO4_0);
+                // The generic byte-copy fallback assumes scalar elements for a
+                // non-contiguous source with a different destination shape.
+                if (src0->type == GGML_TYPE_TURBO3_5 && op->type == src0->type) {
+                    return (ggml_is_contiguous(src0) && ggml_is_contiguous(op)) ||
+                           (ggml_are_same_shape(src0, op) &&
+                            src0->nb[0] == ggml_type_size(src0->type) &&
+                            op->nb[0] == ggml_type_size(op->type));
+                }
+                return (is_turbo_kv(src0->type) &&
+                        (op->type == src0->type || op->type == GGML_TYPE_F32)) ||
+                       (src0->type == GGML_TYPE_F32 && is_turbo_kv(op->type));
             case GGML_OP_SET_ROWS:
-                return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_TURBO4_0;
+                return src0->type == GGML_TYPE_F32 && is_turbo_kv(op->type);
             case GGML_OP_GET_ROWS:
-                return src0->type == GGML_TYPE_TURBO4_0 && op->type == GGML_TYPE_F32;
+                return is_turbo_kv(src0->type) &&
+                       (op->type == GGML_TYPE_F32 || op->type == src0->type);
             case GGML_OP_FLASH_ATTN_EXT:
-                return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_TURBO4_0 &&
-                       op->src[2]->type == GGML_TYPE_TURBO4_0;
+                return src0->type == GGML_TYPE_F32 && is_turbo_kv(src1->type) &&
+                       op->src[2]->type == src1->type;
             default:
                 return false;
         }

@@ -111,12 +111,12 @@ static void set_rows_cuda_quant(
     }
 }
 
-template<typename idx_t>
+template<typename idx_t, typename block_t>
 __launch_bounds__(GGML_TURBO4_QK)
-static __global__ void k_set_rows_turbo4(
+static __global__ void k_set_rows_turbo(
         const float * __restrict__ src0,
         const idx_t * __restrict__ src1,
-        block_turbo4_0 * __restrict__ dst,
+        block_t * __restrict__ dst,
         const int64_t ne00,
         const int64_t ne01,
         const int64_t ne02,
@@ -151,27 +151,28 @@ static __global__ void k_set_rows_turbo4(
     const int64_t dst_row = src1[i10*s10 + i11*s11 + i12*s12];
 
     const float * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
-    block_turbo4_0 * dst_row_ptr = (block_turbo4_0 *)((char *) dst + dst_row*s1 + i02*s2 + i03*s3);
-    block_turbo4_0 * block = dst_row_ptr + block_in_row;
+    block_t * dst_row_ptr = (block_t *)((char *) dst + dst_row*s1 + i02*s2 + i03*s3);
+    block_t * block = dst_row_ptr + block_in_row;
 
     __shared__ float values[GGML_TURBO4_QK];
     values[j] = src_row[block_in_row*GGML_TURBO4_QK + j];
     __syncthreads();
 
-    ggml_cuda_turbo4_encode_block(values, block, j);
+    ggml_cuda_turbo_encode_block(values, block, j);
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne13);
 }
 
-template<typename idx_t>
-static void set_rows_cuda_turbo4(
+template<typename idx_t, typename block_t>
+static void set_rows_cuda_turbo(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    GGML_ASSERT(nb00 == sizeof(float) && nb0 == sizeof(block_t));
     GGML_ASSERT(ne00 % GGML_TURBO4_QK == 0);
     const int64_t blocks = ne00/GGML_TURBO4_QK;
     const int64_t total = blocks*ne01*ne02*ne03;
@@ -185,8 +186,8 @@ static void set_rows_cuda_turbo4(
     const int64_t s12 = nb12/sizeof(idx_t);
 
     if (total > 0) {
-        k_set_rows_turbo4<idx_t><<<static_cast<unsigned int>(total), GGML_TURBO4_QK, 0, ctx.stream()>>>(
-            (const float *) src0->data, (const idx_t *) src1->data, (block_turbo4_0 *) dst->data,
+        k_set_rows_turbo<idx_t, block_t><<<static_cast<unsigned int>(total), GGML_TURBO4_QK, 0, ctx.stream()>>>(
+            (const float *) src0->data, (const idx_t *) src1->data, (block_t *) dst->data,
             ne00, ne01, ne02, ne10, ne11, ne12, ne13,
             s01, s02, s03, s10, s11, s12, nb1, nb2, nb3);
     }
@@ -465,9 +466,16 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (dst->type == GGML_TYPE_TURBO4_0) {
         GGML_ASSERT(src0->type == GGML_TYPE_F32);
         if (src1->type == GGML_TYPE_I64) {
-            set_rows_cuda_turbo4<int64_t>(ctx, src0, src1, dst);
+            set_rows_cuda_turbo<int64_t, block_turbo4_0>(ctx, src0, src1, dst);
         } else {
-            set_rows_cuda_turbo4<int32_t>(ctx, src0, src1, dst);
+            set_rows_cuda_turbo<int32_t, block_turbo4_0>(ctx, src0, src1, dst);
+        }
+    } else if (dst->type == GGML_TYPE_TURBO3_5) {
+        GGML_ASSERT(src0->type == GGML_TYPE_F32);
+        if (src1->type == GGML_TYPE_I64) {
+            set_rows_cuda_turbo<int64_t, block_turbo3_5>(ctx, src0, src1, dst);
+        } else {
+            set_rows_cuda_turbo<int32_t, block_turbo3_5>(ctx, src0, src1, dst);
         }
     } else if (src0->type == GGML_TYPE_F32) {
         if (src1->type == GGML_TYPE_I64) {
