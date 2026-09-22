@@ -1021,8 +1021,12 @@ void llama_context::sched_reserve() {
     // paged C1: reserve the paged decode graph (lists instead of the mask)
     // once so its buffers exist before the first selected sequence decodes
     if (c1_kv != nullptr && c1_kv->pyramidkv_c1_paged()) {
+        // graph_reserve rounds n_tokens UP to a multiple of n_seqs; the paged
+        // query metadata holds exactly n_ubatch rows, so round down instead
+        // (5 slots with n_ubatch 256 would otherwise reserve 260 rows).
+        const uint32_t n_tokens_paged = std::max(n_seqs, (n_tokens / n_seqs) * n_seqs);
         c1_kv->pyramidkv_c1_set_reserve_paged(true);
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_paged, n_seqs, std::min(n_outputs_pp, n_tokens_paged), mctx.get(), model.hparams.no_alloc);
         c1_kv->pyramidkv_c1_set_reserve_paged(false);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute buffers for the paged C1 graph");
