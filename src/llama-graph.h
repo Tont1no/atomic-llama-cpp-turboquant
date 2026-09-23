@@ -297,8 +297,7 @@ public:
 
     // ReplaySSM (llama_memory_recurrent::rs_replay), R = n_rs_seq, W = conv
     // window; null otherwise. Filled by llm_graph_set_rs_replay_inputs().
-    ggml_tensor * rp_rows      = nullptr; // I32 [R * n_seqs] saved rows, left-padded per sequence
-    ggml_tensor * rp_mask      = nullptr; // F32 [1, 1, R, n_seqs] 1 = replayed token, 0 = no-op pad
+    ggml_tensor * rp_idx       = nullptr; // I32 [3, n_seqs] (source cell, replayed tokens, destination cell)
     ggml_tensor * rp_raw_rows  = nullptr; // I32 [R * n_seqs] all saved conv-input rows per sequence
     ggml_tensor * rp_conv_rows = nullptr; // I32 [W * n_seqs] conv window after the replay
 

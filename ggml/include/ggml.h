@@ -2666,6 +2666,15 @@ extern "C" {
     // after the last token and slot 1 after token base_t. A rollback restores
     // slot 1 and replays the accepted tokens instead of keeping one snapshot
     // per speculative token.
+    //
+    // rp (optional, scalar gate only): F32 [2*S_v*H_v + 2*H_v, R * cells]
+    // replay rows; the row of token r of cell c is c*R + r and holds
+    // [k (head i at i*S_v) | v (at S_v*H_v) | g (at 2*S_v*H_v) | beta].
+    // rp_idx: I32 [3, n_seqs] = (source cell, tokens to replay, destination
+    // cell) per sequence. Before its tokens a sequence replays its first
+    // `count` source rows (state update only, no output); after the op the
+    // last `tail` tokens of the ubatch are stored in the destination cell's
+    // rows 0..tail-1. The output holds the ubatch's own tokens only.
     GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2674,7 +2683,11 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               base_t);
+            int64_t               base_t,
+            struct ggml_tensor  * rp,
+            struct ggml_tensor  * rp_idx,
+            int64_t               R,
+            int64_t               tail);
 
     // DSA lightning indexer
     //

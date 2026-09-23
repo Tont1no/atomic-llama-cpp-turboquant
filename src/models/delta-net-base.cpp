@@ -468,7 +468,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     // ReplaySSM: after a rollback the state came from group 1 (the tail's
     // base token); the replayed tokens' conv inputs move the window on.
-    const bool    replay       = inp->rp_rows != nullptr;
+    const bool    replay       = inp->rp_idx != nullptr;
     const int64_t W            = conv_kernel_size - 1;
     const int64_t n_seq_tokens = qkv_mixed->ne[1];
     int64_t       tail         = 0;
@@ -614,17 +614,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    // ReplaySSM: q/k/v/g/b start with R replayed (or no-op) tokens; two state
-    // groups - after the last token and after the tail's base token.
-    const bool    replay   = inp->rp_rows != nullptr;
+    // ReplaySSM: the delta net first replays the tokens a rollback kept (from
+    // the replay rows) and stores this ubatch's tail for the next one; two
+    // state groups - after the last token and after the tail's base token.
+    const bool    replay   = inp->rp_idx != nullptr;
     const int64_t R        = replay ? (int64_t) mctx_cur->get_n_rs_seq() : 0;
     const int64_t K        = replay ? 2 : cparams.n_rs_seq + 1;
-    const int64_t n_real   = n_seq_tokens - R;
-    const int64_t rp_tail  = replay ? std::min<int64_t>(n_real, R + 1) - 1 : 0;
+    const int64_t rp_tail  = replay ? std::min<int64_t>(n_seq_tokens, R + 1) - 1 : 0;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = replay
-        ? ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, n_seq_tokens - 1 - rp_tail)
+        ? ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, n_seq_tokens - 1 - rp_tail,
+              mctx_cur->get_rp_kvgb_l(il), inp->rp_idx, R, rp_tail)
         : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
@@ -636,14 +637,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 
     ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
-        S_v, H_v, n_real, n_seqs,
+        S_v, H_v, n_seq_tokens, n_seqs,
         ggml_row_size(gdn_out->type, S_v),
         ggml_row_size(gdn_out->type, S_v * H_v),
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
-        ggml_row_size(gdn_out->type, S_v * H_v * R));
-    if (replay) {
-        output = ggml_cont(ctx0, output);   // the replayed tokens' outputs are dropped
-    }
+        0);
     cb(output, "attn_output", il);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);

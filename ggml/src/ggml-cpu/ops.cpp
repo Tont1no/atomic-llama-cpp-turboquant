@@ -11195,6 +11195,33 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
+        // ReplaySSM: first replay the accepted tokens kept from the last ubatch
+        // (state update only; their outputs were produced back then)
+        if (dst->src[6] != nullptr && !kda) {
+            const ggml_tensor * rp = dst->src[6];
+            const int32_t * idx = (const int32_t *) dst->src[7]->data;
+            const int64_t R   = ggml_get_op_params_i32(dst, 2);
+            const int64_t kvw = S_v * H;
+            const int32_t src = idx[3*iv3 + 0];
+            const int32_t cnt = idx[3*iv3 + 1];
+            for (int32_t r = 0; r < cnt; ++r) {
+                const float * row = (const float *) rp->data + ((int64_t) src * R + r) * rp->ne[0];
+                const float * k_d = row + ik1 * S_v;
+                const float * v_d = row + kvw + iv1 * S_v;
+                const float g_val = row[2*kvw + iv1];
+                const float b_val = row[2*kvw + H + iv1];
+                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_val));
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
+                    delta[j] = (v_d[j] - sum) * b_val;
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
+                }
+            }
+        }
+
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
@@ -11302,6 +11329,44 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
         ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+
+    // ReplaySSM: store this ubatch's tail after every head has read the old rows
+    if (dst->src[6] != nullptr) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            const ggml_tensor * q = dst->src[0];
+            const ggml_tensor * k = dst->src[1];
+            const ggml_tensor * v = dst->src[2];
+            const ggml_tensor * g = dst->src[3];
+            const ggml_tensor * b = dst->src[4];
+            const ggml_tensor * rp = dst->src[6];
+            const int32_t * idx = (const int32_t *) dst->src[7]->data;
+            const int64_t R    = ggml_get_op_params_i32(dst, 2);
+            const int64_t tail = ggml_get_op_params_i32(dst, 3);
+            const int64_t S_v  = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+            const int64_t nk   = k->ne[1];
+            const int64_t kvw  = S_v * H;
+            const int64_t rk3  = n_seqs / k->ne[3];
+            GGML_UNUSED(q);
+            for (int64_t s = 0; s < n_seqs; ++s) {
+                const int32_t dst_cell = idx[3*s + 2];
+                for (int64_t ti = 0; ti < tail; ++ti) {
+                    const int64_t t = n_tokens - tail + ti;
+                    float * row = (float *) rp->data + ((int64_t) dst_cell * R + ti) * rp->ne[0];
+                    for (int64_t h = 0; h < nk; ++h) {
+                        memcpy(row + h * S_v, (const char *) k->data + (s / rk3) * k->nb[3] + t * k->nb[2] + h * k->nb[1],
+                               S_v * sizeof(float));
+                    }
+                    for (int64_t h = 0; h < H; ++h) {
+                        memcpy(row + kvw + h * S_v, (const char *) v->data + s * v->nb[3] + t * v->nb[2] + h * v->nb[1],
+                               S_v * sizeof(float));
+                        row[2*kvw + h]     = *(const float *) ((const char *) g->data + s * g->nb[3] + t * g->nb[2] + h * g->nb[1]);
+                        row[2*kvw + H + h] = *(const float *) ((const char *) b->data + s * b->nb[3] + t * b->nb[2] + h * b->nb[1]);
+                    }
+                }
+            }
+        }
     }
 }
 

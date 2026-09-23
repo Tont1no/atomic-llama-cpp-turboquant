@@ -77,9 +77,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     rp_raw_l.assign(n_layer, nullptr);
-    rp_mix_l.assign(n_layer, nullptr);
-    rp_g_l.assign(n_layer, nullptr);
-    rp_b_l.assign(n_layer, nullptr);
+    rp_kvgb_l.assign(n_layer, nullptr);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -117,14 +115,10 @@ llama_memory_recurrent::llama_memory_recurrent(
             const int64_t channels = hparams.ssm_d_inner + 2*hparams.ssm_n_group*hparams.ssm_d_state;
             const int64_t h_v      = hparams.ssm_dt_rank;
             const int64_t rows     = (int64_t) mem_size * n_rs_seq;
-            rp_raw_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, rows);
-            rp_mix_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, rows);
-            rp_g_l[i]   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h_v, rows);
-            rp_b_l[i]   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h_v, rows);
-            ggml_format_name(rp_raw_l[i], "replay_raw_l%d", i);
-            ggml_format_name(rp_mix_l[i], "replay_mix_l%d", i);
-            ggml_format_name(rp_g_l[i],   "replay_g_l%d", i);
-            ggml_format_name(rp_b_l[i],   "replay_b_l%d", i);
+            rp_raw_l[i]  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, rows);
+            rp_kvgb_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*hparams.ssm_d_inner + 2*h_v, rows);
+            ggml_format_name(rp_raw_l[i],  "replay_raw_l%d", i);
+            ggml_format_name(rp_kvgb_l[i], "replay_kvgb_l%d", i);
         }
     }
 
@@ -1350,16 +1344,8 @@ ggml_tensor * llama_memory_recurrent_context::get_rp_raw_l(int32_t il) const {
     return mem->rp_raw_l[il];
 }
 
-ggml_tensor * llama_memory_recurrent_context::get_rp_mix_l(int32_t il) const {
-    return mem->rp_mix_l[il];
-}
-
-ggml_tensor * llama_memory_recurrent_context::get_rp_g_l(int32_t il) const {
-    return mem->rp_g_l[il];
-}
-
-ggml_tensor * llama_memory_recurrent_context::get_rp_b_l(int32_t il) const {
-    return mem->rp_b_l[il];
+ggml_tensor * llama_memory_recurrent_context::get_rp_kvgb_l(int32_t il) const {
+    return mem->rp_kvgb_l[il];
 }
 
 int32_t llama_memory_recurrent_context::rp_src(int i) const {

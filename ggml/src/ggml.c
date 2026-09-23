@@ -6598,11 +6598,30 @@ struct ggml_tensor * ggml_gated_delta_net_replay(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               base_t) {
+        int64_t               base_t,
+        struct ggml_tensor  * rp,
+        struct ggml_tensor  * rp_idx,
+        int64_t               R,
+        int64_t               tail) {
     GGML_ASSERT(base_t >= 0 && base_t < v->ne[2]);
     struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 2);
     // op param 1: base_t + 1 (0 = the ordinary last-K snapshot layout)
     ggml_set_op_params_i32(result, 1, (int32_t) (base_t + 1));
+    if (rp != NULL) {
+        const int64_t S_v = v->ne[0];
+        const int64_t H   = v->ne[1];
+        GGML_ASSERT(g->ne[0] == 1);
+        GGML_ASSERT(rp->type == GGML_TYPE_F32 && ggml_is_contiguous(rp));
+        GGML_ASSERT(rp->ne[0] == 2*S_v*H + 2*H && R > 0 && rp->ne[1] % R == 0);
+        GGML_ASSERT(rp_idx != NULL && rp_idx->type == GGML_TYPE_I32 && ggml_is_contiguous(rp_idx));
+        GGML_ASSERT(rp_idx->ne[0] == 3 && rp_idx->ne[1] == v->ne[3]);
+        GGML_ASSERT(tail >= 0 && tail <= R && tail <= v->ne[2]);
+        GGML_ASSERT(k->ne[1] <= H);
+        ggml_set_op_params_i32(result, 2, (int32_t) R);
+        ggml_set_op_params_i32(result, 3, (int32_t) tail);
+        result->src[6] = rp;
+        result->src[7] = rp_idx;
+    }
     return result;
 }
 

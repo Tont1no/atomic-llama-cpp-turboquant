@@ -88,9 +88,7 @@ public:
     uint32_t conv_window = 0;   // conv kernel - 1 (the conv state's time length)
     uint32_t n_state_groups() const { return rs_replay ? 2 : 1 + n_rs_seq; }
     std::vector<ggml_tensor *> rp_raw_l; // [channels, n_rs_seq * size]: conv inputs of the tail
-    std::vector<ggml_tensor *> rp_mix_l; // [channels, n_rs_seq * size]: conv outputs after SiLU
-    std::vector<ggml_tensor *> rp_g_l;   // [H_v, n_rs_seq * size]: gates
-    std::vector<ggml_tensor *> rp_b_l;   // [H_v, n_rs_seq * size]: betas
+    std::vector<ggml_tensor *> rp_kvgb_l; // [2*S_v*H_v + 2*H_v, n_rs_seq * size]: delta-net inputs (ggml_gated_delta_net_replay)
     std::vector<uint32_t> rp_tail;       // per seq: tokens after the base in the last ubatch
     std::vector<uint32_t> rp_replay;     // per seq: tokens the next ubatch replays
 
@@ -194,9 +192,7 @@ public:
     uint32_t get_n_rs_seq() const;
     uint32_t get_conv_window() const;   // conv kernel - 1
     ggml_tensor * get_rp_raw_l(int32_t il) const;
-    ggml_tensor * get_rp_mix_l(int32_t il) const;
-    ggml_tensor * get_rp_g_l(int32_t il) const;
-    ggml_tensor * get_rp_b_l(int32_t il) const;
+    ggml_tensor * get_rp_kvgb_l(int32_t il) const;
     // cell whose saved tail the i-th sequence of the ubatch replays from
     int32_t  rp_src(int i) const;
     // tokens the i-th sequence replays; consumed like the rollback index
