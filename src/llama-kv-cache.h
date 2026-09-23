@@ -239,6 +239,8 @@ public:
             llama_seq_id seq_id,
             const std::vector<llama_pyramidkv_c1_layer_selection> & selections,
             std::string & error);
+    bool pyramidkv_c1_set_protected(llama_seq_id seq_id, std::vector<std::pair<int32_t, int32_t>> ranges);
+    bool pyramidkv_c1_is_protected(llama_seq_id seq_id, llama_pos pos) const;
     // paged_reselect: drop a selected sequence's lists (its cells were kept),
     // so the next prompt prefills over all of them and is scored anew.
     bool pyramidkv_c1_paged_unselect(llama_seq_id seq_id, std::string & error);
@@ -519,6 +521,8 @@ private:
         int32_t pos;
     };
     std::vector<uint8_t> pyramidkv_c1_paged_compacted;                          // [n_seq_max]
+    // Position ranges a paged selection keeps whole (llama_pyramidkv_c1_protect_positions)
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> pyramidkv_c1_protected; // [n_seq_max]
     std::vector<std::vector<std::vector<std::vector<pyramidkv_c1_list_entry>>>>
         pyramidkv_c1_paged_lists;                                               // [layer][head][seq]
     bool pyramidkv_c1_reserve_paged = false;

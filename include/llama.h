@@ -905,6 +905,14 @@ extern "C" {
     // no such cache, the mode is off, or the sequence was never selected.
     LLAMA_API bool llama_pyramidkv_c1_reselect(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // PyramidKV C1 paged: cells of the sequence whose position lies in one of
+    // the n half-open ranges [begin[i], end[i]) survive its next selection
+    // whole, in every head (an M-RoPE image stores all of its cells on one
+    // position; a partly kept image makes the model invent its details).
+    // Replaces the sequence's earlier ranges; n = 0 clears them.
+    LLAMA_API bool llama_pyramidkv_c1_protect_positions(struct llama_context * ctx, llama_seq_id seq_id,
+            const llama_pos * begin, const llama_pos * end, int32_t n);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

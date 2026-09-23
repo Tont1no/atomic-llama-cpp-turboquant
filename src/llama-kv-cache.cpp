@@ -823,8 +823,29 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
 // Paged C1
 //
 
+bool llama_kv_cache::pyramidkv_c1_set_protected(llama_seq_id seq_id, std::vector<std::pair<int32_t, int32_t>> ranges) {
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= pyramidkv_c1_protected.size()) {
+        return false;
+    }
+    pyramidkv_c1_protected[seq_id] = std::move(ranges);
+    return true;
+}
+
+bool llama_kv_cache::pyramidkv_c1_is_protected(llama_seq_id seq_id, llama_pos pos) const {
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= pyramidkv_c1_protected.size()) {
+        return false;
+    }
+    for (const auto & r : pyramidkv_c1_protected[seq_id]) {
+        if (pos >= r.first && pos < r.second) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void llama_kv_cache::pyramidkv_c1_paged_reset() {
     pyramidkv_c1_paged_compacted.assign(n_seq_max, 0);
+    pyramidkv_c1_protected.assign(n_seq_max, {});
     pyramidkv_c1_paged_lists.assign(pyramidkv_c1_layers.size(), {});
     for (size_t layer_index = 0; layer_index < pyramidkv_c1_layers.size(); ++layer_index) {
         const auto & state = pyramidkv_c1_layers[layer_index];
@@ -985,19 +1006,43 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
     for (const uint32_t cell : candidates) {
         kept[cell] = 1;
     }
+    // Protected ranges (images) stay whole and join every head's list.
+    std::vector<uint32_t> protected_cells;
+    if (static_cast<size_t>(seq_id) < pyramidkv_c1_protected.size() && !pyramidkv_c1_protected[seq_id].empty()) {
+        const auto & ranges = pyramidkv_c1_protected[seq_id];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.seq_count(i) != 1) {
+                continue;
+            }
+            const llama_pos p = cells.pos_get(i);
+            for (const auto & r : ranges) {
+                if (p >= r.first && p < r.second) {
+                    protected_cells.push_back(i);
+                    kept[i] = 1;
+                    break;
+                }
+            }
+        }
+    }
     for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
         const auto & selection = *by_layer[layer_index];
         for (size_t head = 0; head < selection.heads.size(); ++head) {
             const auto & selected = selection.heads[head];
             auto & list = pyramidkv_c1_paged_lists[layer_index][head][seq_id];
             list.clear();
-            list.reserve(selected.keep_cells.size());
+            list.reserve(selected.keep_cells.size() + protected_cells.size());
             for (size_t i = 0; i < selected.keep_cells.size(); ++i) {
                 const size_t logical = selected.keep_cells[i];
                 if (!kept[logical]) {
                     continue;
                 }
                 list.push_back({ static_cast<uint32_t>(logical), static_cast<int32_t>(selected.keep_positions[i]) });
+            }
+            for (const uint32_t cell : protected_cells) {
+                // keep_cells is ordered by cell
+                if (!std::binary_search(selected.keep_cells.begin(), selected.keep_cells.end(), static_cast<size_t>(cell))) {
+                    list.push_back({ cell, static_cast<int32_t>(cells.pos_get(cell)) });
+                }
             }
             // The selection orders by cell; a prompt that landed in cells freed
             // by an earlier sequence is not cell-ordered by position. The

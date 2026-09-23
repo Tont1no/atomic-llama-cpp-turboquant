@@ -3737,6 +3737,31 @@ bool llama_context::extract_pyramidkv_scores(
                         score.key_score_slots_per_head, active_tokens, error, seq, node.sequence_local)) {
                     return fail(error);
                 }
+                // Protected cells (the newest images) are kept whole by the
+                // paged apply; leave them out here so they do not take the
+                // text's share of the budget.
+                for (size_t head = 0; head < score.key_positions_per_head.size(); ++head) {
+                    auto & positions = score.key_positions_per_head[head];
+                    auto & cells_h   = score.key_cells_per_head[head];
+                    const bool slots_used = head < score.key_score_slots_per_head.size();
+                    size_t out = 0;
+                    for (size_t i = 0; i < positions.size(); ++i) {
+                        if (kv->pyramidkv_c1_is_protected(seq, (llama_pos) positions[i])) {
+                            continue;
+                        }
+                        positions[out] = positions[i];
+                        cells_h[out] = cells_h[i];
+                        if (slots_used) {
+                            score.key_score_slots_per_head[head][out] = score.key_score_slots_per_head[head][i];
+                        }
+                        ++out;
+                    }
+                    positions.resize(out);
+                    cells_h.resize(out);
+                    if (slots_used) {
+                        score.key_score_slots_per_head[head].resize(out);
+                    }
+                }
                 score.key_tokens = 0;
                 for (const auto & head_positions : score.key_positions_per_head) {
                     score.key_tokens = std::max(score.key_tokens, head_positions.size());
@@ -5380,6 +5405,24 @@ bool llama_pyramidkv_c1_reselect(struct llama_context * ctx, llama_seq_id seq_id
         return false;
     }
     return true;
+}
+
+bool llama_pyramidkv_c1_protect_positions(struct llama_context * ctx, llama_seq_id seq_id,
+        const llama_pos * begin, const llama_pos * end, int32_t n) {
+    if (!ctx || n < 0 || (n > 0 && (!begin || !end))) {
+        return false;
+    }
+    auto * kv = llama_context_attention_cache(ctx->get_memory());
+    if (kv == nullptr || !kv->pyramidkv_c1_paged()) {
+        return false;
+    }
+    std::vector<std::pair<int32_t, int32_t>> ranges;
+    for (int32_t i = 0; i < n; ++i) {
+        if (end[i] > begin[i]) {
+            ranges.emplace_back(begin[i], end[i]);
+        }
+    }
+    return kv->pyramidkv_c1_set_protected(seq_id, std::move(ranges));
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
