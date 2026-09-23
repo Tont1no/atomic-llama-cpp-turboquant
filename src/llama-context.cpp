@@ -5036,7 +5036,6 @@ llama_context_params llama_context_default_params() {
             /*.list_capacity          =*/ 0,
             /*.paged_union_factor     =*/ 4,
             /*.max_prefill_cells      =*/ 0,
-            /*.paged_reselect         =*/ false,
         },
         /*.tq4_key_center             =*/ false,
         /*.rs_replay                  =*/ false,
@@ -5390,21 +5389,6 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
-}
-
-bool llama_pyramidkv_c1_reselect(struct llama_context * ctx, llama_seq_id seq_id) {
-    if (!ctx) {
-        return false;
-    }
-    auto * kv = llama_context_attention_cache(ctx->get_memory());
-    std::string error;
-    if (kv == nullptr || !kv->pyramidkv_c1_paged_unselect(seq_id, error)) {
-        if (!error.empty()) {
-            LLAMA_LOG_WARN("%s: %s\n", __func__, error.c_str());
-        }
-        return false;
-    }
-    return true;
 }
 
 bool llama_pyramidkv_c1_protect_positions(struct llama_context * ctx, llama_seq_id seq_id,

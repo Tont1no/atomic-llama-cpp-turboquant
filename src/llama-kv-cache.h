@@ -241,9 +241,6 @@ public:
             std::string & error);
     bool pyramidkv_c1_set_protected(llama_seq_id seq_id, std::vector<std::pair<int32_t, int32_t>> ranges);
     bool pyramidkv_c1_is_protected(llama_seq_id seq_id, llama_pos pos) const;
-    // paged_reselect: drop a selected sequence's lists (its cells were kept),
-    // so the next prompt prefills over all of them and is scored anew.
-    bool pyramidkv_c1_paged_unselect(llama_seq_id seq_id, std::string & error);
     // Graph reserve builds the paged decode graph once with this set.
     void pyramidkv_c1_set_reserve_paged(bool value) { pyramidkv_c1_reserve_paged = value; }
     bool pyramidkv_c1_reserve_paged_active() const { return pyramidkv_c1_reserve_paged; }

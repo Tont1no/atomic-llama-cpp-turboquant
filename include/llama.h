@@ -390,11 +390,6 @@ extern "C" {
         uint32_t paged_union_factor;
         // Internal per-request prefill bound; zero uses the full arena.
         uint32_t max_prefill_cells;
-        // Paged: a selection keeps every cell in the arena (the lists still
-        // shrink, so decode costs the same) and llama_pyramidkv_c1_reselect()
-        // lets a follow-up prompt select anew for its own question. Costs
-        // the cells a selection would have given back to other sequences.
-        bool     paged_reselect;
     };
 
     struct llama_context_params {
@@ -898,12 +893,6 @@ extern "C" {
               llama_seq_id seq_id,
            const llama_pos * pos,
                    int32_t n);
-
-    // PyramidKV C1 paged with paged_reselect: forget the sequence's selection
-    // so its next prompt (a follow-up turn) prefills over every kept cell and
-    // the observer selects anew for that prompt. false when the context has
-    // no such cache, the mode is off, or the sequence was never selected.
-    LLAMA_API bool llama_pyramidkv_c1_reselect(struct llama_context * ctx, llama_seq_id seq_id);
 
     // PyramidKV C1 paged: cells of the sequence whose position lies in one of
     // the n half-open ranges [begin[i], end[i]) survive its next selection

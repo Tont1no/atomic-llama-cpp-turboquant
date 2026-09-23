@@ -119,7 +119,6 @@ bool llama_pyramidkv_c1_make_config(
             0, kMaxTokens, output.max_prefill_cells, error)) {
         return false;
     }
-    output.paged_reselect = params.paged && params.paged_reselect;
 
     if ((output.pooling_kernel & 1u) == 0 ||
         output.max_capacity_prompt <= output.recent_window) {

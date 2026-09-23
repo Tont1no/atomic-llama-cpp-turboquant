@@ -99,7 +99,6 @@ struct llama_pyramidkv_c1_config {
     std::size_t list_capacity = 0;
     std::size_t paged_union_factor = 4;
     std::size_t max_prefill_cells = 0;
-    bool paged_reselect = false;
 };
 
 struct llama_pyramidkv_c1_score {

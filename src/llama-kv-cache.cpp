@@ -1058,7 +1058,7 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
     }
     uint32_t freed = 0;
     auto & head_pos = v_heads[seq_to_stream[seq_id]];
-    for (uint32_t i = 0; i < cells.size() && !pyramidkv_c1_config.paged_reselect; ++i) {
+    for (uint32_t i = 0; i < cells.size(); ++i) {
         if (kept[i] || cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.seq_count(i) != 1) {
             continue;
         }
@@ -1081,32 +1081,6 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
     LLAMA_LOG_INFO("%s: PyramidKV paged selection seq=%d kept_cells=%zu freed_cells=%u longest_list=%zu pos=[%d,%d] recent_l0h0=%zu\n",
         __func__, (int) seq_id, static_cast<size_t>(std::count(kept.begin(), kept.end(), 1)), freed,
         pyramidkv_c1_paged_list_size(seq_id), pos_min, pos_max, recent);
-    return true;
-}
-
-bool llama_kv_cache::pyramidkv_c1_paged_unselect(llama_seq_id seq_id, std::string & error) {
-    if (!pyramidkv_c1_paged() || !pyramidkv_c1_config.paged_reselect) {
-        error = "PyramidKV C1 reselection needs paged_reselect";
-        return false;
-    }
-    if (seq_id < 0 || static_cast<size_t>(seq_id) >= n_seq_max ||
-            static_cast<size_t>(seq_id) >= pyramidkv_c1_paged_compacted.size()) {
-        error = "PyramidKV C1 reselection names an unknown sequence";
-        return false;
-    }
-    if (!pyramidkv_c1_paged_compacted[seq_id]) {
-        return false;	// nothing selected yet: the next prompt end selects anyway
-    }
-    for (auto & layer : pyramidkv_c1_paged_lists) {
-        for (auto & head : layer) {
-            if (static_cast<size_t>(seq_id) < head.size()) {
-                head[seq_id].clear();
-            }
-        }
-    }
-    pyramidkv_c1_paged_compacted[seq_id] = 0;
-    LLAMA_LOG_INFO("%s: PyramidKV paged seq=%d unselected for a new prompt (%u cells kept)\n",
-        __func__, (int) seq_id, (unsigned) seq_n_cells(seq_id));
     return true;
 }
 
