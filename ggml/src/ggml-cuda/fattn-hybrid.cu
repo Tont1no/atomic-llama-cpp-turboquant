@@ -579,11 +579,12 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
             if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
                 continue;
             }
-            const bool hot = (int64_t) q_position - key_position < recent_window;
-            if (hot && (hot_row < 0 || hot_row >= n_hot_rows)) {
-                __trap();
-                return;
-            }
+            // Recent keys read their F16 hot row. The ring protects the newest
+            // cells, not positions, so an M-RoPE image (many cells on one
+            // position) can have recent keys without one; those read their
+            // TurboQuant arena copy, which every token has.
+            const bool hot = (int64_t) q_position - key_position < recent_window &&
+                hot_row >= 0 && hot_row < n_hot_rows;
             const int64_t local_key = hot ? hot_row : cold_row;
             const char * k_row = hot
                 ? k_hot + local_key*kh_nb1 + kv_head*kh_nb2
@@ -723,11 +724,12 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
             if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
                 continue;
             }
-            const bool hot = (int64_t) q_position - key_position < recent_window;
-            if (hot && (hot_row < 0 || hot_row >= n_hot_rows)) {
-                __trap();
-                return;
-            }
+            // Recent keys read their F16 hot row. The ring protects the newest
+            // cells, not positions, so an M-RoPE image (many cells on one
+            // position) can have recent keys without one; those read their
+            // TurboQuant arena copy, which every token has.
+            const bool hot = (int64_t) q_position - key_position < recent_window &&
+                hot_row >= 0 && hot_row < n_hot_rows;
             const int64_t local_key = hot ? hot_row : cold_row;
             const char * k_row = hot
                 ? k_hot + local_key*kh_nb1 + kv_head*kh_nb2

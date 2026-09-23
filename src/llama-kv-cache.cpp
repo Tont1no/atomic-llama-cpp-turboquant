@@ -2777,9 +2777,13 @@ bool llama_kv_cache::pyramidkv_c1_key_positions(
             }
             entries.emplace_back(position, i, slot);
         }
+        // Sorted by (position, logical cell). An M-RoPE image puts all of its
+        // cells on one sequence position (the 2-D place lives in the cell's
+        // ext), so equal positions are legal; one logical cell twice is not.
         std::sort(entries.begin(), entries.end());
         for (const auto & [position, logical, slot] : entries) {
-            if (!head_positions.empty() && position <= head_positions.back()) {
+            if (!head_positions.empty() && (position < head_positions.back() ||
+                    (position == head_positions.back() && logical == head_cells.back()))) {
                 error = "PyramidKV C1 head contains duplicate original positions";
                 return false;
             }
@@ -2817,7 +2821,9 @@ bool llama_kv_cache::pyramidkv_c1_prepare_batch_rows(
 
     auto & cells = v_cells[sinfo.strm[0]];
     const bool paged = pyramidkv_c1_paged();
-    std::vector<int64_t> protected_from;
+    // Oldest (position, cell) of each sequence that stays protected; older hot
+    // rows may be released.
+    std::vector<std::pair<int64_t, uint32_t>> protected_from;
     if (paged) {
         const uint64_t protected_per_seq = static_cast<uint64_t>(pyramidkv_c1_config.recent_window) +
             pyramidkv_c1_config.rollback_headroom;
@@ -2827,11 +2833,36 @@ bool llama_kv_cache::pyramidkv_c1_prepare_batch_rows(
             error = "PyramidKV paged hot cache cannot protect recent and rollback rows plus this ubatch";
             return false;
         }
-        protected_from.resize(n_seq_max);
-        for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
-            // A later ubatch can run before the caller rejects this sequence's draft tail.
-            protected_from[seq] = static_cast<int64_t>(cells.seq_pos_max(seq)) + 1 -
-                static_cast<int64_t>(protected_per_seq);
+        // Protect each sequence's newest protected_per_seq CELLS (a later
+        // ubatch can run before the caller rejects this sequence's draft
+        // tail). Counting cells rather than positions matters for M-RoPE
+        // images, whose cells share one position: a position window kept a
+        // whole screenshot protected and the ring overflowed. For text the
+        // two are the same. Every head holds the same logical cells, so the
+        // first ring decides for all.
+        protected_from.assign(n_seq_max, { std::numeric_limits<int64_t>::min(), 0 });
+        if (!pyramidkv_c1_layers.empty() && !pyramidkv_c1_layers.front().hot_heads.empty() &&
+                protected_per_seq > 0) {
+            std::vector<std::vector<std::pair<int64_t, uint32_t>>> rows(n_seq_max);
+            for (const uint32_t logical : pyramidkv_c1_layers.front().hot_heads.front().physical_to_logical) {
+                if (logical == pyramidkv_c1_invalid_cell || logical >= cells.size() ||
+                        cells.is_empty(logical) || cells.seq_count(logical) != 1) {
+                    continue;
+                }
+                const llama_seq_id seq = cells.seq_get(logical);
+                if (seq >= 0 && static_cast<uint32_t>(seq) < n_seq_max) {
+                    rows[seq].emplace_back(static_cast<int64_t>(cells.pos_get(logical)), logical);
+                }
+            }
+            for (uint32_t seq = 0; seq < n_seq_max; ++seq) {
+                auto & r = rows[seq];
+                if (r.size() <= protected_per_seq) {
+                    continue;
+                }
+                const auto nth = r.begin() + static_cast<std::ptrdiff_t>(protected_per_seq - 1);
+                std::nth_element(r.begin(), nth, r.end(), std::greater<std::pair<int64_t, uint32_t>>());
+                protected_from[seq] = *nth;
+            }
         }
     }
     for (auto & state : pyramidkv_c1_layers) {
@@ -2865,7 +2896,8 @@ bool llama_kv_cache::pyramidkv_c1_prepare_batch_rows(
                         error = "PyramidKV paged hot row has an invalid sequence owner";
                         return false;
                     }
-                    release = cells.pos_get(logical) < protected_from[seq];
+                    release = std::make_pair(static_cast<int64_t>(cells.pos_get(logical)), logical) <
+                        protected_from[seq];
                 }
                 if (release) {
                     hot.physical_to_logical[physical] = pyramidkv_c1_invalid_cell;
@@ -2947,7 +2979,10 @@ bool llama_kv_cache::pyramidkv_c1_prepare_batch_rows(
                     }
                     auto & list = lists[seq];
                     const int32_t pos = static_cast<int32_t>(ubatch.pos[token]);
-                    if (!list.empty() && list.back().pos >= pos) {
+                    // The cells of an M-RoPE image (embedding rows) share one
+                    // position; text must strictly increase.
+                    const bool image_row = ubatch.token == nullptr && ubatch.embd != nullptr && ubatch.n_pos == 4;
+                    if (!list.empty() && (list.back().pos > pos || (list.back().pos == pos && !image_row))) {
                         error = "PyramidKV C1 paged append is not position-ordered (rollback missed?)";
                         return false;
                     }
@@ -5515,12 +5550,17 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     if (!kv->pyramidkv_c1_hot_enabled && !kv->pyramidkv_c1_is_compacted()) {
         return;
     }
+    // Qwen35 image rows (embeddings, see llama_context::extract_pyramidkv_scores)
+    // map by their sequence position on axis 0 like text.
+    const bool image_rows = kv->model.arch == LLM_ARCH_QWEN35 && ubatch != nullptr &&
+        ubatch->token == nullptr && ubatch->embd != nullptr && ubatch->n_pos == 4;
     if (ubatch == nullptr || i_cur >= sinfos.size() || sinfos[i_cur].n_stream() != 1 ||
             ubatch->pos == nullptr ||
-            (ubatch->n_pos != 1 && !(kv->model.arch == LLM_ARCH_QWEN35 && ubatch->token && ubatch->n_pos == 4))) {
+            (ubatch->n_pos != 1 && !(kv->model.arch == LLM_ARCH_QWEN35 && ubatch->token && ubatch->n_pos == 4) &&
+                !image_rows)) {
         throw std::runtime_error("PyramidKV C1 input mapping requires one stream and one-dimensional positions");
     }
-    for (uint32_t axis = 1; axis < ubatch->n_pos; ++axis) {
+    for (uint32_t axis = 1; axis < ubatch->n_pos && !image_rows; ++axis) {
         for (uint32_t token = 0; token < ubatch->n_tokens; ++token) {
             if (ubatch->pos[axis * ubatch->n_tokens + token] != ubatch->pos[token]) {
                 throw std::runtime_error("PyramidKV C1 only supports broadcast text positions");
@@ -5758,11 +5798,8 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
                                 hot_row = static_cast<int32_t>(phys);
                             }
                         }
-                        const int64_t recent_begin = query_min[seq] -
-                            static_cast<int64_t>(kv->pyramidkv_c1_config.recent_window) + 1;
-                        if (list[i].pos >= recent_begin && list[i].pos <= query_max[seq] && hot_row < 0) {
-                            throw std::runtime_error("PyramidKV paged query lost a required F16 recent row");
-                        }
+                        // A recent key without a hot row (image cells beyond
+                        // the ring's newest-cells window) reads its arena copy.
                         out[3*i + 0] = static_cast<int32_t>(cell);
                         out[3*i + 1] = list[i].pos;
                         out[3*i + 2] = hot_row;

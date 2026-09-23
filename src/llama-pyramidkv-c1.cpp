@@ -236,10 +236,12 @@ bool llama_pyramidkv_c1_select(
             error = "a KV head has no bounded key position list";
             return false;
         }
+        // Non-decreasing: the cells of one M-RoPE image share a position.
+        // Duplicate cells are rejected below.
         for (std::size_t i = 0; i < positions.size(); ++i) {
             if (positions[i] < 0 || cells[i] >= score.logical_key_tokens ||
                     slots[i] >= score.key_stride ||
-                    (i != 0 && positions[i] <= positions[i - 1])) {
+                    (i != 0 && positions[i] < positions[i - 1])) {
                 error = "a KV head has non-monotonic original positions";
                 return false;
             }

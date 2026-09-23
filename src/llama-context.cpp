@@ -3621,10 +3621,14 @@ bool llama_context::extract_pyramidkv_scores(
         // drafter reads; the observer graph is unaffected by it.
         return fail("C1 requires Qwen2 or Qwen35 attention without SWA or a shared context");
     }
-    // Qwen35 text broadcasts each position across its four M-RoPE axes.
-    // Image positions and unsupported memory layouts remain rejected.
+    // Qwen35 text broadcasts each position across its four M-RoPE axes. An
+    // image arrives as embedding rows whose cells share the sequence position
+    // (axis 0) and differ on the 2-D axes; its rows are stored and attended
+    // like text but never scored (an image never ends a prompt).
+    const bool image_rows = model.arch == LLM_ARCH_QWEN35 && ubatch.token == nullptr &&
+        ubatch.embd != nullptr && ubatch.n_pos == 4;
     if (ubatch.n_tokens == 0 || ubatch.n_pos == 0 ||
-            (ubatch.n_pos != 1 && !(model.arch == LLM_ARCH_QWEN35 && ubatch.token && ubatch.n_pos == 4)) ||
+            (ubatch.n_pos != 1 && !(model.arch == LLM_ARCH_QWEN35 && ubatch.token && ubatch.n_pos == 4) && !image_rows) ||
             (ubatch.n_seqs_unq != 1 && !paged) || ubatch.n_seqs_unq == 0 || ubatch.pos == nullptr ||
             ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
         return fail("C1 requires one active sequence with one-dimensional positions");
@@ -3634,7 +3638,8 @@ bool llama_context::extract_pyramidkv_scores(
         // split); the observer scores each unselected prompt end separately.
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr || ubatch.pos[i] < 0 ||
-                    (i != 0 && ubatch.seq_id[i][0] == ubatch.seq_id[i - 1][0] && ubatch.pos[i] <= ubatch.pos[i - 1])) {
+                    (i != 0 && ubatch.seq_id[i][0] == ubatch.seq_id[i - 1][0] &&
+                        (image_rows ? ubatch.pos[i] < ubatch.pos[i - 1] : ubatch.pos[i] <= ubatch.pos[i - 1]))) {
                 return fail("C1 paged requires position-ordered tokens per sequence");
             }
         }
@@ -3642,12 +3647,12 @@ bool llama_context::extract_pyramidkv_scores(
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr ||
                     ubatch.seq_id[i][0] != 0 || ubatch.pos[i] < 0 ||
-                    (i != 0 && ubatch.pos[i] <= ubatch.pos[i - 1])) {
+                    (i != 0 && (image_rows ? ubatch.pos[i] < ubatch.pos[i - 1] : ubatch.pos[i] <= ubatch.pos[i - 1]))) {
                 return fail("C1 requires strictly increasing positions for sequence 0");
             }
         }
     }
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+    for (uint32_t i = 0; i < ubatch.n_tokens && !image_rows; ++i) {
         for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
             if (ubatch.pos[axis * ubatch.n_tokens + i] != ubatch.pos[i]) {
                 return fail("C1 only accepts broadcast text positions for Qwen35 M-RoPE");
@@ -3667,6 +3672,9 @@ bool llama_context::extract_pyramidkv_scores(
     const bool has_output = ubatch.output != nullptr &&
         std::any_of(ubatch.output, ubatch.output + ubatch.n_tokens,
             [](int8_t output) { return output != 0; });
+    if (image_rows && (has_output || !res->get_pyramidkv_scores().empty())) {
+        return fail("C1 does not score image rows; a prompt must end with text");
+    }
     if (paged) {
         // Selected sequences need no maintenance (the arena copy of every
         // decode token exists from its ubatch on, the lists grow in
