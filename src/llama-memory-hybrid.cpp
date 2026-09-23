@@ -31,7 +31,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
     ggml_backend_buffer_type_t kv_buffer_type,
-    llama_pyramidkv_c1_config pyramidkv_c1) :
+    llama_pyramidkv_c1_config pyramidkv_c1,
+                     bool   rs_replay) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -65,7 +66,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
+            : filter_recr,
+        rs_replay
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {

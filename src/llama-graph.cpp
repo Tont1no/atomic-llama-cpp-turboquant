@@ -438,6 +438,36 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// ReplaySSM row tables. Sequence s replays its first `cnt` saved tail rows,
+// placed at the end of R slots (the leading slots are no-op tokens: gate 0,
+// beta 0); its conv window starts `cnt` rows into [conv state, saved rows].
+static void llm_graph_set_rs_replay_inputs(const llama_memory_recurrent_context * mctx, llm_graph_input_rs * inp) {
+    if (inp->rp_rows == nullptr) {
+        return;
+    }
+    const int64_t R      = mctx->get_n_rs_seq();
+    const int64_t W      = mctx->get_conv_window();
+    const int64_t n_seqs = inp->rp_mask->ne[3];
+    GGML_ASSERT(ggml_backend_buffer_is_host(inp->rp_rows->buffer));
+    auto * rows = (int32_t *) inp->rp_rows->data;
+    auto * mask = (float *)   inp->rp_mask->data;
+    auto * raw  = (int32_t *) inp->rp_raw_rows->data;
+    auto * conv = (int32_t *) inp->rp_conv_rows->data;
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        const int64_t src = mctx->rp_src((int) s);
+        const int64_t cnt = mctx->rp_take((int) s);
+        for (int64_t j = 0; j < R; ++j) {
+            const int64_t k = j - (R - cnt);
+            rows[s*R + j] = (int32_t) (src*R + (k >= 0 ? k : 0));
+            mask[s*R + j] = k >= 0 ? 1.0f : 0.0f;
+            raw [s*R + j] = (int32_t) (src*R + j);
+        }
+        for (int64_t j = 0; j < W; ++j) {
+            conv[s*W + j] = (int32_t) (s*(W + R) + cnt + j);
+        }
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -452,6 +482,7 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+    llm_graph_set_rs_replay_inputs(mctx, this);
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -1253,6 +1284,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+    llm_graph_set_rs_replay_inputs(mctx->get_recr(), inp_rs.get());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1290,6 +1322,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->rp_rows != nullptr) == mctx->get_recr()->get_rs_replay();
 
     return res;
 }
@@ -1333,6 +1366,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->rp_rows != nullptr) == mctx->get_recr()->get_rs_replay();
 
     return res;
 }
@@ -1421,6 +1455,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->rp_rows != nullptr) == mctx->get_recr()->get_rs_replay();
 
     return res;
 }
@@ -4312,6 +4347,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+
+    if (mctx_cur->get_rs_replay()) {
+        const int64_t R = mctx_cur->get_n_rs_seq();
+        const int64_t W = mctx_cur->get_conv_window();
+        inp->rp_rows      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, R * n_seqs);
+        inp->rp_mask      = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, R, n_seqs);
+        inp->rp_raw_rows  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, R * n_seqs);
+        inp->rp_conv_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, W * n_seqs);
+        ggml_set_input(inp->rp_rows);
+        ggml_set_input(inp->rp_mask);
+        ggml_set_input(inp->rp_raw_rows);
+        ggml_set_input(inp->rp_conv_rows);
+    }
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();

@@ -41,7 +41,8 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
     ggml_backend_buffer_type_t kv_buffer_type = nullptr,
-    llama_pyramidkv_c1_config pyramidkv_c1 = {});
+    llama_pyramidkv_c1_config pyramidkv_c1 = {},
+                     bool   rs_replay = false);
 
     ~llama_memory_hybrid() = default;
 

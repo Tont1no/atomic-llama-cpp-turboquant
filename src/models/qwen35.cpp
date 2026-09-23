@@ -400,27 +400,79 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
+    // ReplaySSM: the delta net first replays the tokens a rollback kept (their
+    // saved conv outputs, gates and betas; no-op pads fill up to R), then
+    // this ubatch. build_recurrent_attn drops the replayed outputs again.
+    int64_t n_gdn_tokens = n_seq_tokens;
+    if (inp->rp_rows != nullptr) {
+        const int64_t R       = mctx_cur->get_n_rs_seq();
+        const auto    kv_head = mctx_cur->get_head();
+        ggml_tensor * rp_mix  = mctx_cur->get_rp_mix_l(il);
+        ggml_tensor * rp_g    = mctx_cur->get_rp_g_l(il);
+        ggml_tensor * rp_b    = mctx_cur->get_rp_b_l(il);
+
+        ggml_tensor * mix_rp = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, rp_mix, inp->rp_rows),
+                conv_channels, R, n_seqs);
+        ggml_tensor * g_rp = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rp_g, inp->rp_rows),
+                1, num_v_heads, R, n_seqs);
+        ggml_tensor * b_rp = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rp_b, inp->rp_rows),
+                1, num_v_heads, R, n_seqs);
+        g_rp = ggml_mul(ctx0, g_rp, inp->rp_mask);   // pad: gate 0 -> decay 1
+        b_rp = ggml_mul(ctx0, b_rp, inp->rp_mask);   // pad: beta 0 -> no update
+        cb(mix_rp, "replay_mix", il);
+        // read the saved rows before this ubatch overwrites them below
+        ggml_build_forward_expand(gf, mix_rp);
+        ggml_build_forward_expand(gf, g_rp);
+        ggml_build_forward_expand(gf, b_rp);
+
+        const int64_t tail = std::min<int64_t>(n_seq_tokens, R + 1) - 1;
+        if (tail > 0) {
+            const size_t   off_tok = (size_t) (n_seq_tokens - tail);
+            const size_t   dst_off = (size_t) kv_head * R;
+            ggml_tensor * mix_src = ggml_view_3d(ctx0, conv_qkv_mix, conv_channels, tail, n_seqs,
+                    conv_qkv_mix->nb[1], conv_qkv_mix->nb[2], off_tok * conv_qkv_mix->nb[1]);
+            ggml_tensor * mix_dst = ggml_view_3d(ctx0, rp_mix, conv_channels, tail, n_seqs,
+                    rp_mix->nb[1], R * rp_mix->nb[1], dst_off * rp_mix->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, mix_src, mix_dst));
+            const size_t hb = ggml_row_size(GGML_TYPE_F32, num_v_heads);
+            for (int which = 0; which < 2; ++which) {
+                ggml_tensor * val = which == 0 ? gate : beta;
+                ggml_tensor * buf = which == 0 ? rp_g : rp_b;
+                ggml_tensor * src = ggml_view_3d(ctx0, val, num_v_heads, tail, n_seqs,
+                        hb, hb * n_seq_tokens, off_tok * hb);
+                ggml_tensor * dst = ggml_view_3d(ctx0, buf, num_v_heads, tail, n_seqs,
+                        buf->nb[1], R * buf->nb[1], dst_off * buf->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+            }
+        }
+
+        conv_qkv_mix = ggml_concat(ctx0, mix_rp, conv_qkv_mix, 1);
+        gate         = ggml_concat(ctx0, g_rp, gate, 2);
+        beta         = ggml_concat(ctx0, b_rp, beta, 2);
+        n_gdn_tokens = R + n_seq_tokens;
+    }
+
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
     int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
 
     // Extract the convolved Q, K, V from conv_output
-    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_gdn_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_k_dim),
             nb1_qkv,
-            nb1_qkv * n_seq_tokens,
+            nb1_qkv * n_gdn_tokens,
             0);
 
-    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_seq_tokens, n_seqs,
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_gdn_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_k_dim),
             nb1_qkv,
-            nb1_qkv * n_seq_tokens,
+            nb1_qkv * n_gdn_tokens,
             head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
 
-    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
+    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_gdn_tokens, n_seqs,
             ggml_row_size(conv_qkv_mix->type, head_v_dim),
             nb1_qkv,
-            nb1_qkv * n_seq_tokens,
+            nb1_qkv * n_gdn_tokens,
             ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
 
     cb(q_conv, "q_conv", il);
@@ -440,8 +492,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // note: need explicit repeat only if we are not using the fused GDN.
     if (num_k_heads != num_v_heads && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
         GGML_ASSERT(num_v_heads % num_k_heads == 0);
-        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
-        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_seq_tokens, n_seqs);
+        q_conv = ggml_repeat_4d(ctx0, q_conv, head_k_dim, num_v_heads, n_gdn_tokens, n_seqs);
+        k_conv = ggml_repeat_4d(ctx0, k_conv, head_k_dim, num_v_heads, n_gdn_tokens, n_seqs);
     }
 
     cb(q_conv, "q_conv_predelta", il);

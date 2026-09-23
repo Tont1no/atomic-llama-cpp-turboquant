@@ -6590,6 +6590,22 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               base_t) {
+    GGML_ASSERT(base_t >= 0 && base_t < v->ne[2]);
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 2);
+    // op param 1: base_t + 1 (0 = the ordinary last-K snapshot layout)
+    ggml_set_op_params_i32(result, 1, (int32_t) (base_t + 1));
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

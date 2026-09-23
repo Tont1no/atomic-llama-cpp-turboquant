@@ -2662,6 +2662,20 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // ReplaySSM: like ggml_gated_delta_net with two snapshots only - slot 0
+    // after the last token and slot 1 after token base_t. A rollback restores
+    // slot 1 and replays the accepted tokens instead of keeping one snapshot
+    // per speculative token.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int64_t               base_t);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

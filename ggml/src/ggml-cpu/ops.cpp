@@ -11141,6 +11141,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
+    // ReplaySSM (ggml_gated_delta_net_replay): slot 0 after the last token,
+    // slot 1 after token base1 - 1. 0 keeps the last-K layout.
+    const int64_t base1 = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(base1 == 0 || K == 2);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
@@ -11239,7 +11243,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             attn_data += S_v * H; // advance to next token
 
-            if (K > 1) {
+            if (K > 1 && base1 > 0) {
+                const int64_t head_offset = (iv3 * H + iv1) * S_v * S_v;
+                if (t == n_tokens - 1) {
+                    memcpy(state_out_base + head_offset, s_out, S_v * S_v * sizeof(float));
+                }
+                if (t == base1 - 1) {
+                    memcpy(state_out_base + state_size_per_snap + head_offset, s_out, S_v * S_v * sizeof(float));
+                }
+            } else if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +

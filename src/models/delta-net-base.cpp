@@ -466,6 +466,40 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
+    // ReplaySSM: after a rollback the state came from group 1 (the tail's
+    // base token); the replayed tokens' conv inputs move the window on.
+    const bool    replay       = inp->rp_rows != nullptr;
+    const int64_t W            = conv_kernel_size - 1;
+    const int64_t n_seq_tokens = qkv_mixed->ne[1];
+    int64_t       tail         = 0;
+    if (replay) {
+        const int64_t R      = mctx_cur->get_n_rs_seq();
+        ggml_tensor * rp_raw = mctx_cur->get_rp_raw_l(il);
+
+        // per sequence: [conv state (W rows), saved tail inputs (R rows)], channel-major
+        ggml_tensor * state_rows = ggml_cont(ctx0, ggml_permute(ctx0, conv_states, 1, 0, 2, 3));
+        ggml_tensor * saved      = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, rp_raw, inp->rp_raw_rows),
+                conv_channels, R, n_seqs);
+        ggml_tensor * table      = ggml_reshape_2d(ctx0, ggml_concat(ctx0, state_rows, saved, 1),
+                conv_channels, (W + R) * n_seqs);
+        ggml_tensor * window     = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, table, inp->rp_conv_rows),
+                conv_channels, W, n_seqs);
+        conv_states = ggml_cont(ctx0, ggml_permute(ctx0, window, 1, 0, 2, 3));
+        cb(conv_states, "conv_states_replayed", il);
+        // read the saved rows before this ubatch overwrites them below
+        ggml_build_forward_expand(gf, conv_states);
+
+        // keep this ubatch's tail (tokens after its base) for the next rollback
+        tail = std::min<int64_t>(n_seq_tokens, R + 1) - 1;
+        if (tail > 0) {
+            ggml_tensor * src = ggml_view_3d(ctx0, qkv_mixed, conv_channels, tail, n_seqs,
+                    qkv_mixed->nb[1], qkv_mixed->nb[2], (n_seq_tokens - tail) * qkv_mixed->nb[1]);
+            ggml_tensor * dst = ggml_view_3d(ctx0, rp_raw, conv_channels, tail, n_seqs,
+                    rp_raw->nb[1], R * rp_raw->nb[1], (size_t) kv_head * R * rp_raw->nb[1]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        }
+    }
+
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
@@ -476,7 +510,26 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (replay) {
+        // group 0: window ending at the last token; group 1: at the base token
+        for (int64_t s_slot = 0; s_slot < 2; ++s_slot) {
+            const int64_t s_idx = s_slot == 0 ? conv_input->ne[0] - W : n_seq_tokens - tail;
+
+            ggml_tensor * conv_state_last =
+                ggml_view_3d(ctx0, conv_input,
+                        conv_kernel_size - 1, conv_channels, n_seqs,
+                        conv_input->nb[1], conv_input->nb[2],
+                        ggml_row_size(conv_input->type, s_idx));
+
+            ggml_tensor * conv_state_update =
+                ggml_view_2d(ctx0,
+                        conv_states_all, row_count, n_seqs,
+                        conv_states_all->nb[1],
+                        (s_slot * mem_size + kv_head) * row_size);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        }
+    } else if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -561,10 +614,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    // ReplaySSM: q/k/v/g/b start with R replayed (or no-op) tokens; two state
+    // groups - after the last token and after the tail's base token.
+    const bool    replay   = inp->rp_rows != nullptr;
+    const int64_t R        = replay ? (int64_t) mctx_cur->get_n_rs_seq() : 0;
+    const int64_t K        = replay ? 2 : cparams.n_rs_seq + 1;
+    const int64_t n_real   = n_seq_tokens - R;
+    const int64_t rp_tail  = replay ? std::min<int64_t>(n_real, R + 1) - 1 : 0;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = replay
+        ? ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, n_seq_tokens - 1 - rp_tail)
+        : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -575,11 +636,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 
     ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
-        S_v, H_v, n_seq_tokens, n_seqs,
+        S_v, H_v, n_real, n_seqs,
         ggml_row_size(gdn_out->type, S_v),
         ggml_row_size(gdn_out->type, S_v * H_v),
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
-        0);
+        ggml_row_size(gdn_out->type, S_v * H_v * R));
+    if (replay) {
+        output = ggml_cont(ctx0, output);   // the replayed tokens' outputs are dropped
+    }
     cb(output, "attn_output", il);
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);

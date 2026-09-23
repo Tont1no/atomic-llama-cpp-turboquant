@@ -385,6 +385,10 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    cparams.rs_replay = params.rs_replay && cparams.n_rs_seq > 0 && model.arch == LLM_ARCH_QWEN35;
+    if (params.rs_replay && !cparams.rs_replay) {
+        LLAMA_LOG_WARN("%s: rs_replay needs n_rs_seq > 0 on a Qwen3.5 hybrid; using snapshot rollback\n", __func__);
+    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -679,6 +683,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: rs_replay             = %d\n",   __func__, cparams.rs_replay ? 1 : 0);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 
@@ -5006,8 +5011,10 @@ llama_context_params llama_context_default_params() {
             /*.list_capacity          =*/ 0,
             /*.paged_union_factor     =*/ 4,
             /*.max_prefill_cells      =*/ 0,
+            /*.paged_reselect         =*/ false,
         },
         /*.tq4_key_center             =*/ false,
+        /*.rs_replay                  =*/ false,
     };
 
     return result;
@@ -5358,6 +5365,21 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_pyramidkv_c1_reselect(struct llama_context * ctx, llama_seq_id seq_id) {
+    if (!ctx) {
+        return false;
+    }
+    auto * kv = llama_context_attention_cache(ctx->get_memory());
+    std::string error;
+    if (kv == nullptr || !kv->pyramidkv_c1_paged_unselect(seq_id, error)) {
+        if (!error.empty()) {
+            LLAMA_LOG_WARN("%s: %s\n", __func__, error.c_str());
+        }
+        return false;
+    }
+    return true;
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

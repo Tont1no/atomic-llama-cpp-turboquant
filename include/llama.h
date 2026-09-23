@@ -390,6 +390,11 @@ extern "C" {
         uint32_t paged_union_factor;
         // Internal per-request prefill bound; zero uses the full arena.
         uint32_t max_prefill_cells;
+        // Paged: a selection keeps every cell in the arena (the lists still
+        // shrink, so decode costs the same) and llama_pyramidkv_c1_reselect()
+        // lets a follow-up prompt select anew for its own question. Costs
+        // the cells a selection would have given back to other sequences.
+        bool     paged_reselect;
     };
 
     struct llama_context_params {
@@ -467,6 +472,12 @@ extern "C" {
         // Experimental fixed post-RoPE K offset stored on the KV device.
         // State I/O and sequence shifts are unsupported for this profile.
         bool tq4_key_center;
+
+        // [EXPERIMENTAL] ReplaySSM, with n_rs_seq > 0 on Qwen3.5 hybrids: keep
+        // two recurrent states per sequence instead of 1 + n_rs_seq and
+        // replay accepted speculative tokens from their saved inputs after a
+        // rollback (see ggml_gated_delta_net_replay).
+        bool rs_replay;
     };
 
     struct llama_model_tensor_override {
@@ -887,6 +898,12 @@ extern "C" {
               llama_seq_id seq_id,
            const llama_pos * pos,
                    int32_t n);
+
+    // PyramidKV C1 paged with paged_reselect: forget the sequence's selection
+    // so its next prompt (a follow-up turn) prefills over every kept cell and
+    // the observer selects anew for that prompt. false when the context has
+    // no such cache, the mode is off, or the sequence was never selected.
+    LLAMA_API bool llama_pyramidkv_c1_reselect(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
