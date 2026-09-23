@@ -445,7 +445,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 Q->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
                 K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type) ||
                 K_hot->nb[0] != sizeof(ggml_fp16_t) || V_hot->nb[0] != sizeof(ggml_fp16_t) ||
-                mask != nullptr || sinks != nullptr) {
+                sinks != nullptr) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // src[3] carries the optional quest list in the paged mode
+        if (mask != nullptr && (mask->type != GGML_TYPE_I32 || !ggml_is_contiguous(mask) ||
+                mask->ne[0] < 1 || (mask->ne[0] - 1) % 3 != 0 ||
+                mask->ne[1] != K->ne[2] || mask->ne[2] != k_pos->ne[3])) {
             return BEST_FATTN_KERNEL_NONE;
         }
         return BEST_FATTN_KERNEL_HYBRID_PAGED;

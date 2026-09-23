@@ -503,6 +503,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         const int32_t * q_meta,      // [2, NQ]: position, seq
         const int32_t * k_list,      // [3, max_len, NKV_HEADS, NSEQ]
         const int32_t * k_list_len,  // [NKV_HEADS, NSEQ]
+        const int32_t * quest,       // [1 + 3*n, NKV_HEADS, NSEQ] or null
+        const int64_t quest_stride,
         float * dst,
         const int64_t D,
         const int64_t NQ,
@@ -570,12 +572,22 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         }
         // Future draft rows must not change an earlier query's reduction groups.
         const int64_t n_keys = first;
-        const int64_t key_begin = split_k_path ? (n_keys*split)/split_k : 0;
-        const int64_t key_end   = split_k_path ? (n_keys*(split + 1))/split_k : n_keys;
+        // Quest entries follow the sorted list; each is checked for causality.
+        int64_t n_quest = 0;
+        const int32_t * quest_list = nullptr;
+        if (quest != nullptr) {
+            const int32_t * qs = quest + quest_stride*(kv_head + NKV_HEADS*q_seq);
+            n_quest = min((int64_t) qs[0], (quest_stride - 1)/3);
+            quest_list = qs + 1;
+        }
+        const int64_t n_total = n_keys + n_quest;
+        const int64_t key_begin = split_k_path ? (n_total*split)/split_k : 0;
+        const int64_t key_end   = split_k_path ? (n_total*(split + 1))/split_k : n_total;
         for (int64_t key_index = key_begin; key_index < key_end; ++key_index) {
-            const int32_t cold_row = list[3*key_index + 0];
-            const int32_t key_position = list[3*key_index + 1];
-            const int32_t hot_row = list[3*key_index + 2];
+            const int32_t * entry = key_index < n_keys ? list + 3*key_index : quest_list + 3*(key_index - n_keys);
+            const int32_t cold_row = entry[0];
+            const int32_t key_position = entry[1];
+            const int32_t hot_row = entry[2];
             if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
                 continue;
             }
@@ -649,6 +661,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
         const int32_t * q_meta,
         const int32_t * k_list,
         const int32_t * k_list_len,
+        const int32_t * quest,
+        const int64_t quest_stride,
         float * dst,
         const int64_t D,
         const int64_t NQ,
@@ -715,12 +729,21 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
             }
         }
         const int64_t n_keys = first;
-        const int64_t key_begin = split_k_path ? (n_keys*split)/split_k : 0;
-        const int64_t key_end = split_k_path ? (n_keys*(split + 1))/split_k : n_keys;
+        int64_t n_quest = 0;
+        const int32_t * quest_list = nullptr;
+        if (quest != nullptr) {
+            const int32_t * qs = quest + quest_stride*(kv_head + NKV_HEADS*q_seq);
+            n_quest = min((int64_t) qs[0], (quest_stride - 1)/3);
+            quest_list = qs + 1;
+        }
+        const int64_t n_total = n_keys + n_quest;
+        const int64_t key_begin = split_k_path ? (n_total*split)/split_k : 0;
+        const int64_t key_end = split_k_path ? (n_total*(split + 1))/split_k : n_total;
         for (int64_t key_index = key_begin; key_index < key_end; ++key_index) {
-            const int32_t cold_row = list[3*key_index + 0];
-            const int32_t key_position = list[3*key_index + 1];
-            const int32_t hot_row = list[3*key_index + 2];
+            const int32_t * entry = key_index < n_keys ? list + 3*key_index : quest_list + 3*(key_index - n_keys);
+            const int32_t cold_row = entry[0];
+            const int32_t key_position = entry[1];
+            const int32_t hot_row = entry[2];
             if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
                 continue;
             }
@@ -810,10 +833,15 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
     const ggml_tensor * q_meta = dst->src[7];
     const ggml_tensor * k_list = dst->src[8];
     const ggml_tensor * k_list_len = dst->src[9];
+    const ggml_tensor * quest = dst->src[3];
 
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(k_cold->type == type && v_cold->type == type);
+    GGML_ASSERT(quest == nullptr || (quest->type == GGML_TYPE_I32 && ggml_is_contiguous(quest) &&
+        quest->ne[1] == k_cold->ne[2] && quest->ne[2] == k_list->ne[3]));
+    const int32_t * quest_data = quest ? (const int32_t *) quest->data : nullptr;
+    const int64_t quest_stride = quest ? quest->ne[0] : 0;
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->ne[0] == k_cold->ne[0] && (q->ne[0] == 128 || q->ne[0] == 256));
     GGML_ASSERT(q->ne[3] == 1);
@@ -843,7 +871,7 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
     // The split count follows the longest list any query in this batch can
     // walk; short lists simply leave splits empty (the merge handles S == 0).
     const int64_t max_len = k_list->ne[1];
-    const int split_k = ggml_cuda_hybrid_split_count(max_len, n_rows, q->ne[0]);
+    const int split_k = ggml_cuda_hybrid_split_count(max_len + (quest_stride - (quest ? 1 : 0))/3, n_rows, q->ne[0]);
     // On by default: Qwen3.5 27B paged decode with 4 users x MTP3 measured
     // 244 -> 269 tok/s and 8 users plain 199 -> 216 (64K prompts, RTX 5090),
     // bit-identical results. GGML_CUDA_PAGED_GQA6=0 restores the per-row path.
@@ -865,6 +893,7 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
                 (const char *) k_cold->data, (const char *) v_cold->data,
                 (const char *) k_hot->data, (const char *) v_hot->data,
                 (const int32_t *) q_meta->data, (const int32_t *) k_list->data, (const int32_t *) k_list_len->data,
+                quest_data, quest_stride,
                 (float *) dst->data,
                 q->ne[0], q->ne[1], q->ne[2], k_cold->ne[2], k_list->ne[3], max_len,
                 k_cold->ne[1], k_hot->ne[1],
@@ -881,6 +910,7 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
             (const char *) k_cold->data, (const char *) v_cold->data,
             (const char *) k_hot->data, (const char *) v_hot->data,
             (const int32_t *) q_meta->data, (const int32_t *) k_list->data, (const int32_t *) k_list_len->data,
+            quest_data, quest_stride,
             (float *) dst->data,
             q->ne[0], q->ne[1], q->ne[2], k_cold->ne[2], k_list->ne[3], max_len,
             k_cold->ne[1], k_hot->ne[1],

@@ -5036,6 +5036,8 @@ llama_context_params llama_context_default_params() {
             /*.list_capacity          =*/ 0,
             /*.paged_union_factor     =*/ 4,
             /*.max_prefill_cells      =*/ 0,
+            /*.quest_pages            =*/ 0,
+            /*.quest_page_size        =*/ 64,
         },
         /*.tq4_key_center             =*/ false,
         /*.rs_replay                  =*/ false,

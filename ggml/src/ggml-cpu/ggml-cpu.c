@@ -2102,6 +2102,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_PYRAMIDKV_QUEST_UPDATE:
+            {
+                ggml_compute_forward_pyramidkv_quest_update(params, tensor);
+            } break;
+        case GGML_OP_PYRAMIDKV_QUEST_SELECT:
+            {
+                ggml_compute_forward_pyramidkv_quest_select(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2291,6 +2299,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_LEAKY_RELU:
+        case GGML_OP_PYRAMIDKV_QUEST_UPDATE:
+        case GGML_OP_PYRAMIDKV_QUEST_SELECT:
             {
                 n_tasks = 1;
             } break;

@@ -390,6 +390,13 @@ extern "C" {
         uint32_t paged_union_factor;
         // Internal per-request prefill bound; zero uses the full arena.
         uint32_t max_prefill_cells;
+        // Quest, paged only (0 = off): every decode step also attends the
+        // quest_pages best arena pages (quest_page_size cells each) of its
+        // sequence, scored from per-page bounds of the unrotated keys against
+        // the step's own queries. The arena then keeps every prompt cell
+        // (a selection frees nothing).
+        uint32_t quest_pages;
+        uint32_t quest_page_size;
     };
 
     struct llama_context_params {

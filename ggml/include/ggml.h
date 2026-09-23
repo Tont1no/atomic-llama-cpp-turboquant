@@ -583,6 +583,8 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_PYRAMIDKV_QUEST_UPDATE,
+        GGML_OP_PYRAMIDKV_QUEST_SELECT,
 
         GGML_OP_UNARY,
 
@@ -2503,6 +2505,59 @@ extern "C" {
 
     // 0: dense hybrid (k_positions per row), 1: paged lists.
     GGML_API int32_t ggml_flash_attn_ext_hybrid_mode(const struct ggml_tensor * a);
+
+    // Paged hybrid attention also walks a quest list (ggml_pyramidkv_quest_select
+    // result: I32 [1 + 3*n, n_kv_heads, n_seqs], count then (arena row, position,
+    // -1) entries, unsorted; each entry is checked for causality on its own).
+    GGML_API void ggml_flash_attn_ext_hybrid_paged_set_quest(
+            struct ggml_tensor * a,
+            struct ggml_tensor * quest);
+
+    // PyramidKV Quest page bounds for a paged C1 arena, per attention layer:
+    //   bounds    F16 [2*D, n_kv_heads, n_pages]: per channel the lowest (0..D-1)
+    //             and highest (D..2D-1) UNROTATED key of the page's cells
+    //             (page = arena cell / page_size)
+    //   page_seqs I32 [n_pages]: bit s set once sequence s wrote a cell there
+    //   cell_meta I32 [2, n_cells]: (position, sequence) per cell, sequence -1 = none
+    // The update first resets the listed pages (resets I32 [1 + R]: count, then
+    // pages), then widens the bounds of the pages its tokens are written to
+    // (k F32 [D, n_kv_heads, n_tokens]; writes I32 [3, n_tokens]: cell,
+    // position, sequence; cell < 0 skips the token). With write_meta it also
+    // resets/records page_seqs and cell_meta - once per ubatch, not per layer.
+    // Returns a view of bounds.
+    GGML_API struct ggml_tensor * ggml_pyramidkv_quest_update(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * bounds,
+            struct ggml_tensor  * page_seqs,
+            struct ggml_tensor  * cell_meta,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * writes,
+            struct ggml_tensor  * resets,
+            int32_t               page_size,
+            bool                  write_meta);
+
+    // Per sequence slot and KV head: every page of the sequence is scored by
+    // max over the slot's query tokens and the head's GQA query heads of
+    // sum_d max(q_d lo_d, q_d hi_d); the n_select best pages (ties: lower page)
+    // are listed in page order with their cells of the sequence that the base
+    // list does not hold.
+    //   q        F32 [D, n_q_heads, n_tokens] unrotated queries
+    //   q_meta   I32 [2, n_tokens] (position, sequence slot)
+    //   seq_ids  I32 [n_seqs] sequence id of each slot (< 32)
+    //   base     I32 [3, max_len, n_kv_heads, n_seqs], base_len I32 [n_kv_heads, n_seqs]
+    // Result I32 [1 + 3*n_select*page_size, n_kv_heads, n_seqs].
+    GGML_API struct ggml_tensor * ggml_pyramidkv_quest_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * bounds,
+            struct ggml_tensor  * page_seqs,
+            struct ggml_tensor  * cell_meta,
+            struct ggml_tensor  * q_meta,
+            struct ggml_tensor  * seq_ids,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * base_len,
+            int32_t               n_select,
+            int32_t               page_size);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

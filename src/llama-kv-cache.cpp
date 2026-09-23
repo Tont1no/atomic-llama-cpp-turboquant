@@ -815,6 +815,68 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
         aux.stage_len.assign(len_stride*n_layers, 0);
         aux.stage_meta.assign(2*n_ubatch, -1);
     }
+    quest_pending_resets.clear();
+    quest_meta_dirty = true;
+    if (pyramidkv_c1_quest()) {
+        const uint32_t page = static_cast<uint32_t>(pyramidkv_c1_config.quest_page_size);
+        const uint64_t n_cells = get_size();
+        const uint64_t n_pages = (n_cells + page - 1)/page;
+        int64_t head_dim = -1;
+        for (size_t slot = 0; slot < pyramidkv_c1_layers.size(); ++slot) {
+            const int64_t d = hparams.n_embd_head_k(layers[slot].il);
+            if ((head_dim >= 0 && d != head_dim) || pyramidkv_c1_layers[slot].kv_heads != heads_max) {
+                error = "PyramidKV Quest requires one head size and KV head count over the attention layers";
+                return false;
+            }
+            head_dim = d;
+        }
+        if (head_dim != 128 && head_dim != 256) {
+            error = "PyramidKV Quest requires a 128 or 256 key head size";
+            return false;
+        }
+        ggml_init_params qparams = {
+            /*.mem_size   =*/ 8*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr qctx { ggml_init(qparams) };
+        if (!qctx) {
+            error = "PyramidKV Quest context allocation failed";
+            return false;
+        }
+        ggml_tensor * bounds = ggml_new_tensor_4d(qctx.get(), GGML_TYPE_F16, 2*head_dim, heads_max, n_pages, n_layers);
+        ggml_tensor * page_seqs = ggml_new_tensor_1d(qctx.get(), GGML_TYPE_I32, n_pages);
+        ggml_tensor * cell_meta = ggml_new_tensor_2d(qctx.get(), GGML_TYPE_I32, 2, n_cells);
+        ggml_tensor * writes = ggml_new_tensor_2d(qctx.get(), GGML_TYPE_I32, 3, n_ubatch);
+        ggml_tensor * resets = ggml_new_tensor_1d(qctx.get(), GGML_TYPE_I32, 1 + n_ubatch);
+        ggml_tensor * seq_ids = ggml_new_tensor_1d(qctx.get(), GGML_TYPE_I32, n_seq_max);
+        ggml_format_name(bounds, "pyramidkv_quest_bounds");
+        ggml_format_name(page_seqs, "pyramidkv_quest_page_seqs");
+        ggml_format_name(cell_meta, "pyramidkv_quest_cell_meta");
+        ggml_format_name(writes, "pyramidkv_quest_writes");
+        ggml_format_name(resets, "pyramidkv_quest_resets");
+        ggml_format_name(seq_ids, "pyramidkv_quest_seq_ids");
+        ggml_backend_buffer_ptr qbuf { ggml_backend_alloc_ctx_tensors_from_buft(qctx.get(), kv_buffer_type) };
+        if (!qbuf) {
+            error = "PyramidKV Quest buffer allocation failed";
+            return false;
+        }
+        ggml_backend_buffer_clear(qbuf.get(), 0);
+        LLAMA_LOG_INFO("%s: PyramidKV Quest %zu pages x %zu cells per step, %llu pages, bounds %.1f MiB\n",
+            __func__, pyramidkv_c1_config.quest_pages, pyramidkv_c1_config.quest_page_size,
+            (unsigned long long) n_pages, ggml_nbytes(bounds)/1048576.0);
+        aux.quest_ctx = std::move(qctx);
+        aux.quest_buf = std::move(qbuf);
+        aux.quest_bounds = bounds;
+        aux.quest_page_seqs = page_seqs;
+        aux.quest_cell_meta = cell_meta;
+        aux.quest_writes = writes;
+        aux.quest_resets = resets;
+        aux.quest_seq_ids = seq_ids;
+        aux.stage_quest_writes.assign(3*n_ubatch, -1);
+        aux.stage_quest_resets.assign(1 + n_ubatch, 0);
+        aux.stage_quest_seq_ids.assign(n_seq_max, -1);
+    }
     pyramidkv_c1_bind_aux_backend(backend);
     return true;
 }
@@ -1058,7 +1120,8 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
     }
     uint32_t freed = 0;
     auto & head_pos = v_heads[seq_to_stream[seq_id]];
-    for (uint32_t i = 0; i < cells.size(); ++i) {
+    // Quest attends pages of the whole prompt: nothing is freed.
+    for (uint32_t i = 0; i < cells.size() && !pyramidkv_c1_quest(); ++i) {
         if (kept[i] || cells.is_empty(i) || !cells.seq_has(i, seq_id) || cells.seq_count(i) != 1) {
             continue;
         }
@@ -1380,6 +1443,7 @@ void llama_kv_cache::pyramidkv_c1_fail_transition(const std::string & error) {
 }
 
 void llama_kv_cache::clear(bool data) {
+    quest_meta_dirty = true;
     if (pyramidkv_c1_hot_enabled && pyramidkv_c1_compacted) {
         std::string error;
         if (!pyramidkv_c1_reinitialize(error)) {
@@ -1443,6 +1507,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    quest_meta_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -1630,6 +1695,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    quest_meta_dirty = true;
     if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && seq_id_src != seq_id_dst) {
         pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
             ? "TQ4 key center cannot copy cache rows to another sequence"
@@ -1728,6 +1794,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    quest_meta_dirty = true;
     if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && seq_id != 0) {
         pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
             ? "TQ4 key center supports only sequence 0"
@@ -1764,6 +1831,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    quest_meta_dirty = true;
     const llama_pos range_begin = std::max<llama_pos>(0, p0);
     const llama_pos range_end = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
     if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && shift != 0 && range_begin != range_end) {
@@ -1822,6 +1890,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    quest_meta_dirty = true;
     const llama_pos range_begin = std::max<llama_pos>(0, p0);
     const llama_pos range_end = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
     if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && d != 1 && range_begin != range_end) {
@@ -2446,6 +2515,27 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
+    if (pyramidkv_c1_quest() && sinfo.n_stream() == 1) {
+        const auto & cells = v_cells[sinfo.strm[0]];
+        const uint32_t page = static_cast<uint32_t>(pyramidkv_c1_config.quest_page_size);
+        int64_t last_page = -1;
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const int64_t p = sinfo.idxs[0][ii]/page;
+            if (p == last_page || std::find(quest_pending_resets.begin(), quest_pending_resets.end(), (int32_t) p) != quest_pending_resets.end()) {
+                last_page = p;
+                continue;
+            }
+            last_page = p;
+            bool empty = true;
+            for (uint32_t c = (uint32_t) p*page; c < std::min<uint32_t>(((uint32_t) p + 1)*page, cells.size()) && empty; ++c) {
+                empty = cells.is_empty(c);
+            }
+            if (empty) {
+                quest_pending_resets.push_back((int32_t) p);
+            }
+        }
+    }
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
@@ -2455,6 +2545,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const auto idx = sinfo.idxs[s][ii];
 
             if (!cells.is_empty(idx)) {
+                quest_meta_dirty = true;
                 assert(cells.seq_count(idx) == 1);
 
                 const llama_seq_id seq_id = cells.seq_get(idx);
@@ -4862,6 +4953,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    quest_meta_dirty = true;
     if (tq4_key_center_enabled_flag) {
         throw std::runtime_error(
             "TQ4 key-center state_read is disabled until the anchor has a versioned state format");
@@ -5907,6 +5999,52 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
             }
         }
     }
+    // Quest: the ubatch's (cell, position, sequence) writes, the pages to
+    // reset first, the slot -> sequence map; the whole cell table after any
+    // change other than an append.
+    bool quest_dirty = false, quest_full = false;
+    size_t quest_resets = 0;
+    if (kv->pyramidkv_c1_quest() && aux.quest_writes != nullptr) {
+        if (ubatch->n_tokens > aux.n_ubatch) {
+            throw std::runtime_error("PyramidKV Quest ubatch exceeds the staged write capacity");
+        }
+        for (uint32_t token = 0; token < ubatch->n_tokens; ++token) {
+            const bool one = ubatch->n_seq_id != nullptr && ubatch->n_seq_id[token] == 1 && ubatch->seq_id[token] != nullptr;
+            aux.stage_quest_writes[3*token + 0] = static_cast<int32_t>(sinfo.idxs[0][token]);
+            aux.stage_quest_writes[3*token + 1] = static_cast<int32_t>(ubatch->pos[token]);
+            aux.stage_quest_writes[3*token + 2] = one ? ubatch->seq_id[token][0] : -1;
+        }
+        quest_resets = std::min<size_t>(kv->quest_pending_resets.size(), aux.stage_quest_resets.size() - 1);
+        aux.stage_quest_resets[0] = static_cast<int32_t>(quest_resets);
+        for (size_t i = 0; i < quest_resets; ++i) {
+            aux.stage_quest_resets[1 + i] = kv->quest_pending_resets[i];
+        }
+        kv->quest_pending_resets.clear();
+        std::fill(aux.stage_quest_seq_ids.begin(), aux.stage_quest_seq_ids.end(), -1);
+        for (uint32_t s = 0; s < ubatch->n_seqs_unq && s < aux.stage_quest_seq_ids.size(); ++s) {
+            aux.stage_quest_seq_ids[s] = ubatch->seq_id_unq[s];
+        }
+        if (kv->quest_meta_dirty) {
+            const uint32_t page = static_cast<uint32_t>(kv->pyramidkv_c1_config.quest_page_size);
+            aux.stage_quest_cell_meta.assign(2ull*aux.quest_cell_meta->ne[1], -1);
+            aux.stage_quest_page_seqs.assign(aux.quest_page_seqs->ne[0], 0);
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell) || cells.seq_count(cell) != 1) {
+                    continue;
+                }
+                const llama_seq_id seq = cells.seq_get(cell);
+                aux.stage_quest_cell_meta[2*cell + 0] = cells.pos_get(cell);
+                aux.stage_quest_cell_meta[2*cell + 1] = seq;
+                if (seq >= 0 && seq < 32) {
+                    aux.stage_quest_page_seqs[cell/page] |= (int32_t) (1u << seq);
+                }
+            }
+            kv->quest_meta_dirty = false;
+            quest_full = true;
+        }
+        quest_dirty = true;
+    }
+
     // One upload per kind replaces per-layer inputs. Ordered on the KV
     // backend's compute stream: inside one decode call
     // the previous ubatch's graph can still be reading these tensors while
@@ -5955,8 +6093,17 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     if (aux_meta_dirty) {
         upload(aux.q_meta, aux.stage_meta.data(), 2ull*ubatch->n_tokens*sizeof(int32_t));
     }
+    if (quest_dirty) {
+        upload(aux.quest_writes, aux.stage_quest_writes.data(), 3ull*ubatch->n_tokens*sizeof(int32_t));
+        upload(aux.quest_resets, aux.stage_quest_resets.data(), (1 + quest_resets)*sizeof(int32_t));
+        upload(aux.quest_seq_ids, aux.stage_quest_seq_ids.data(), aux.stage_quest_seq_ids.size()*sizeof(int32_t));
+        if (quest_full) {
+            upload(aux.quest_cell_meta, aux.stage_quest_cell_meta.data(), ggml_nbytes(aux.quest_cell_meta));
+            upload(aux.quest_page_seqs, aux.stage_quest_page_seqs.data(), ggml_nbytes(aux.quest_page_seqs));
+        }
+    }
     if (aux.backend != nullptr &&
-            (aux_pos_dirty || aux_hot_dirty || aux_q_dirty || aux_list_dirty || aux_meta_dirty)) {
+            (aux_pos_dirty || aux_hot_dirty || aux_q_dirty || aux_list_dirty || aux_meta_dirty || quest_dirty)) {
         if (aux.upload_done) {
             ggml_backend_event_record(aux.upload_done.get(), aux.backend);
             aux.upload_pending = true;
@@ -6268,6 +6415,39 @@ ggml_tensor * llama_kv_cache_context::get_q_meta(ggml_context * ctx, int32_t il,
         throw std::runtime_error("PyramidKV C1 query metadata shape changed while reusing a graph");
     }
     return input.q_meta;
+}
+
+ggml_tensor * llama_kv_cache_context::quest_update(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const {
+    const auto & aux = kv->pyramidkv_c1_aux;
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (aux.quest_bounds == nullptr || map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV Quest tensors are not allocated");
+    }
+    const size_t slot = static_cast<size_t>(map_it->second);
+    const int64_t n_tokens = k_cur->ne[2];
+    ggml_tensor * bounds = ggml_view_3d(ctx, aux.quest_bounds, aux.quest_bounds->ne[0], aux.quest_bounds->ne[1],
+        aux.quest_bounds->ne[2], aux.quest_bounds->nb[1], aux.quest_bounds->nb[2], slot*aux.quest_bounds->nb[3]);
+    ggml_tensor * writes = ggml_view_2d(ctx, aux.quest_writes, 3, n_tokens, aux.quest_writes->nb[1], 0);
+    // Resets are sized for the whole ubatch; the count in element 0 bounds them.
+    ggml_tensor * resets = ggml_view_1d(ctx, aux.quest_resets, 1 + n_tokens, 0);
+    return ggml_pyramidkv_quest_update(ctx, bounds, aux.quest_page_seqs, aux.quest_cell_meta, k_cur, writes, resets,
+        static_cast<int32_t>(kv->pyramidkv_c1_config.quest_page_size), slot == 0);
+}
+
+ggml_tensor * llama_kv_cache_context::quest_select(ggml_context * ctx, ggml_tensor * q_cur, int32_t il) const {
+    const auto & aux = kv->pyramidkv_c1_aux;
+    const auto map_it = kv->map_layer_ids.find(il);
+    if (aux.quest_bounds == nullptr || map_it == kv->map_layer_ids.end()) {
+        throw std::runtime_error("PyramidKV Quest tensors are not allocated");
+    }
+    const size_t slot = static_cast<size_t>(map_it->second);
+    ggml_tensor * bounds = ggml_view_3d(ctx, aux.quest_bounds, aux.quest_bounds->ne[0], aux.quest_bounds->ne[1],
+        aux.quest_bounds->ne[2], aux.quest_bounds->nb[1], aux.quest_bounds->nb[2], slot*aux.quest_bounds->nb[3]);
+    return ggml_pyramidkv_quest_select(ctx, q_cur, bounds, aux.quest_page_seqs, aux.quest_cell_meta,
+        get_q_meta(ctx, il, static_cast<size_t>(q_cur->ne[2])), aux.quest_seq_ids,
+        get_k_list(ctx, il), get_k_list_len(ctx, il),
+        static_cast<int32_t>(kv->pyramidkv_c1_config.quest_pages),
+        static_cast<int32_t>(kv->pyramidkv_c1_config.quest_page_size));
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

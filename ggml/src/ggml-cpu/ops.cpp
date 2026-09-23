@@ -8972,6 +8972,7 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
     const int32_t * meta = (const int32_t *) q_meta->data;
     const int32_t * lists = (const int32_t *) k_list->data;
     const int32_t * lens = (const int32_t *) k_list_len->data;
+    const ggml_tensor * quest = dst->src[3];
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iq2 = ir / q->ne[1];
@@ -8991,20 +8992,30 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
         float S = 0.0f;
 
         if (q_seq >= 0 && q_seq < n_seq) {
-            const int64_t n_keys = MIN((int64_t) lens[kv_head + n_kv_heads*q_seq], max_len);
+            const int64_t list_len = MIN((int64_t) lens[kv_head + n_kv_heads*q_seq], max_len);
             const int32_t * list = lists + 3*max_len*(kv_head + n_kv_heads*q_seq);
-            for (int64_t ik = 0; ik < n_keys; ++ik) {
-                const int32_t cold_row = list[3*ik + 0];
-                const int32_t key_pos = list[3*ik + 1];
-                const int32_t hot_row = list[3*ik + 2];
-                if (q_position < key_pos) {
-                    break;
-                }
-                if (cold_row < 0 || cold_row >= k_cold->ne[1] || key_pos < 0) {
+            int64_t n_keys = 0;
+            while (n_keys < list_len && list[3*n_keys + 1] <= q_position) {
+                ++n_keys;
+            }
+            int64_t n_quest = 0;
+            const int32_t * quest_list = nullptr;
+            if (quest != nullptr) {
+                const int32_t * qs = (const int32_t *) ((const char *) quest->data +
+                    kv_head*quest->nb[1] + q_seq*quest->nb[2]);
+                n_quest = MIN((int64_t) qs[0], (quest->ne[0] - 1)/3);
+                quest_list = qs + 1;
+            }
+            for (int64_t ik = 0; ik < n_keys + n_quest; ++ik) {
+                const int32_t * entry = ik < n_keys ? list + 3*ik : quest_list + 3*(ik - n_keys);
+                const int32_t cold_row = entry[0];
+                const int32_t key_pos = entry[1];
+                const int32_t hot_row = entry[2];
+                if (cold_row < 0 || cold_row >= k_cold->ne[1] || key_pos < 0 || q_position < key_pos) {
                     continue;
                 }
-                const bool hot = static_cast<int64_t>(q_position) - key_pos < recent_window;
-                GGML_ASSERT(!hot || (hot_row >= 0 && hot_row < k_hot->ne[1]));
+                const bool hot = static_cast<int64_t>(q_position) - key_pos < recent_window &&
+                    hot_row >= 0 && hot_row < k_hot->ne[1];
                 const int64_t local_key = hot ? hot_row : cold_row;
                 const ggml_tensor * kt = hot ? k_hot : k_cold;
                 const ggml_tensor * vt = hot ? v_hot : v_cold;
@@ -12444,4 +12455,184 @@ void ggml_compute_forward_lightning_indexer(
             }
         }
     }
+}
+
+// PyramidKV Quest reference (ggml_pyramidkv_quest_update / _select).
+
+void ggml_compute_forward_pyramidkv_quest_update(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    ggml_tensor * bounds    = dst->src[0];
+    ggml_tensor * page_seqs = dst->src[1];
+    ggml_tensor * cell_meta = dst->src[2];
+    const ggml_tensor * k      = dst->src[3];
+    const ggml_tensor * writes = dst->src[4];
+    const ggml_tensor * resets = dst->src[5];
+    const int32_t page_size  = ggml_get_op_params_i32(dst, 0);
+    const bool    write_meta = ggml_get_op_params_i32(dst, 1) != 0;
+    const int64_t D       = k->ne[0];
+    const int64_t n_kv    = k->ne[1];
+    const int64_t n_pages = bounds->ne[2];
+    const int64_t n_cells = cell_meta->ne[1];
+    int32_t * seqs = (int32_t *) page_seqs->data;
+    int32_t * meta = (int32_t *) cell_meta->data;
+
+    const int32_t * r = (const int32_t *) resets->data;
+    const int64_t n_resets = MIN((int64_t) r[0], resets->ne[0] - 1);
+    for (int64_t i = 0; i < n_resets; ++i) {
+        const int32_t page = r[1 + i];
+        if (page < 0 || page >= n_pages) {
+            continue;
+        }
+        for (int64_t h = 0; h < n_kv; ++h) {
+            ggml_fp16_t * row = (ggml_fp16_t *) ((char *) bounds->data + h*bounds->nb[1] + page*bounds->nb[2]);
+            for (int64_t d = 0; d < D; ++d) {
+                row[d]     = GGML_CPU_FP32_TO_FP16(INFINITY);
+                row[D + d] = GGML_CPU_FP32_TO_FP16(-INFINITY);
+            }
+        }
+        if (write_meta) {
+            seqs[page] = 0;
+        }
+    }
+    const int32_t * w = (const int32_t *) writes->data;
+    for (int64_t t = 0; t < k->ne[2]; ++t) {
+        const int32_t cell = w[3*t + 0];
+        if (cell < 0 || cell >= n_cells || cell/page_size >= n_pages) {
+            continue;
+        }
+        const int64_t page = cell/page_size;
+        for (int64_t h = 0; h < n_kv; ++h) {
+            const float * key = (const float *) ((const char *) k->data + h*k->nb[1] + t*k->nb[2]);
+            ggml_fp16_t * row = (ggml_fp16_t *) ((char *) bounds->data + h*bounds->nb[1] + page*bounds->nb[2]);
+            for (int64_t d = 0; d < D; ++d) {
+                if (key[d] < GGML_CPU_FP16_TO_FP32(row[d])) {
+                    row[d] = GGML_CPU_FP32_TO_FP16(key[d]);
+                }
+                if (key[d] > GGML_CPU_FP16_TO_FP32(row[D + d])) {
+                    row[D + d] = GGML_CPU_FP32_TO_FP16(key[d]);
+                }
+            }
+        }
+        if (write_meta) {
+            const int32_t seq = w[3*t + 2];
+            meta[2*cell + 0] = w[3*t + 1];
+            meta[2*cell + 1] = seq;
+            if (seq >= 0 && seq < 32) {
+                seqs[page] = (int32_t) ((uint32_t) seqs[page] | (1u << seq));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_pyramidkv_quest_select(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * q         = dst->src[0];
+    const ggml_tensor * bounds    = dst->src[1];
+    const ggml_tensor * page_seqs = dst->src[2];
+    const ggml_tensor * cell_meta = dst->src[3];
+    const ggml_tensor * q_meta    = dst->src[4];
+    const ggml_tensor * seq_ids   = dst->src[5];
+    const ggml_tensor * base      = dst->src[6];
+    const ggml_tensor * base_len  = dst->src[7];
+    const int32_t n_select  = ggml_get_op_params_i32(dst, 0);
+    const int32_t page_size = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t D       = q->ne[0];
+    const int64_t n_kv    = bounds->ne[1];
+    const int64_t group   = q->ne[1]/n_kv;
+    const int64_t n_pages = bounds->ne[2];
+    const int64_t n_cells = cell_meta->ne[1];
+    const int64_t n_seqs  = dst->ne[2];
+    const int64_t max_len = base->ne[1];
+    const int32_t * seqs  = (const int32_t *) page_seqs->data;
+    const int32_t * meta  = (const int32_t *) cell_meta->data;
+    const int32_t * qm    = (const int32_t *) q_meta->data;
+    const int32_t * ids   = (const int32_t *) seq_ids->data;
+
+    float * scores = (float *) malloc(n_pages*sizeof(float));
+    uint8_t * in_base = (uint8_t *) malloc(n_cells);
+    int32_t * sel = (int32_t *) malloc(n_select*sizeof(int32_t));
+    GGML_ASSERT(scores && in_base && sel);
+
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        const int32_t sid = ids[s];
+        for (int64_t h = 0; h < n_kv; ++h) {
+            for (int64_t p = 0; p < n_pages; ++p) {
+                scores[p] = -INFINITY;
+                if (sid < 0 || sid >= 32 || ((((uint32_t) seqs[p]) >> sid) & 1u) == 0) {
+                    continue;
+                }
+                const ggml_fp16_t * lo = (const ggml_fp16_t *) ((const char *) bounds->data + h*bounds->nb[1] + p*bounds->nb[2]);
+                for (int64_t t = 0; t < q->ne[2]; ++t) {
+                    if (qm[2*t + 1] != s) {
+                        continue;
+                    }
+                    for (int64_t g = 0; g < group; ++g) {
+                        const float * qr = (const float *) ((const char *) q->data + t*q->nb[2] + (h*group + g)*q->nb[1]);
+                        float sum = 0.0f;
+                        for (int64_t d = 0; d < D; ++d) {
+                            sum += qr[d] >= 0.0f ? qr[d]*GGML_CPU_FP16_TO_FP32(lo[D + d]) : qr[d]*GGML_CPU_FP16_TO_FP32(lo[d]);
+                        }
+                        scores[p] = fmaxf(scores[p], sum);
+                    }
+                }
+            }
+            int n_sel = 0;
+            for (int k = 0; k < n_select; ++k) {
+                int64_t best = -1;
+                for (int64_t p = 0; p < n_pages; ++p) {
+                    if (scores[p] > -INFINITY && (best < 0 || scores[p] > scores[best])) {
+                        best = p;
+                    }
+                }
+                if (best < 0) {
+                    break;
+                }
+                sel[n_sel++] = (int32_t) best;
+                scores[best] = -INFINITY;
+            }
+            for (int i = 1; i < n_sel; ++i) {
+                const int32_t v = sel[i];
+                int j = i - 1;
+                while (j >= 0 && sel[j] > v) {
+                    sel[j + 1] = sel[j];
+                    --j;
+                }
+                sel[j + 1] = v;
+            }
+            memset(in_base, 0, n_cells);
+            const int64_t len = MIN((int64_t) ((const int32_t *) base_len->data)[h + n_kv*s], max_len);
+            const int32_t * bl = (const int32_t *) base->data + 3*max_len*(h + n_kv*s);
+            for (int64_t i = 0; i < len; ++i) {
+                if (bl[3*i] >= 0 && bl[3*i] < n_cells) {
+                    in_base[bl[3*i]] = 1;
+                }
+            }
+            int32_t * o = (int32_t *) ((char *) dst->data + h*dst->nb[1] + s*dst->nb[2]);
+            int32_t count = 0;
+            for (int i = 0; i < n_sel; ++i) {
+                for (int64_t c = (int64_t) sel[i]*page_size; c < MIN(((int64_t) sel[i] + 1)*page_size, n_cells); ++c) {
+                    if (meta[2*c + 1] != sid || meta[2*c] < 0 || in_base[c]) {
+                        continue;
+                    }
+                    o[1 + 3*count + 0] = (int32_t) c;
+                    o[1 + 3*count + 1] = meta[2*c];
+                    o[1 + 3*count + 2] = -1;
+                    ++count;
+                }
+            }
+            o[0] = count;
+        }
+    }
+    free(scores);
+    free(in_base);
+    free(sel);
 }

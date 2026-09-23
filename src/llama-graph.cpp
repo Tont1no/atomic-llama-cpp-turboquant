@@ -3542,6 +3542,10 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_backend_sched_set_tensor_backend(sched, k_cur, kv_backend);
     }
 
+    // Quest scores pages in the unrotated basis (the TQ4 rotation makes the
+    // channels uniform, and per-channel bounds would no longer separate).
+    ggml_tensor * quest_q = q_cur;
+    ggml_tensor * quest_k = k_cur;
     if (turbo4_k && cparams.pyramidkv_c1.enabled) {
         const int64_t q_head = llama_graph_turbo4_padded_head(q_cur->ne[0]);
         const int64_t k_head = llama_graph_turbo4_padded_head(k_cur->ne[0]);
@@ -3587,6 +3591,12 @@ ggml_tensor * llm_graph_context::build_attn(
     if (use_pyramidkv_c1) {
         ggml_build_forward_expand(gf, mctx_cur->cpy_k_hot(ctx0, k_hot_cur, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v_hot(ctx0, v_hot_cur, il));
+    }
+    const bool use_pyramidkv_quest = use_pyramidkv_c1 && mctx_cur->pyramidkv_quest();
+    if (use_pyramidkv_quest) {
+        ggml_tensor * update = mctx_cur->quest_update(ctx0, quest_k, il);
+        ggml_backend_sched_set_tensor_backend(sched, update, llama_graph_pyramidkv_backend(sched, update->src[0]));
+        ggml_build_forward_expand(gf, update);
     }
 
     if (use_pyramidkv_hybrid || use_pyramidkv_paged) {
@@ -3655,6 +3665,11 @@ ggml_tensor * llm_graph_context::build_attn(
             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
             static_cast<int32_t>(cparams.pyramidkv_c1.recent_window));
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        if (use_pyramidkv_quest) {
+            ggml_tensor * quest = mctx_cur->quest_select(ctx0, quest_q, il);
+            ggml_backend_sched_set_tensor_backend(sched, quest, llama_graph_pyramidkv_backend(sched, quest->src[1]));
+            ggml_flash_attn_ext_hybrid_paged_set_quest(cur, quest);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else if (use_pyramidkv_hybrid) {

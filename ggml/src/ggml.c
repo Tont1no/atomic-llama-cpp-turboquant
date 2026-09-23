@@ -1163,6 +1163,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "PYRAMIDKV_QUEST_UPDATE",
+    "PYRAMIDKV_QUEST_SELECT",
 
     "UNARY",
 
@@ -1180,7 +1182,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1278,6 +1280,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "pyramidkv_quest_update(bounds, k)",
+    "pyramidkv_quest_select(q, bounds)",
 
     "unary(x)",
 
@@ -1295,7 +1299,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5718,6 +5722,95 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
 int32_t ggml_flash_attn_ext_hybrid_mode(const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     return ggml_get_op_params_i32(a, 4);
+}
+
+void ggml_flash_attn_ext_hybrid_paged_set_quest(
+        struct ggml_tensor * a,
+        struct ggml_tensor * quest) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, 4) == 1);
+    GGML_ASSERT(quest && quest->type == GGML_TYPE_I32 && ggml_is_contiguous(quest));
+    const struct ggml_tensor * k_list = a->src[8];
+    GGML_ASSERT(quest->ne[0] >= 1 && (quest->ne[0] - 1) % 3 == 0);
+    GGML_ASSERT(quest->ne[1] == k_list->ne[2] && quest->ne[2] == k_list->ne[3]);
+    // src[3] (the mask) is unused by the paged mode
+    a->src[3] = quest;
+}
+
+struct ggml_tensor * ggml_pyramidkv_quest_update(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * bounds,
+        struct ggml_tensor  * page_seqs,
+        struct ggml_tensor  * cell_meta,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * writes,
+        struct ggml_tensor  * resets,
+        int32_t               page_size,
+        bool                  write_meta) {
+    GGML_ASSERT(bounds->type == GGML_TYPE_F16 && ggml_is_contiguous(bounds));
+    GGML_ASSERT(page_seqs->type == GGML_TYPE_I32 && ggml_is_contiguous(page_seqs));
+    GGML_ASSERT(cell_meta->type == GGML_TYPE_I32 && ggml_is_contiguous(cell_meta) && cell_meta->ne[0] == 2);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 && k->nb[0] == sizeof(float));
+    GGML_ASSERT(writes->type == GGML_TYPE_I32 && ggml_is_contiguous(writes));
+    GGML_ASSERT(resets->type == GGML_TYPE_I32 && ggml_is_contiguous(resets) && resets->ne[0] >= 1);
+    GGML_ASSERT(bounds->ne[0] == 2*k->ne[0] && bounds->ne[1] == k->ne[1]);
+    GGML_ASSERT(page_seqs->ne[0] == bounds->ne[2]);
+    GGML_ASSERT(page_size > 0 && bounds->ne[2]*page_size >= cell_meta->ne[1]);
+    GGML_ASSERT(writes->ne[0] == 3 && writes->ne[1] == k->ne[2] && k->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, bounds);
+    ggml_set_op_params_i32(result, 0, page_size);
+    ggml_set_op_params_i32(result, 1, write_meta ? 1 : 0);
+    result->op     = GGML_OP_PYRAMIDKV_QUEST_UPDATE;
+    result->src[0] = bounds;
+    result->src[1] = page_seqs;
+    result->src[2] = cell_meta;
+    result->src[3] = k;
+    result->src[4] = writes;
+    result->src[5] = resets;
+    return result;
+}
+
+struct ggml_tensor * ggml_pyramidkv_quest_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * bounds,
+        struct ggml_tensor  * page_seqs,
+        struct ggml_tensor  * cell_meta,
+        struct ggml_tensor  * q_meta,
+        struct ggml_tensor  * seq_ids,
+        struct ggml_tensor  * base,
+        struct ggml_tensor  * base_len,
+        int32_t               n_select,
+        int32_t               page_size) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && q->ne[3] == 1);
+    GGML_ASSERT(q->ne[0] == 128 || q->ne[0] == 256);
+    GGML_ASSERT(bounds->type == GGML_TYPE_F16 && ggml_is_contiguous(bounds) && bounds->ne[0] == 2*q->ne[0]);
+    GGML_ASSERT(q->ne[1] % bounds->ne[1] == 0);
+    GGML_ASSERT(page_seqs->type == GGML_TYPE_I32 && page_seqs->ne[0] == bounds->ne[2]);
+    GGML_ASSERT(cell_meta->type == GGML_TYPE_I32 && cell_meta->ne[0] == 2);
+    GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && ggml_is_contiguous(q_meta) &&
+        q_meta->ne[0] == 2 && q_meta->ne[1] == q->ne[2]);
+    GGML_ASSERT(base->type == GGML_TYPE_I32 && ggml_is_contiguous(base) && base->ne[0] == 3 &&
+        base->ne[2] == bounds->ne[1]);
+    GGML_ASSERT(base_len->type == GGML_TYPE_I32 && ggml_is_contiguous(base_len) &&
+        base_len->ne[0] == bounds->ne[1] && base_len->ne[1] == base->ne[3]);
+    GGML_ASSERT(seq_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(seq_ids) && seq_ids->ne[0] >= base->ne[3]);
+    GGML_ASSERT(n_select > 0 && n_select <= 256 && page_size > 0 && page_size <= 4096);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32,
+        1 + 3*(int64_t) n_select*page_size, bounds->ne[1], base->ne[3]);
+    ggml_set_op_params_i32(result, 0, n_select);
+    ggml_set_op_params_i32(result, 1, page_size);
+    result->op     = GGML_OP_PYRAMIDKV_QUEST_SELECT;
+    result->src[0] = q;
+    result->src[1] = bounds;
+    result->src[2] = page_seqs;
+    result->src[3] = cell_meta;
+    result->src[4] = q_meta;
+    result->src[5] = seq_ids;
+    result->src[6] = base;
+    result->src[7] = base_len;
+    return result;
 }
 
 void ggml_flash_attn_ext_set_prec(

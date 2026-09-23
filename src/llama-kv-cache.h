@@ -229,6 +229,8 @@ public:
     // (row lists), and decode of a selected sequence runs the paged hybrid
     // operator over its lists. No layout replacement ever happens.
     bool pyramidkv_c1_paged() const { return pyramidkv_c1_hot_enabled && pyramidkv_c1_config.paged; }
+    // Quest: per-step page choice on top of the paged lists (keeps every cell).
+    bool pyramidkv_c1_quest() const { return pyramidkv_c1_paged() && pyramidkv_c1_config.quest_pages > 0; }
     bool pyramidkv_c1_local_prefill() const;
     bool pyramidkv_c1_paged_seq_compacted(llama_seq_id seq_id) const;
     // Every sequence of the ubatch is selected: the ubatch runs the paged path.
@@ -543,6 +545,23 @@ private:
         ggml_tensor * k_list         = nullptr;
         ggml_tensor * k_list_len     = nullptr;
         ggml_tensor * q_meta         = nullptr;
+        // Quest (see ggml_pyramidkv_quest_update/_select): page bounds
+        // F16 [2*D, heads, n_pages, n_layers], page_seqs I32 [n_pages],
+        // cell_meta I32 [2, n_cells], per-ubatch writes I32 [3, n_ubatch],
+        // resets I32 [1 + n_ubatch], slot sequence ids I32 [n_seq_max].
+        ggml_context_ptr quest_ctx;
+        ggml_backend_buffer_ptr quest_buf;
+        ggml_tensor * quest_bounds    = nullptr;
+        ggml_tensor * quest_page_seqs = nullptr;
+        ggml_tensor * quest_cell_meta = nullptr;
+        ggml_tensor * quest_writes    = nullptr;
+        ggml_tensor * quest_resets    = nullptr;
+        ggml_tensor * quest_seq_ids   = nullptr;
+        std::vector<int32_t> stage_quest_writes;
+        std::vector<int32_t> stage_quest_resets;
+        std::vector<int32_t> stage_quest_seq_ids;
+        std::vector<int32_t> stage_quest_cell_meta;
+        std::vector<int32_t> stage_quest_page_seqs;
         uint32_t pos_stride = 0;
         uint32_t hot_stride = 0;
         uint32_t n_ubatch   = 0;
@@ -572,6 +591,11 @@ private:
     };
     pyramidkv_c1_aux_tensors pyramidkv_c1_aux;
     bool pyramidkv_c1_aux_rebuild(std::string & error);
+    // Quest: pages first written since they were empty (reset before the
+    // bounds widen), and whether cells changed other than by appends (the
+    // device cell table is then rebuilt from the host cells).
+    std::vector<int32_t> quest_pending_resets;
+    bool quest_meta_dirty = true;
 public:
     void pyramidkv_c1_bind_aux_backend(ggml_backend_t backend);
 private:
@@ -694,6 +718,11 @@ public:
     ggml_tensor * get_k_list_len(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_q_meta(ggml_context * ctx, int32_t il, size_t n) const;
     bool pyramidkv_c1_compacted() const { return kv->pyramidkv_c1_is_compacted(); }
+    // Quest: widen the page bounds with this ubatch's unrotated keys, and the
+    // per-step page list for the paged operator (unrotated queries).
+    bool pyramidkv_quest() const { return kv->pyramidkv_c1_quest(); }
+    ggml_tensor * quest_update(ggml_context * ctx, ggml_tensor * k_cur, int32_t il) const;
+    ggml_tensor * quest_select(ggml_context * ctx, ggml_tensor * q_cur, int32_t il) const;
 
     ggml_tensor * get_kq_mask(ggml_context * ctx, ggml_tensor * base_mask, int32_t il) const;
 

@@ -126,6 +126,23 @@ bool llama_pyramidkv_c1_make_config(
         return false;
     }
     output.paged = params.paged;
+    if (params.quest_pages > 0) {
+        const uint32_t page = params.quest_page_size;
+        if (!params.paged) {
+            error = "pyramidkv_c1.quest_pages requires the paged mode";
+            return false;
+        }
+        if (params.quest_pages > 256 || page < 8 || page > 1024 || (page & (page - 1)) != 0) {
+            error = "pyramidkv_c1.quest_pages must be 1..256 and quest_page_size a power of two in 8..1024";
+            return false;
+        }
+        if (n_seq_max > 32) {
+            error = "pyramidkv_c1.quest_pages supports at most 32 sequences";
+            return false;
+        }
+        output.quest_pages = params.quest_pages;
+        output.quest_page_size = page;
+    }
     const std::size_t protected_per_seq = output.recent_window +
         (output.paged ? output.rollback_headroom : 0);
     bool capacity_ok = true;
