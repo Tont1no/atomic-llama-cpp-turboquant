@@ -5724,6 +5724,16 @@ int32_t ggml_flash_attn_ext_hybrid_mode(const struct ggml_tensor * a) {
     return ggml_get_op_params_i32(a, 4);
 }
 
+void ggml_flash_attn_ext_hybrid_paged_set_ext(
+        struct ggml_tensor * a,
+        struct ggml_tensor * ext) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(a, 4) == 1);
+    GGML_ASSERT(ext && ext->type == GGML_TYPE_I32 && ggml_is_contiguous(ext));
+    GGML_ASSERT(ext->ne[0] > a->src[0]->ne[1] && ext->ne[1] == 1);
+    // src[4] (sinks) is unused by the paged mode
+    a->src[4] = ext;
+}
+
 void ggml_flash_attn_ext_hybrid_paged_set_quest(
         struct ggml_tensor * a,
         struct ggml_tensor * quest) {

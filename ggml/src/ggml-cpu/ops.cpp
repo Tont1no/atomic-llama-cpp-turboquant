@@ -8973,6 +8973,9 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
     const int32_t * lists = (const int32_t *) k_list->data;
     const int32_t * lens = (const int32_t *) k_list_len->data;
     const ggml_tensor * quest = dst->src[3];
+    const ggml_tensor * ext = dst->src[4];
+    const int32_t * ext_data = ext ? (const int32_t *) ext->data : nullptr;
+    const int64_t ext_cells = ext ? ext->ne[0] - q->ne[1] : 0;
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iq2 = ir / q->ne[1];
@@ -8987,6 +8990,7 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
 
         const int32_t q_position = meta[2*iq1 + 0];
         const int32_t q_seq      = meta[2*iq1 + 1];
+        const int32_t q_ext      = ext_data ? ext_data[ext_cells + iq1] : -1;
 
         float M = -INFINITY;
         float S = 0.0f;
@@ -9012,6 +9016,9 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
                 const int32_t key_pos = entry[1];
                 const int32_t hot_row = entry[2];
                 if (cold_row < 0 || cold_row >= k_cold->ne[1] || key_pos < 0 || q_position < key_pos) {
+                    continue;
+                }
+                if (q_ext >= 0 && key_pos == q_position && cold_row < ext_cells && ext_data[cold_row] > q_ext) {
                     continue;
                 }
                 const bool hot = static_cast<int64_t>(q_position) - key_pos < recent_window &&

@@ -545,6 +545,10 @@ private:
         ggml_tensor * k_list         = nullptr;
         ggml_tensor * k_list_len     = nullptr;
         ggml_tensor * q_meta         = nullptr;
+        // paged M-RoPE order: I32 [n_cells + n_ubatch], (y, x) code of every
+        // arena cell, then one per query of the ubatch (-1 for text)
+        ggml_tensor * ext            = nullptr;
+        std::vector<int32_t> stage_ext;
         // Quest (see ggml_pyramidkv_quest_update/_select): page bounds
         // F16 [2*D, heads, n_pages, n_layers], page_seqs I32 [n_pages],
         // cell_meta I32 [2, n_cells], per-ubatch writes I32 [3, n_ubatch],
@@ -717,6 +721,7 @@ public:
     ggml_tensor * get_k_list(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_k_list_len(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_q_meta(ggml_context * ctx, int32_t il, size_t n) const;
+    ggml_tensor * get_paged_ext(ggml_context * ctx, size_t n) const;
     bool pyramidkv_c1_compacted() const { return kv->pyramidkv_c1_is_compacted(); }
     // Quest: widen the page bounds with this ubatch's unrotated keys, and the
     // per-step page list for the paged operator (unrotated queries).

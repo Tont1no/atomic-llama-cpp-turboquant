@@ -2513,6 +2513,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * quest);
 
+    // M-RoPE images put many cells on one position; the dense mask orders
+    // them by (y, x) (llama_kv_cell_ext). ext I32 [n_cells + n_q]: the
+    // y*65536 + x code of every arena cell, then one code per query (-1 for
+    // text). A key at the query's own position with a larger code is masked.
+    GGML_API void ggml_flash_attn_ext_hybrid_paged_set_ext(
+            struct ggml_tensor * a,
+            struct ggml_tensor * ext);
+
     // PyramidKV Quest page bounds for a paged C1 arena, per attention layer:
     //   bounds    F16 [2*D, n_kv_heads, n_pages]: per channel the lowest (0..D-1)
     //             and highest (D..2D-1) UNROTATED key of the page's cells

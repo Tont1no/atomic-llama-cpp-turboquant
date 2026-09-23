@@ -505,6 +505,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         const int32_t * k_list_len,  // [NKV_HEADS, NSEQ]
         const int32_t * quest,       // [1 + 3*n, NKV_HEADS, NSEQ] or null
         const int64_t quest_stride,
+        const int32_t * ext,         // [ext_cells + NQ] M-RoPE (y, x) codes or null
+        const int64_t ext_cells,
         float * dst,
         const int64_t D,
         const int64_t NQ,
@@ -551,6 +553,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
 
     const int32_t q_position = q_meta[2*iq1 + 0];
     const int32_t q_seq      = q_meta[2*iq1 + 1];
+    const int32_t q_ext      = ext != nullptr ? ext[ext_cells + iq1] : -1;
 
     float output[8] = {};
     float M = -INFINITY;
@@ -589,6 +592,10 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
             const int32_t key_position = entry[1];
             const int32_t hot_row = entry[2];
             if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
+                continue;
+            }
+            // image cells on the query's own position: (y, x) order as the dense mask
+            if (q_ext >= 0 && key_position == q_position && cold_row < ext_cells && ext[cold_row] > q_ext) {
                 continue;
             }
             // Recent keys read their F16 hot row. The ring protects the newest
@@ -663,6 +670,8 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
         const int32_t * k_list_len,
         const int32_t * quest,
         const int64_t quest_stride,
+        const int32_t * ext,
+        const int64_t ext_cells,
         float * dst,
         const int64_t D,
         const int64_t NQ,
@@ -707,6 +716,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
     const int64_t head0 = kv_head*n_heads;
     const int32_t q_position = q_meta[2*iq1 + 0];
     const int32_t q_seq = q_meta[2*iq1 + 1];
+    const int32_t q_ext = ext != nullptr ? ext[ext_cells + iq1] : -1;
 
     float output[n_heads][n_values] = {};
     float M[n_heads];
@@ -745,6 +755,10 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
             const int32_t key_position = entry[1];
             const int32_t hot_row = entry[2];
             if (cold_row < 0 || cold_row >= n_cold_rows || key_position < 0 || q_position < key_position) {
+                continue;
+            }
+            // image cells on the query's own position: (y, x) order as the dense mask
+            if (q_ext >= 0 && key_position == q_position && cold_row < ext_cells && ext[cold_row] > q_ext) {
                 continue;
             }
             // Recent keys read their F16 hot row. The ring protects the newest
@@ -842,6 +856,10 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
         quest->ne[1] == k_cold->ne[2] && quest->ne[2] == k_list->ne[3]));
     const int32_t * quest_data = quest ? (const int32_t *) quest->data : nullptr;
     const int64_t quest_stride = quest ? quest->ne[0] : 0;
+    const ggml_tensor * ext = dst->src[4];
+    GGML_ASSERT(ext == nullptr || (ext->type == GGML_TYPE_I32 && ext->ne[0] > q->ne[1]));
+    const int32_t * ext_data = ext ? (const int32_t *) ext->data : nullptr;
+    const int64_t ext_cells = ext ? ext->ne[0] - q->ne[1] : 0;
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->ne[0] == k_cold->ne[0] && (q->ne[0] == 128 || q->ne[0] == 256));
     GGML_ASSERT(q->ne[3] == 1);
@@ -893,7 +911,7 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
                 (const char *) k_cold->data, (const char *) v_cold->data,
                 (const char *) k_hot->data, (const char *) v_hot->data,
                 (const int32_t *) q_meta->data, (const int32_t *) k_list->data, (const int32_t *) k_list_len->data,
-                quest_data, quest_stride,
+                quest_data, quest_stride, ext_data, ext_cells,
                 (float *) dst->data,
                 q->ne[0], q->ne[1], q->ne[2], k_cold->ne[2], k_list->ne[3], max_len,
                 k_cold->ne[1], k_hot->ne[1],
@@ -910,7 +928,7 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
             (const char *) k_cold->data, (const char *) v_cold->data,
             (const char *) k_hot->data, (const char *) v_hot->data,
             (const int32_t *) q_meta->data, (const int32_t *) k_list->data, (const int32_t *) k_list_len->data,
-            quest_data, quest_stride,
+            quest_data, quest_stride, ext_data, ext_cells,
             (float *) dst->data,
             q->ne[0], q->ne[1], q->ne[2], k_cold->ne[2], k_list->ne[3], max_len,
             k_cold->ne[1], k_hot->ne[1],

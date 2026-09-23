@@ -8358,11 +8358,13 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
     const int32_t recent_window;
     const ggml_type type_kv;
     const int64_t quest_n;
+    const bool use_ext;
 
     std::string vars() override {
         return VARS_TO_STR9(d, nh, nkv, nq, n_arena, n_hot, nseq, list_len, logit_softcap) +
             ",recent_window=" + std::to_string(recent_window) + "," + VARS_TO_STR1(type_kv) +
-            (quest_n > 0 ? ",quest_n=" + std::to_string(quest_n) : "");
+            (quest_n > 0 ? ",quest_n=" + std::to_string(quest_n) : "") +
+            (use_ext ? ",ext=1" : "");
     }
 
     double max_nmse_err() override {
@@ -8387,10 +8389,11 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
             bool perf_only = false,
             int32_t recent_window = 4,
             ggml_type type_kv = GGML_TYPE_TURBO4_0,
-            int64_t quest_n = 0)
+            int64_t quest_n = 0,
+            bool use_ext = false)
         : d(d), nh(nh), nkv(nkv), nq(nq), n_arena(n_arena), n_hot(n_hot), nseq(nseq),
           list_len(list_len), logit_softcap(logit_softcap), perf_only(perf_only), recent_window(recent_window), type_kv(type_kv),
-          quest_n(quest_n) {}
+          quest_n(quest_n), use_ext(use_ext) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nq, nh, 1);
@@ -8418,6 +8421,11 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
             ggml_tensor * quest = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1 + 3*quest_n, nkv, nseq);
             ggml_set_name(quest, "pg_quest");
             ggml_flash_attn_ext_hybrid_paged_set_quest(out, quest);
+        }
+        if (use_ext) {
+            ggml_tensor * ext = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_arena + nq);
+            ggml_set_name(ext, "pg_ext");
+            ggml_flash_attn_ext_hybrid_paged_set_ext(out, ext);
         }
         if (perf_only) {
             return out;
@@ -8468,6 +8476,7 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
         ggml_tensor * k_list_len = find_tensor("pg_k_list_len");
         ggml_tensor * ref = find_tensor("pg_ref");
         ggml_tensor * quest = find_tensor("pg_quest");
+        ggml_tensor * ext_t = find_tensor("pg_ext");
         GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len && ref);
         auto get_bytes = [](const ggml_tensor * t) {
             std::vector<uint8_t> bytes(ggml_nbytes(t));
@@ -8485,11 +8494,17 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
         if (quest != nullptr) {
             questb = get_bytes(quest);
         }
+        std::vector<uint8_t> extb;
+        if (ext_t != nullptr) {
+            extb = get_bytes(ext_t);
+        }
+        const int32_t * ext = ext_t ? (const int32_t *) extb.data() : nullptr;
         std::vector<float> out(ggml_nelements(ref), 0.0f);
         std::vector<float> kf(d), vf(d);
         const float scale = 1.0f/sqrtf((float) d);
         for (int64_t token = 0; token < nq; ++token) {
             const int32_t q_pos = meta[2*token], q_seq = meta[2*token + 1];
+            const int32_t q_ext = ext ? ext[n_arena + token] : -1;
             for (int64_t head = 0; head < nh; ++head) {
                 const int64_t kv_head = head/(nh/nkv);
                 const float * qrow = (const float *) (qb.data() + token*q->nb[1] + head*q->nb[2]);
@@ -8509,6 +8524,9 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
                         const int32_t * entry = i < n ? list + 3*i : quest_list + 3*(i - n);
                         const int32_t cold_row = entry[0], pos = entry[1];
                         if (cold_row < 0 || cold_row >= n_arena || pos < 0 || q_pos < pos) {
+                            continue;
+                        }
+                        if (q_ext >= 0 && pos == q_pos && ext[cold_row] > q_ext) {
                             continue;
                         }
                         // quest entries carry no hot row and read the arena
@@ -8593,6 +8611,17 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
                         // lists are ragged: the last sequence walks a shorter one
                         values[head + nkv*seq] = (int32_t) (seq == nseq - 1 && !perf_only ? list_len - 3 : list_len);
                     }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pg_ext") == 0) {
+                // arena cells get (y, x) codes; odd queries are image rows,
+                // even ones text (-1)
+                std::vector<int32_t> values(ggml_nelements(t));
+                for (int64_t c = 0; c < n_arena; ++c) {
+                    values[c] = (int32_t) (((c/7) % 5)*65536 + (c % 7));
+                }
+                for (int64_t query = 0; query < nq; ++query) {
+                    values[n_arena + query] = query % 2 == 1 ? (int32_t) ((query % 5)*65536 + 3) : -1;
                 }
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "pg_quest") == 0) {
@@ -11635,6 +11664,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 3, 64, 16, 2, 24, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 10));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 8, 128, 64, 2, 48, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 33));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 4, 8192, 1024, 8, 2100, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 256));
+    // M-RoPE (y, x) order for keys on the query's own position
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 5, 64, 16, 2, 24, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 10, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 8, 128, 64, 2, 48, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 4, 8192, 1024, 8, 2100, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, true));
     test_cases.emplace_back(new test_pyramidkv_quest_update(128, 2, 37, 300, 16, true));
     test_cases.emplace_back(new test_pyramidkv_quest_update(256, 4, 9, 1000, 64, false));
     test_cases.emplace_back(new test_pyramidkv_quest_select(128, 8, 2, 3, 2, 1000, 16, 5, 40));

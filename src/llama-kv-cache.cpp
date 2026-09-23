@@ -778,10 +778,13 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
     ggml_tensor * k_list = nullptr;
     ggml_tensor * k_list_len = nullptr;
     ggml_tensor * q_meta = nullptr;
+    ggml_tensor * ext = nullptr;
     if (paged) {
         k_list     = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, list_stride, n_layers);
         k_list_len = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, len_stride, n_layers);
         q_meta     = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 2*n_ubatch);
+        ext        = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, get_size() + n_ubatch);
+        ggml_format_name(ext, "pyramidkv_c1_aux_ext");
         ggml_format_name(k_list,     "pyramidkv_c1_aux_k_list");
         ggml_format_name(k_list_len, "pyramidkv_c1_aux_k_list_len");
         ggml_format_name(q_meta,     "pyramidkv_c1_aux_q_meta");
@@ -814,6 +817,8 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
         aux.stage_list.assign(list_stride*n_layers, -1);
         aux.stage_len.assign(len_stride*n_layers, 0);
         aux.stage_meta.assign(2*n_ubatch, -1);
+        aux.ext = ext;
+        aux.stage_ext.assign(n_ubatch, -1);
     }
     quest_pending_resets.clear();
     quest_meta_dirty = true;
@@ -5999,6 +6004,34 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
             }
         }
     }
+    // M-RoPE order for the paged operator: this ubatch's query codes, and
+    // the codes of the arena cells an image ubatch writes.
+    bool ext_dirty = false;
+    std::vector<std::pair<uint32_t, uint32_t>> ext_runs;
+    if (kv->pyramidkv_c1_paged() && aux.ext != nullptr) {
+        if (ubatch->n_tokens > aux.stage_ext.size()) {
+            throw std::runtime_error("PyramidKV paged M-RoPE codes exceed the staged capacity");
+        }
+        const bool two_d = image_rows && ubatch->n_pos >= 3;
+        for (uint32_t token = 0; token < ubatch->n_tokens; ++token) {
+            aux.stage_ext[token] = two_d
+                ? static_cast<int32_t>(ubatch->pos[token + ubatch->n_tokens]*65536 + ubatch->pos[token + 2*ubatch->n_tokens])
+                : -1;
+        }
+        if (two_d) {
+            // contiguous runs of destination cells, uploaded from stage_ext
+            for (uint32_t token = 0; token < ubatch->n_tokens; ) {
+                uint32_t end = token + 1;
+                while (end < ubatch->n_tokens && sinfo.idxs[0][end] == sinfo.idxs[0][end - 1] + 1) {
+                    ++end;
+                }
+                ext_runs.emplace_back(token, end);
+                token = end;
+            }
+        }
+        ext_dirty = true;
+    }
+
     // Quest: the ubatch's (cell, position, sequence) writes, the pages to
     // reset first, the slot -> sequence map; the whole cell table after any
     // change other than an append.
@@ -6093,6 +6126,25 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     if (aux_meta_dirty) {
         upload(aux.q_meta, aux.stage_meta.data(), 2ull*ubatch->n_tokens*sizeof(int32_t));
     }
+    if (ext_dirty) {
+        const size_t cells = static_cast<size_t>(aux.ext->ne[0]) - aux.stage_ext.size();
+        for (const auto & run : ext_runs) {
+            const size_t offset = static_cast<size_t>(sinfo.idxs[0][run.first])*sizeof(int32_t);
+            const size_t bytes = static_cast<size_t>(run.second - run.first)*sizeof(int32_t);
+            if (aux.backend != nullptr) {
+                ggml_backend_tensor_set_async(aux.backend, aux.ext, aux.stage_ext.data() + run.first, offset, bytes);
+            } else {
+                ggml_backend_tensor_set(aux.ext, aux.stage_ext.data() + run.first, offset, bytes);
+            }
+        }
+        const size_t q_offset = cells*sizeof(int32_t);
+        const size_t q_bytes = static_cast<size_t>(ubatch->n_tokens)*sizeof(int32_t);
+        if (aux.backend != nullptr) {
+            ggml_backend_tensor_set_async(aux.backend, aux.ext, aux.stage_ext.data(), q_offset, q_bytes);
+        } else {
+            ggml_backend_tensor_set(aux.ext, aux.stage_ext.data(), q_offset, q_bytes);
+        }
+    }
     if (quest_dirty) {
         upload(aux.quest_writes, aux.stage_quest_writes.data(), 3ull*ubatch->n_tokens*sizeof(int32_t));
         upload(aux.quest_resets, aux.stage_quest_resets.data(), (1 + quest_resets)*sizeof(int32_t));
@@ -6103,7 +6155,7 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
         }
     }
     if (aux.backend != nullptr &&
-            (aux_pos_dirty || aux_hot_dirty || aux_q_dirty || aux_list_dirty || aux_meta_dirty || quest_dirty)) {
+            (aux_pos_dirty || aux_hot_dirty || aux_q_dirty || aux_list_dirty || aux_meta_dirty || quest_dirty || ext_dirty)) {
         if (aux.upload_done) {
             ggml_backend_event_record(aux.upload_done.get(), aux.backend);
             aux.upload_pending = true;
@@ -6401,6 +6453,16 @@ ggml_tensor * llama_kv_cache_context::get_k_list_len(ggml_context * ctx, int32_t
             state.kv_heads*sizeof(int32_t), slot*aux.k_list_len->nb[1]);
     }
     return input.k_list_len;
+}
+
+ggml_tensor * llama_kv_cache_context::get_paged_ext(ggml_context * ctx, size_t n) const {
+    const auto & aux = kv->pyramidkv_c1_aux;
+    if (aux.ext == nullptr || n > aux.stage_ext.size()) {
+        throw std::runtime_error("PyramidKV paged M-RoPE code tensor is not allocated for this ubatch");
+    }
+    // cells, then this ubatch's n queries
+    const size_t cells = static_cast<size_t>(aux.ext->ne[0]) - aux.stage_ext.size();
+    return ggml_view_1d(ctx, aux.ext, static_cast<int64_t>(cells + n), 0);
 }
 
 ggml_tensor * llama_kv_cache_context::get_q_meta(ggml_context * ctx, int32_t il, size_t n) const {
