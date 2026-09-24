@@ -5748,6 +5748,12 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
             query_max[seq] = std::max(query_max[seq], static_cast<int64_t>(ubatch->pos[token]));
         }
     }
+    // LLAMA_PYRAMIDKV_INPUT_TIMING=1: log the host time of this staging
+    static const bool input_timing = [] {
+        const char * value = std::getenv("LLAMA_PYRAMIDKV_INPUT_TIMING");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    const int64_t input_timing_start = input_timing ? ggml_time_us() : 0;
     for (auto & input : pyramidkv_inputs) {
         const auto map_it = kv->map_layer_ids.find(input.il);
         if (map_it == kv->map_layer_ids.end() ||
@@ -6168,6 +6174,22 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     ++phase.input_map_calls;
     phase.input_map_us += static_cast<uint64_t>(ggml_time_us() - phase_start_us);
 #endif
+    if (input_timing) {
+        static int64_t total_us = 0, paged_us = 0;
+        static uint64_t calls = 0, paged_calls = 0;
+        const int64_t us = ggml_time_us() - input_timing_start;
+        total_us += us;
+        ++calls;
+        if (aux_list_dirty) {
+            paged_us += us;
+            ++paged_calls;
+        }
+        if (calls % 256 == 0) {
+            LLAMA_LOG_INFO("%s: PyramidKV input staging: %llu calls, %.2f ms avg; paged %llu calls, %.2f ms avg\n",
+                __func__, (unsigned long long) calls, total_us/1000.0/calls,
+                (unsigned long long) paged_calls, paged_calls ? paged_us/1000.0/paged_calls : 0.0);
+        }
+    }
 }
 
 
