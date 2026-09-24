@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -49,6 +50,8 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_ncells[s] = 0;
+            seq_recent_n[s] = 0;
         }
     }
 
@@ -340,6 +343,40 @@ public:
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, pos[i]);
+
+        seq_recent[seq_id][seq_recent_n[seq_id]++ % SEQ_RECENT] = i;
+    }
+
+    // number of cells holding seq_id
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        return seq_ncells[seq_id];
+    }
+
+    // the cells of seq_id with a position in [p0, p1), in ascending order, when
+    // the last SEQ_RECENT additions of seq_id contain all of them (a speculative
+    // rollback removes the tail the last ubatch wrote); false otherwise, and the
+    // caller scans every cell. The count from seq_pos makes the answer exact.
+    bool seq_recent_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & out) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        out.clear();
+        uint32_t expected = 0;
+        for (auto it = seq_pos[seq_id].lower_bound(p0); it != seq_pos[seq_id].end() && it->first < p1; ++it) {
+            expected += (uint32_t) it->second;
+            if (expected > SEQ_RECENT) {
+                return false;
+            }
+        }
+        const uint64_t n = std::min<uint64_t>(seq_recent_n[seq_id], SEQ_RECENT);
+        for (uint64_t k = 0; k < n; ++k) {
+            const uint32_t i = seq_recent[seq_id][k];
+            if (i < pos.size() && pos[i] >= p0 && pos[i] < p1 && seq[i].test(seq_id)) {
+                out.push_back(i);
+            }
+        }
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out.size() == expected;
     }
 
     // return the sequence id of this cell
@@ -525,6 +562,14 @@ private:
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
 
+    // cells per sequence (the sum of seq_pos[s]) and a ring of the cells most
+    // recently added to each sequence - both make a speculative rollback and a
+    // cell count independent of the cache size
+    static constexpr uint32_t SEQ_RECENT = 64;
+    uint32_t seq_ncells[LLAMA_MAX_SEQ] = {};
+    uint64_t seq_recent_n[LLAMA_MAX_SEQ] = {};
+    uint32_t seq_recent[LLAMA_MAX_SEQ][SEQ_RECENT];
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
@@ -534,10 +579,12 @@ private:
         if (--it->second == 0) {
             seq_pos[s].erase(it);
         }
+        --seq_ncells[s];
     }
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
         seq_pos[s][p]++;
+        ++seq_ncells[s];
     }
 
     // remove cell i

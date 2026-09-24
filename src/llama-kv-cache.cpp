@@ -1656,16 +1656,26 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
+        const auto remove = [&](uint32_t i) {
             if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
                 quest_note_removed(i);
+            }
+        };
+        // a rollback removes the few cells the last ubatch wrote: find them
+        // without scanning the whole cache
+        static thread_local std::vector<uint32_t> recent;
+        if (p0 > 0 && cells.seq_recent_in(seq_id, p0, p1, recent)) {
+            for (const uint32_t i : recent) {
+                remove(i);
+            }
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.pos_in(i, p0, p1)) {
+                    remove(i);
+                }
             }
         }
 
@@ -1995,12 +2005,7 @@ int64_t llama_kv_cache::seq_n_cells(llama_seq_id seq_id) const {
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
         return -1;
     }
-    const auto & cells = v_cells[seq_to_stream[seq_id]];
-    int64_t n = 0;
-    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
-        n += !cells.is_empty(i) && cells.seq_has(i, seq_id);
-    }
-    return n;
+    return v_cells[seq_to_stream[seq_id]].seq_n_cells(seq_id);
 }
 
 int32_t llama_kv_cache::seq_positions(llama_seq_id seq_id, llama_pos * pos, int32_t cap) const {

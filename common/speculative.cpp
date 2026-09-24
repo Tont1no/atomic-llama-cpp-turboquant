@@ -1441,6 +1441,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // sequences whose features take the host path, decoded below
+        std::vector<llama_seq_id> host_seqs;
+        int32_t host_rows = 0;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1480,6 +1483,73 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            host_seqs.push_back(seq_id);
+            host_rows += n_rows;
+        }
+
+        if (host_seqs.empty()) {
+            return true;
+        }
+
+        // Decode steps: every sequence's few verified rows go into one drafter
+        // decode instead of one decode (and one graph launch) per sequence.
+        if (host_seqs.size() > 1 && host_rows <= n_ubatch) {
+            for (const llama_seq_id seq_id : host_seqs) {
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                if (!prune_history(seq_id, batch_in.pos + i_batch_beg[seq_id], n_rows)) return false;
+            }
+            {
+                common_time_meas timing(profile.feature_gather_cpu_wall_us, !profile.enabled);
+                int32_t row = 0;
+                for (const llama_seq_id seq_id : host_seqs) {
+                    const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_rows; ++i) {
+                            std::memcpy(batch_inject.embd + (size_t) (row + i) * n_embd_enc + k * (size_t) n_embd_tgt,
+                                    layer + (size_t) (i_batch_beg[seq_id] + i) * n_embd_tgt,
+                                    (size_t) n_embd_tgt * sizeof(float));
+                        }
+                    }
+                    row += n_rows;
+                }
+            }
+            common_time_meas timing(profile.inject_cpu_wall_us, !profile.enabled);
+            batch_inject.n_tokens = host_rows;
+            int32_t row = 0;
+            for (const llama_seq_id seq_id : host_seqs) {
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                for (int32_t i = 0; i < n_rows; ++i, ++row) {
+                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + i];
+                    batch_inject.pos[row] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * host_rows + row] = p;
+                        batch_inject.pos[2 * host_rows + row] = p;
+                        batch_inject.pos[3 * host_rows + row] = 0;
+                    }
+                    batch_inject.n_seq_id[row]  = 1;
+                    batch_inject.seq_id[row][0] = seq_id;
+                    batch_inject.logits[row]    = false;
+                }
+            }
+            if (profile.enabled) {
+                ++profile.process_chunks;
+                profile.process_rows += (uint64_t) host_rows;
+            }
+            const int32_t rc = llama_decode(ctx_dft, batch_inject);
+            if (rc != 0) {
+                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, %zu sequences)\n",
+                        __func__, rc, (int) host_rows, host_seqs.size());
+                return false;
+            }
+            return true;
+        }
+
+        for (const llama_seq_id seq_id : host_seqs) {
+            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
                 if (!prune_history(seq_id, batch_in.pos + i_batch_beg[seq_id] + offset, n_chunk)) return false;
