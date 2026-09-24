@@ -524,6 +524,10 @@ private:
     std::vector<std::vector<std::pair<int32_t, int32_t>>> pyramidkv_c1_protected; // [n_seq_max]
     std::vector<std::vector<std::vector<std::vector<pyramidkv_c1_list_entry>>>>
         pyramidkv_c1_paged_lists;                                               // [layer][head][seq]
+    // First list entry that changed other than by an append since the input
+    // staging last copied the list ([layer][head][seq]; UINT32_MAX = none):
+    // a rollback trim marks its first erased entry, a selection the whole list.
+    std::vector<std::vector<std::vector<uint32_t>>> pyramidkv_c1_paged_dirty;
     bool pyramidkv_c1_reserve_paged = false;
     void pyramidkv_c1_paged_reset();
     void pyramidkv_c1_paged_trim(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
@@ -578,6 +582,11 @@ private:
         std::vector<int32_t> stage_list;
         std::vector<int32_t> stage_len;
         std::vector<int32_t> stage_meta;
+        // Incremental list staging: entries of (layer slot, head, ubatch
+        // sequence slot) that the device copy already holds, and which
+        // sequence each (layer slot, ubatch slot) was staged for.
+        std::vector<uint32_t> staged_valid;
+        std::vector<int32_t> staged_seq;
         // Backend that computes on the KV device. The per-ubatch uploads go
         // through its stream (tensor_set_async) so they are ordered after the
         // previous ubatch's graph, which may still be reading these tensors:

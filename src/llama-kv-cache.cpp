@@ -817,6 +817,8 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
         aux.stage_list.assign(list_stride*n_layers, -1);
         aux.stage_len.assign(len_stride*n_layers, 0);
         aux.stage_meta.assign(2*n_ubatch, -1);
+        aux.staged_valid.assign(static_cast<size_t>(n_layers)*heads_max*n_seq_max, 0);
+        aux.staged_seq.assign(static_cast<size_t>(n_layers)*n_seq_max, -1);
         aux.ext = ext;
         aux.stage_ext.assign(n_ubatch, -1);
     }
@@ -914,10 +916,12 @@ void llama_kv_cache::pyramidkv_c1_paged_reset() {
     pyramidkv_c1_paged_compacted.assign(n_seq_max, 0);
     pyramidkv_c1_protected.assign(n_seq_max, {});
     pyramidkv_c1_paged_lists.assign(pyramidkv_c1_layers.size(), {});
+    pyramidkv_c1_paged_dirty.assign(pyramidkv_c1_layers.size(), {});
     for (size_t layer_index = 0; layer_index < pyramidkv_c1_layers.size(); ++layer_index) {
         const auto & state = pyramidkv_c1_layers[layer_index];
         pyramidkv_c1_paged_lists[layer_index].assign(state.kv_heads,
             std::vector<std::vector<pyramidkv_c1_list_entry>>(n_seq_max));
+        pyramidkv_c1_paged_dirty[layer_index].assign(state.kv_heads, std::vector<uint32_t>(n_seq_max, 0));
     }
 }
 
@@ -977,10 +981,17 @@ void llama_kv_cache::pyramidkv_c1_paged_trim(llama_seq_id seq_id, llama_pos p0, 
     if (seq_id < 0 || static_cast<size_t>(seq_id) >= n_seq_max) {
         return;
     }
-    for (auto & layer : pyramidkv_c1_paged_lists) {
-        for (auto & head : layer) {
-            auto & list = head[seq_id];
-            list.erase(std::remove_if(list.begin(), list.end(),
+    for (size_t layer = 0; layer < pyramidkv_c1_paged_lists.size(); ++layer) {
+        for (size_t head = 0; head < pyramidkv_c1_paged_lists[layer].size(); ++head) {
+            auto & list = pyramidkv_c1_paged_lists[layer][head][seq_id];
+            const auto first = std::find_if(list.begin(), list.end(),
+                [&](const pyramidkv_c1_list_entry & e) { return e.pos >= p0 && e.pos < p1; });
+            if (first == list.end()) {
+                continue;
+            }
+            uint32_t & dirty = pyramidkv_c1_paged_dirty[layer][head][seq_id];
+            dirty = std::min(dirty, static_cast<uint32_t>(first - list.begin()));
+            list.erase(std::remove_if(first, list.end(),
                 [&](const pyramidkv_c1_list_entry & e) { return e.pos >= p0 && e.pos < p1; }), list.end());
         }
     }
@@ -1097,6 +1108,7 @@ bool llama_kv_cache::pyramidkv_c1_paged_apply_selection(
             const auto & selected = selection.heads[head];
             auto & list = pyramidkv_c1_paged_lists[layer_index][head][seq_id];
             list.clear();
+            pyramidkv_c1_paged_dirty[layer_index][head][seq_id] = 0;
             list.reserve(selected.keep_cells.size() + protected_cells.size());
             for (size_t i = 0; i < selected.keep_cells.size(); ++i) {
                 const size_t logical = selected.keep_cells[i];
@@ -5730,6 +5742,8 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     bool aux_list_dirty = false, aux_meta_dirty = false;
     size_t aux_pos_layers = 0, aux_hot_layers = 0, aux_list_layers = 0;
     size_t aux_list_max_len = 0;
+    // lowest list entry restaged by this call (upload starts there)
+    size_t aux_list_min_start = std::numeric_limits<size_t>::max();
     std::vector<int64_t> query_min(kv->n_seq_max, std::numeric_limits<int64_t>::max());
     std::vector<int64_t> query_max(kv->n_seq_max, -1);
     if (kv->pyramidkv_c1_paged()) {
@@ -5924,6 +5938,16 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
             std::fill(len_data, len_data + aux.len_stride, 0);
             for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
                 const llama_seq_id seq = ubatch->seq_id_unq[s];
+                int32_t * staged_seqs = aux.staged_seq.data() + static_cast<size_t>(slot)*kv->n_seq_max;
+                const bool same_seq = staged_seqs[s] == seq;
+                // the dirty marks are consumed here, so no other slot may
+                // keep counting as a copy of this sequence
+                for (uint32_t t = 0; t < kv->n_seq_max; ++t) {
+                    if (staged_seqs[t] == seq) {
+                        staged_seqs[t] = -1;
+                    }
+                }
+                staged_seqs[s] = seq;
                 for (uint32_t head = 0; head < heads; ++head) {
                     const auto & list = lists[head][seq];
                     const auto & hot = state.hot_heads[head];
@@ -5933,7 +5957,25 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
                         throw std::runtime_error("PyramidKV paged list exceeds its reserved capacity");
                     }
                     aux_list_max_len = std::max(aux_list_max_len, n);
-                    for (size_t i = 0; i < n; ++i) {
+                    // Only the entries the device copy lacks are restaged: new
+                    // ones, those after a trim or selection, and the recent
+                    // window, whose hot rows follow the ring (the kernel reads
+                    // a hot row only within recent_window of the query).
+                    uint32_t & staged = aux.staged_valid[(static_cast<size_t>(slot)*aux.heads_max + head)*kv->n_seq_max + s];
+                    uint32_t & dirty = kv->pyramidkv_c1_paged_dirty[slot][head][seq];
+                    size_t start = same_seq ? std::min<size_t>({ staged, dirty, n }) : 0;
+                    if (n > 0 && start > 0) {
+                        const int64_t window = static_cast<int64_t>(list.back().pos) -
+                            static_cast<int64_t>(kv->pyramidkv_c1_config.recent_window) -
+                            static_cast<int64_t>(ubatch->n_tokens) - 1;
+                        const auto recent = std::lower_bound(list.begin(), list.end(), window,
+                            [](const auto & e, int64_t p) { return e.pos < p; });
+                        start = std::min<size_t>(start, static_cast<size_t>(recent - list.begin()));
+                    }
+                    staged = static_cast<uint32_t>(n);
+                    dirty = UINT32_MAX;
+                    aux_list_min_start = std::min(aux_list_min_start, start);
+                    for (size_t i = start; i < n; ++i) {
                         const uint32_t cell = list[i].cell;
                         if (!valid_cell(cell) || !cells.seq_has(cell, seq) || cells.pos_get(cell) != list[i].pos) {
                             throw std::runtime_error("PyramidKV paged list references a stale arena cell");
@@ -6111,16 +6153,20 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
             const size_t row_elems = 3ull*kv->pyramidkv_c1_paged_list_capacity();
             GGML_ASSERT(row_elems > 0 && aux.list_stride % row_elems == 0);
             const size_t pitch = row_elems*sizeof(int32_t);
-            const size_t width = 3ull*aux_list_max_len*sizeof(int32_t);
+            // Columns before the lowest restaged entry are already on the
+            // device (the host staging mirrors every uploaded column).
+            const size_t first = std::min(aux_list_min_start, aux_list_max_len);
+            const size_t width = 3ull*(aux_list_max_len - first)*sizeof(int32_t);
+            const size_t offset = 3ull*first*sizeof(int32_t);
             const size_t rows = aux_list_layers*(aux.list_stride/row_elems);
             // All heads and sequence slots share this pitch, including layer padding.
             // The separately uploaded lengths exclude every uncopied tail.
-            if (aux.backend != nullptr) {
-                ggml_backend_tensor_set_2d_async(aux.backend, aux.k_list, aux.stage_list.data(),
-                    0, width, rows, pitch, pitch);
-            } else {
-                ggml_backend_tensor_set_2d(aux.k_list, aux.stage_list.data(),
-                    0, width, rows, pitch, pitch);
+            if (width > 0 && aux.backend != nullptr) {
+                ggml_backend_tensor_set_2d_async(aux.backend, aux.k_list, aux.stage_list.data() + 3*first,
+                    offset, width, rows, pitch, pitch);
+            } else if (width > 0) {
+                ggml_backend_tensor_set_2d(aux.k_list, aux.stage_list.data() + 3*first,
+                    offset, width, rows, pitch, pitch);
             }
 #if LLAMA_PYRAMIDKV_C1_PHASE_TIMING
             ++phase.list_upload_calls;
