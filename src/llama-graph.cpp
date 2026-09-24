@@ -3665,7 +3665,14 @@ ggml_tensor * llm_graph_context::build_attn(
             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f,
             static_cast<int32_t>(cparams.pyramidkv_c1.recent_window));
         ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-        ggml_flash_attn_ext_hybrid_paged_set_ext(cur, mctx_cur->get_paged_ext(ctx0, ubatch.n_tokens));
+        // LLAMA_PYRAMIDKV_PAGED_EXT=0 restores the position-only order (A/B)
+        static const bool paged_ext = [] {
+            const char * value = std::getenv("LLAMA_PYRAMIDKV_PAGED_EXT");
+            return !(value != nullptr && std::strcmp(value, "0") == 0);
+        }();
+        if (paged_ext) {
+            ggml_flash_attn_ext_hybrid_paged_set_ext(cur, mctx_cur->get_paged_ext(ctx0, ubatch.n_tokens));
+        }
         if (use_pyramidkv_quest) {
             ggml_tensor * quest = mctx_cur->quest_select(ctx0, quest_q, il);
             ggml_backend_sched_set_tensor_backend(sched, quest, llama_graph_pyramidkv_backend(sched, quest->src[1]));
