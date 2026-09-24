@@ -8595,7 +8595,8 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
                     // hidden and some visible. One query names no sequence.
                     const int32_t seq = perf_only ? (int32_t) (query % nseq) :
                         (query == nq - 1 && nq > 2 ? -1 : (int32_t) (query % nseq));
-                    values[2*query + 0] = (int32_t) (list_len/2 + query*3);
+                    // perf: every list entry visible, like a decode step
+                    values[2*query + 0] = perf_only ? (int32_t) (2*list_len + 8 + query) : (int32_t) (list_len/2 + query*3);
                     values[2*query + 1] = seq;
                 }
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(int32_t));
@@ -11692,6 +11693,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 5, 64, 16, 2, 24, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 10, true));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 8, 128, 64, 2, 48, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, true));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 4, 8192, 1024, 8, 2100, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, true));
+    // tiled kernel (GQA 6, D 256): long lists through split-K, quest and image codes
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 16, 8192, 1024, 4, 2100));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 16, 8192, 1024, 4, 2100, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 200, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 3, 4096, 256, 3, 700, 30.0f));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 40, 4096, 512, 2, 900));
     test_cases.emplace_back(new test_pyramidkv_quest_update(128, 2, 37, 300, 16, true));
     test_cases.emplace_back(new test_pyramidkv_quest_update(256, 4, 9, 1000, 64, false));
     test_cases.emplace_back(new test_pyramidkv_quest_update(128, 2, 37, 300, 16, true, GGML_TYPE_I8));
@@ -12158,6 +12164,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 8, 262144, 1024, 8, 2048, 0.0f, true));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 32, 262144, 1024, 8, 2048, 0.0f, true));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 1, 262144, 1024, 1, 2048, 0.0f, true));
+    // Bonsai/Qwen3.8 decode: 4 users x DFlash depth 3 (4 tokens each), cap 2048 lists
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 16, 524288, 3096, 4, 2300, 0.0f, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 4, 524288, 3096, 4, 2300, 0.0f, true));
 
     // TURBO4_0 KV: decode (NQ=1, direct vector kernel) against prefill tiles
     // (NQ=256, MMA-F16 over a transient F16 copy) at the VibeThinker D128/2-KV-head

@@ -560,6 +560,11 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
     float S = 0.0f;
 
     const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + iq2*q_nb2);
+    // same TQ4 lane layout as the GQA-6 kernel: a query computes the same sums
+    // whichever of the two kernels a batch shape selects
+    constexpr bool vec = type == GGML_TYPE_TURBO4_0;
+    const int d0 = 128*(lane >> 4) + 8*(lane & 15);
+    const auto dim = [&](int i) { return vec ? d0 + i : lane + 32*i; };
 
     if (q_seq >= 0 && q_seq < NSEQ) {
         const int64_t list_len = min((int64_t) k_list_len[kv_head + NKV_HEADS*q_seq], max_len);
@@ -613,11 +618,53 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
                 : v_cold + local_key*vc_nb1 + kv_head*vc_nb2;
 
             float dot = 0.0f;
-            for (int64_t d = lane; d < D; d += 32) {
-                const float key = hot
-                    ? __half2float(*(const half *) (k_row + d*sizeof(half)))
-                    : ggml_cuda_hybrid_turbo_value<type>(k_row, (int) d, lane_centroid);
-                dot += q_row[d]*key;
+            float values[8];
+            if (vec && D == 256) {
+                float keys[8];
+                if (hot) {
+                    const uint4 kr = *(const uint4 *) (k_row + d0*sizeof(half));
+                    const uint4 vr = *(const uint4 *) (v_row + d0*sizeof(half));
+                    const half2 * kh = (const half2 *) &kr;
+                    const half2 * vh = (const half2 *) &vr;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 kf = __half22float2(kh[j]);
+                        const float2 vf = __half22float2(vh[j]);
+                        keys[2*j + 0] = kf.x;
+                        keys[2*j + 1] = kf.y;
+                        values[2*j + 0] = vf.x;
+                        values[2*j + 1] = vf.y;
+                    }
+                } else {
+                    const block_turbo4_0 * kb = (const block_turbo4_0 *) k_row + (lane >> 4);
+                    const block_turbo4_0 * vb = (const block_turbo4_0 *) v_row + (lane >> 4);
+                    const float kn = __half2float(kb->norm);
+                    const float vn = __half2float(vb->norm);
+                    const uint32_t kq = *(const uint32_t *) (kb->qs + 4*(lane & 15));
+                    const uint32_t vq = *(const uint32_t *) (vb->qs + 4*(lane & 15));
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        keys[j] = ggml_cuda_turbo4_centroid_shfl((uint8_t) ((kq >> (4*j)) & 0x0fu), lane_centroid)*kn;
+                        values[j] = ggml_cuda_turbo4_centroid_shfl((uint8_t) ((vq >> (4*j)) & 0x0fu), lane_centroid)*vn;
+                    }
+                }
+                const float4 qa = *(const float4 *) (q_row + d0);
+                const float4 qb = *(const float4 *) (q_row + d0 + 4);
+                dot += qa.x*keys[0];
+                dot += qa.y*keys[1];
+                dot += qa.z*keys[2];
+                dot += qa.w*keys[3];
+                dot += qb.x*keys[4];
+                dot += qb.y*keys[5];
+                dot += qb.z*keys[6];
+                dot += qb.w*keys[7];
+            } else {
+                for (int64_t d = lane; d < D; d += 32) {
+                    const float key = hot
+                        ? __half2float(*(const half *) (k_row + d*sizeof(half)))
+                        : ggml_cuda_hybrid_turbo_value<type>(k_row, (int) d, lane_centroid);
+                    dot += q_row[d]*key;
+                }
             }
             dot = ggml_cuda_hybrid_warp_sum(dot);
             float score = dot*scale;
@@ -628,11 +675,18 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
             const float M_new = fmaxf(M, score);
             const float old_scale = S == 0.0f ? 0.0f : expf(M - M_new);
             const float weight = expf(score - M_new);
-            for (int64_t d = lane; d < D; d += 32) {
-                const float value = hot
-                    ? __half2float(*(const half *) (v_row + d*sizeof(half)))
-                    : ggml_cuda_hybrid_turbo_value<type>(v_row, (int) d, lane_centroid);
-                output[d/32] = __fmaf_rn(value, weight, __fmul_rn(output[d/32], old_scale));
+            if (vec && D == 256) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    output[i] = __fmaf_rn(values[i], weight, __fmul_rn(output[i], old_scale));
+                }
+            } else {
+                for (int64_t d = lane; d < D; d += 32) {
+                    const float value = hot
+                        ? __half2float(*(const half *) (v_row + d*sizeof(half)))
+                        : ggml_cuda_hybrid_turbo_value<type>(v_row, (int) d, lane_centroid);
+                    output[d/32] = __fmaf_rn(value, weight, __fmul_rn(output[d/32], old_scale));
+                }
             }
             S = S*old_scale + weight;
             M = M_new;
@@ -642,13 +696,13 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
     if constexpr (!split_k_path) {
         float * dst_row = (float *) ((char *) dst + iq2*dst_nb1 + iq1*dst_nb2);
         const float inv = S == 0.0f ? 0.0f : 1.0f/S;
-        for (int64_t d = lane; d < D; d += 32) {
-            dst_row[d] = output[d/32]*inv;
+        for (int64_t i = 0; i < D/32; ++i) {
+            dst_row[vec && D == 256 ? dim((int) i) : lane + 32*i] = output[i]*inv;
         }
     } else {
         float * partial_row = partial_o + (row*split_k + split)*D;
-        for (int64_t d = lane; d < D; d += 32) {
-            partial_row[d] = output[d/32];
+        for (int64_t i = 0; i < D/32; ++i) {
+            partial_row[vec && D == 256 ? dim((int) i) : lane + 32*i] = output[i];
         }
         if (lane == 0) {
             partial_meta[row*split_k + split] = make_float2(M, S);
@@ -714,6 +768,13 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
     const int64_t kv_head = group/NQ;
     const int64_t iq1 = group - kv_head*NQ;
     const int64_t head0 = kv_head*n_heads;
+    // TQ4: a lane owns 8 consecutive dims of the row, so a key or value costs
+    // one 32-bit load of packed codes and one norm per lane (instead of 8
+    // byte and 8 norm loads); the kernel is bound by these dependent loads.
+    // TQ3.5 keeps the strided layout.
+    constexpr bool vec = type == GGML_TYPE_TURBO4_0;
+    const int d0 = 128*(lane >> 4) + 8*(lane & 15);
+    const auto dim = [&](int i) { return vec ? d0 + i : lane + 32*i; };
     const int32_t q_position = q_meta[2*iq1 + 0];
     const int32_t q_seq = q_meta[2*iq1 + 1];
     const int32_t q_ext = ext != nullptr ? ext[ext_cells + iq1] : -1;
@@ -777,23 +838,67 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
 
             float keys[n_values];
             float values[n_values];
+            if constexpr (vec) {
+                if (hot) {
+                    const uint4 kr = *(const uint4 *) (k_row + d0*sizeof(half));
+                    const uint4 vr = *(const uint4 *) (v_row + d0*sizeof(half));
+                    const half2 * kh = (const half2 *) &kr;
+                    const half2 * vh = (const half2 *) &vr;
 #pragma unroll
-            for (int i = 0; i < n_values; ++i) {
-                const int d = lane + 32*i;
-                keys[i] = hot
-                    ? __half2float(*(const half *) (k_row + d*sizeof(half)))
-                    : ggml_cuda_hybrid_turbo_value<type>(k_row, d, lane_centroid);
-                values[i] = hot
-                    ? __half2float(*(const half *) (v_row + d*sizeof(half)))
-                    : ggml_cuda_hybrid_turbo_value<type>(v_row, d, lane_centroid);
+                    for (int j = 0; j < 4; ++j) {
+                        const float2 kf = __half22float2(kh[j]);
+                        const float2 vf = __half22float2(vh[j]);
+                        keys[2*j + 0] = kf.x;
+                        keys[2*j + 1] = kf.y;
+                        values[2*j + 0] = vf.x;
+                        values[2*j + 1] = vf.y;
+                    }
+                } else {
+                    const block_turbo4_0 * kb = (const block_turbo4_0 *) k_row + (lane >> 4);
+                    const block_turbo4_0 * vb = (const block_turbo4_0 *) v_row + (lane >> 4);
+                    const float kn = __half2float(kb->norm);
+                    const float vn = __half2float(vb->norm);
+                    // element 8m + j sits in byte 4m + j/2, nibble j&1: bits 4j of the word
+                    const uint32_t kq = *(const uint32_t *) (kb->qs + 4*(lane & 15));
+                    const uint32_t vq = *(const uint32_t *) (vb->qs + 4*(lane & 15));
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        keys[j] = ggml_cuda_turbo4_centroid_shfl((uint8_t) ((kq >> (4*j)) & 0x0fu), lane_centroid)*kn;
+                        values[j] = ggml_cuda_turbo4_centroid_shfl((uint8_t) ((vq >> (4*j)) & 0x0fu), lane_centroid)*vn;
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < n_values; ++i) {
+                    const int d = lane + 32*i;
+                    keys[i] = hot
+                        ? __half2float(*(const half *) (k_row + d*sizeof(half)))
+                        : ggml_cuda_hybrid_turbo_value<type>(k_row, d, lane_centroid);
+                    values[i] = hot
+                        ? __half2float(*(const half *) (v_row + d*sizeof(half)))
+                        : ggml_cuda_hybrid_turbo_value<type>(v_row, d, lane_centroid);
+                }
             }
 #pragma unroll
             for (int h = 0; h < n_heads; ++h) {
                 const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + (head0 + h)*q_nb2);
                 float dot = 0.0f;
+                if constexpr (vec) {
+                    const float4 qa = *(const float4 *) (q_row + d0);
+                    const float4 qb = *(const float4 *) (q_row + d0 + 4);
+                    dot += qa.x*keys[0];
+                    dot += qa.y*keys[1];
+                    dot += qa.z*keys[2];
+                    dot += qa.w*keys[3];
+                    dot += qb.x*keys[4];
+                    dot += qb.y*keys[5];
+                    dot += qb.z*keys[6];
+                    dot += qb.w*keys[7];
+                } else {
 #pragma unroll
-                for (int i = 0; i < n_values; ++i) {
-                    dot += q_row[lane + 32*i]*keys[i];
+                    for (int i = 0; i < n_values; ++i) {
+                        dot += q_row[lane + 32*i]*keys[i];
+                    }
                 }
                 dot = ggml_cuda_hybrid_warp_sum(dot);
                 float score = dot*scale;
@@ -822,13 +927,13 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
             const float inv = S[h] == 0.0f ? 0.0f : 1.0f/S[h];
 #pragma unroll
             for (int i = 0; i < n_values; ++i) {
-                dst_row[lane + 32*i] = output[h][i]*inv;
+                dst_row[dim(i)] = output[h][i]*inv;
             }
         } else {
             float * partial_row = partial_o + (row*split_k + split)*D;
 #pragma unroll
             for (int i = 0; i < n_values; ++i) {
-                partial_row[lane + 32*i] = output[h][i];
+                partial_row[dim(i)] = output[h][i];
             }
             if (lane == 0) {
                 partial_meta[row*split_k + split] = make_float2(M[h], S[h]);
