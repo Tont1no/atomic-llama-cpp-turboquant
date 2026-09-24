@@ -983,6 +983,18 @@ size_t llama_kv_cache::pyramidkv_c1_paged_list_size(llama_seq_id seq_id) const {
     return longest;
 }
 
+void llama_kv_cache::quest_note_removed(uint32_t cell) {
+    if (!pyramidkv_c1_quest() || quest_meta_dirty) {
+        return;
+    }
+    if (quest_removed_cells.size() >= 4096) {
+        quest_meta_dirty = true;
+        quest_removed_cells.clear();
+        return;
+    }
+    quest_removed_cells.push_back(cell);
+}
+
 void llama_kv_cache::pyramidkv_c1_paged_trim(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id < 0 || static_cast<size_t>(seq_id) >= n_seq_max) {
         return;
@@ -990,15 +1002,17 @@ void llama_kv_cache::pyramidkv_c1_paged_trim(llama_seq_id seq_id, llama_pos p0, 
     for (size_t layer = 0; layer < pyramidkv_c1_paged_lists.size(); ++layer) {
         for (size_t head = 0; head < pyramidkv_c1_paged_lists[layer].size(); ++head) {
             auto & list = pyramidkv_c1_paged_lists[layer][head][seq_id];
-            const auto first = std::find_if(list.begin(), list.end(),
-                [&](const pyramidkv_c1_list_entry & e) { return e.pos >= p0 && e.pos < p1; });
-            if (first == list.end()) {
+            // lists are position-ordered (the paged kernel binary-searches them)
+            const auto first = std::lower_bound(list.begin(), list.end(), p0,
+                [](const pyramidkv_c1_list_entry & e, llama_pos p) { return e.pos < p; });
+            const auto last = std::lower_bound(first, list.end(), p1,
+                [](const pyramidkv_c1_list_entry & e, llama_pos p) { return e.pos < p; });
+            if (first == last) {
                 continue;
             }
             uint32_t & dirty = pyramidkv_c1_paged_dirty[layer][head][seq_id];
             dirty = std::min(dirty, static_cast<uint32_t>(first - list.begin()));
-            list.erase(std::remove_if(first, list.end(),
-                [&](const pyramidkv_c1_list_entry & e) { return e.pos >= p0 && e.pos < p1; }), list.end());
+            list.erase(first, last);
         }
     }
 }
@@ -1530,7 +1544,6 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    quest_meta_dirty = true;
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -1652,6 +1665,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 if (new_head == cells.size()) {
                     new_head = i;
                 }
+                quest_note_removed(i);
             }
         }
 
@@ -1673,6 +1687,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 }
 
                 cells.rm(i);
+                quest_note_removed(i);
 
                 if (new_head == cells.size()) {
                     new_head = i;
@@ -6091,6 +6106,7 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
     // change other than an append.
     bool quest_dirty = false, quest_full = false;
     size_t quest_resets = 0;
+    std::vector<uint32_t> quest_removed;
     if (kv->pyramidkv_c1_quest() && aux.quest_writes != nullptr) {
         if (ubatch->n_tokens > aux.n_ubatch) {
             throw std::runtime_error("PyramidKV Quest ubatch exceeds the staged write capacity");
@@ -6111,6 +6127,11 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
         for (uint32_t s = 0; s < ubatch->n_seqs_unq && s < aux.stage_quest_seq_ids.size(); ++s) {
             aux.stage_quest_seq_ids[s] = ubatch->seq_id_unq[s];
         }
+        quest_removed.clear();
+        if (!kv->quest_meta_dirty && !kv->quest_removed_cells.empty()) {
+            quest_removed.swap(kv->quest_removed_cells);
+        }
+        kv->quest_removed_cells.clear();
         if (kv->quest_meta_dirty) {
             const uint32_t page = static_cast<uint32_t>(kv->pyramidkv_c1_config.quest_page_size);
             aux.stage_quest_cell_meta.assign(2ull*aux.quest_cell_meta->ne[1], -1);
@@ -6210,6 +6231,18 @@ void llama_kv_cache_context::set_input_pyramidkv_indices(const llama_ubatch * ub
         if (quest_full) {
             upload(aux.quest_cell_meta, aux.stage_quest_cell_meta.data(), ggml_nbytes(aux.quest_cell_meta));
             upload(aux.quest_page_seqs, aux.stage_quest_page_seqs.data(), ggml_nbytes(aux.quest_page_seqs));
+        } else if (!quest_removed.empty()) {
+            // a removed cell drops out of the table (sequence -1); a later write
+            // of this ubatch to the same cell re-registers it in the update op
+            static const int32_t none[2] = { -1, -1 };
+            for (const uint32_t cell : quest_removed) {
+                const size_t offset = 2ull*cell*sizeof(int32_t);
+                if (aux.backend != nullptr) {
+                    ggml_backend_tensor_set_async(aux.backend, aux.quest_cell_meta, none, offset, sizeof(none));
+                } else {
+                    ggml_backend_tensor_set(aux.quest_cell_meta, none, offset, sizeof(none));
+                }
+            }
         }
     }
     if (aux.backend != nullptr &&

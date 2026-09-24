@@ -609,6 +609,11 @@ private:
     // device cell table is then rebuilt from the host cells).
     std::vector<int32_t> quest_pending_resets;
     bool quest_meta_dirty = true;
+    // cells a seq_rm emptied since the last staging (a rollback removes a
+    // few); the staging only invalidates these instead of rebuilding the
+    // whole cell table. Past the cap it falls back to quest_meta_dirty.
+    std::vector<uint32_t> quest_removed_cells;
+    void quest_note_removed(uint32_t cell);
 public:
     void pyramidkv_c1_bind_aux_backend(ggml_backend_t backend);
 private:
