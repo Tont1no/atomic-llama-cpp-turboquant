@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quest8.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -12495,10 +12496,15 @@ void ggml_compute_forward_pyramidkv_quest_update(
             continue;
         }
         for (int64_t h = 0; h < n_kv; ++h) {
-            ggml_fp16_t * row = (ggml_fp16_t *) ((char *) bounds->data + h*bounds->nb[1] + page*bounds->nb[2]);
+            char * row = (char *) bounds->data + h*bounds->nb[1] + page*bounds->nb[2];
             for (int64_t d = 0; d < D; ++d) {
-                row[d]     = GGML_CPU_FP32_TO_FP16(INFINITY);
-                row[D + d] = GGML_CPU_FP32_TO_FP16(-INFINITY);
+                if (bounds->type == GGML_TYPE_I8) {
+                    ((uint8_t *) row)[d]     = 255;
+                    ((uint8_t *) row)[D + d] = 0;
+                } else {
+                    ((ggml_fp16_t *) row)[d]     = GGML_CPU_FP32_TO_FP16(INFINITY);
+                    ((ggml_fp16_t *) row)[D + d] = GGML_CPU_FP32_TO_FP16(-INFINITY);
+                }
             }
         }
         if (write_meta) {
@@ -12514,7 +12520,16 @@ void ggml_compute_forward_pyramidkv_quest_update(
         const int64_t page = cell/page_size;
         for (int64_t h = 0; h < n_kv; ++h) {
             const float * key = (const float *) ((const char *) k->data + h*k->nb[1] + t*k->nb[2]);
-            ggml_fp16_t * row = (ggml_fp16_t *) ((char *) bounds->data + h*bounds->nb[1] + page*bounds->nb[2]);
+            char * raw = (char *) bounds->data + h*bounds->nb[1] + page*bounds->nb[2];
+            if (bounds->type == GGML_TYPE_I8) {
+                uint8_t * row = (uint8_t *) raw;
+                for (int64_t d = 0; d < D; ++d) {
+                    row[d]     = MIN(row[d], ggml_quest8_encode_down(key[d]));
+                    row[D + d] = MAX(row[D + d], ggml_quest8_encode_up(key[d]));
+                }
+                continue;
+            }
+            ggml_fp16_t * row = (ggml_fp16_t *) raw;
             for (int64_t d = 0; d < D; ++d) {
                 if (key[d] < GGML_CPU_FP16_TO_FP32(row[d])) {
                     row[d] = GGML_CPU_FP32_TO_FP16(key[d]);
@@ -12577,7 +12592,19 @@ void ggml_compute_forward_pyramidkv_quest_select(
                 if (sid < 0 || sid >= 32 || ((((uint32_t) seqs[p]) >> sid) & 1u) == 0) {
                     continue;
                 }
-                const ggml_fp16_t * lo = (const ggml_fp16_t *) ((const char *) bounds->data + h*bounds->nb[1] + p*bounds->nb[2]);
+                const char * raw = (const char *) bounds->data + h*bounds->nb[1] + p*bounds->nb[2];
+                float lo_v[512];
+                float hi_v[512];
+                GGML_ASSERT(D <= 512);
+                for (int64_t d = 0; d < D; ++d) {
+                    if (bounds->type == GGML_TYPE_I8) {
+                        lo_v[d] = ggml_quest8_decode(((const uint8_t *) raw)[d]);
+                        hi_v[d] = ggml_quest8_decode(((const uint8_t *) raw)[D + d]);
+                    } else {
+                        lo_v[d] = GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) raw)[d]);
+                        hi_v[d] = GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) raw)[D + d]);
+                    }
+                }
                 for (int64_t t = 0; t < q->ne[2]; ++t) {
                     if (qm[2*t + 1] != s) {
                         continue;
@@ -12586,7 +12613,7 @@ void ggml_compute_forward_pyramidkv_quest_select(
                         const float * qr = (const float *) ((const char *) q->data + t*q->nb[2] + (h*group + g)*q->nb[1]);
                         float sum = 0.0f;
                         for (int64_t d = 0; d < D; ++d) {
-                            sum += qr[d] >= 0.0f ? qr[d]*GGML_CPU_FP16_TO_FP32(lo[D + d]) : qr[d]*GGML_CPU_FP16_TO_FP32(lo[d]);
+                            sum += qr[d] >= 0.0f ? qr[d]*hi_v[d] : qr[d]*lo_v[d];
                         }
                         scores[p] = fmaxf(scores[p], sum);
                     }

@@ -851,7 +851,13 @@ bool llama_kv_cache::pyramidkv_c1_aux_rebuild(std::string & error) {
             error = "PyramidKV Quest context allocation failed";
             return false;
         }
-        ggml_tensor * bounds = ggml_new_tensor_4d(qctx.get(), GGML_TYPE_F16, 2*head_dim, heads_max, n_pages, n_layers);
+        // 8-bit ordered bounds (ggml-quest8.h) halve the table; F16 for A/B
+        static const bool f16_bounds = [] {
+            const char * value = std::getenv("LLAMA_PYRAMIDKV_QUEST_F16");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        ggml_tensor * bounds = ggml_new_tensor_4d(qctx.get(), f16_bounds ? GGML_TYPE_F16 : GGML_TYPE_I8,
+            2*head_dim, heads_max, n_pages, n_layers);
         ggml_tensor * page_seqs = ggml_new_tensor_1d(qctx.get(), GGML_TYPE_I32, n_pages);
         ggml_tensor * cell_meta = ggml_new_tensor_2d(qctx.get(), GGML_TYPE_I32, 2, n_cells);
         ggml_tensor * writes = ggml_new_tensor_2d(qctx.get(), GGML_TYPE_I32, 3, n_ubatch);

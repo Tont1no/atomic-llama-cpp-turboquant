@@ -2522,9 +2522,11 @@ extern "C" {
             struct ggml_tensor * ext);
 
     // PyramidKV Quest page bounds for a paged C1 arena, per attention layer:
-    //   bounds    F16 [2*D, n_kv_heads, n_pages]: per channel the lowest (0..D-1)
-    //             and highest (D..2D-1) UNROTATED key of the page's cells
-    //             (page = arena cell / page_size)
+    //   bounds    F16 or I8 [2*D, n_kv_heads, n_pages]: per channel the lowest
+    //             (0..D-1) and highest (D..2D-1) UNROTATED key of the page's
+    //             cells (page = arena cell / page_size); I8 holds the ordered
+    //             8-bit codes of ggml-quest8.h (lower bounds rounded down,
+    //             upper bounds up)
     //   page_seqs I32 [n_pages]: bit s set once sequence s wrote a cell there
     //   cell_meta I32 [2, n_cells]: (position, sequence) per cell, sequence -1 = none
     // The update first resets the listed pages (resets I32 [1 + R]: count, then

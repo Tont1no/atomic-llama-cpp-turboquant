@@ -5756,7 +5756,7 @@ struct ggml_tensor * ggml_pyramidkv_quest_update(
         struct ggml_tensor  * resets,
         int32_t               page_size,
         bool                  write_meta) {
-    GGML_ASSERT(bounds->type == GGML_TYPE_F16 && ggml_is_contiguous(bounds));
+    GGML_ASSERT((bounds->type == GGML_TYPE_F16 || bounds->type == GGML_TYPE_I8) && ggml_is_contiguous(bounds));
     GGML_ASSERT(page_seqs->type == GGML_TYPE_I32 && ggml_is_contiguous(page_seqs));
     GGML_ASSERT(cell_meta->type == GGML_TYPE_I32 && ggml_is_contiguous(cell_meta) && cell_meta->ne[0] == 2);
     GGML_ASSERT(k->type == GGML_TYPE_F32 && k->nb[0] == sizeof(float));
@@ -5794,7 +5794,8 @@ struct ggml_tensor * ggml_pyramidkv_quest_select(
         int32_t               page_size) {
     GGML_ASSERT(q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && q->ne[3] == 1);
     GGML_ASSERT(q->ne[0] == 128 || q->ne[0] == 256);
-    GGML_ASSERT(bounds->type == GGML_TYPE_F16 && ggml_is_contiguous(bounds) && bounds->ne[0] == 2*q->ne[0]);
+    GGML_ASSERT((bounds->type == GGML_TYPE_F16 || bounds->type == GGML_TYPE_I8) && ggml_is_contiguous(bounds) &&
+        bounds->ne[0] == 2*q->ne[0]);
     GGML_ASSERT(q->ne[1] % bounds->ne[1] == 0);
     GGML_ASSERT(page_seqs->type == GGML_TYPE_I32 && page_seqs->ne[0] == bounds->ne[2]);
     GGML_ASSERT(cell_meta->type == GGML_TYPE_I32 && cell_meta->ne[0] == 2);

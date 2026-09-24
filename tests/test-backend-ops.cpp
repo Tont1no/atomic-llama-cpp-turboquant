@@ -8185,17 +8185,20 @@ struct test_flash_attn_ext_hybrid : public test_case {
 struct test_pyramidkv_quest_update : public test_case {
     const int64_t d, nkv, n_tokens, n_cells, page_size;
     const bool write_meta;
+    const ggml_type type;
 
     std::string vars() override {
-        return VARS_TO_STR6(d, nkv, n_tokens, n_cells, page_size, write_meta);
+        return VARS_TO_STR7(d, nkv, n_tokens, n_cells, page_size, write_meta, type);
     }
 
-    test_pyramidkv_quest_update(int64_t d, int64_t nkv, int64_t n_tokens, int64_t n_cells, int64_t page_size, bool write_meta)
-        : d(d), nkv(nkv), n_tokens(n_tokens), n_cells(n_cells), page_size(page_size), write_meta(write_meta) {}
+    test_pyramidkv_quest_update(int64_t d, int64_t nkv, int64_t n_tokens, int64_t n_cells, int64_t page_size, bool write_meta,
+            ggml_type type = GGML_TYPE_F16)
+        : d(d), nkv(nkv), n_tokens(n_tokens), n_cells(n_cells), page_size(page_size), write_meta(write_meta), type(type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_pages = (n_cells + page_size - 1)/page_size;
-        ggml_tensor * bounds = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2*d, nkv, n_pages);
+        ggml_tensor * bounds = ggml_new_tensor_3d(ctx, type, 2*d, nkv, n_pages);
+        ggml_set_name(bounds, "qu_bounds");
         ggml_tensor * page_seqs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pages);
         ggml_tensor * cell_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_cells);
         ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nkv, n_tokens);
@@ -8227,6 +8230,10 @@ struct test_pyramidkv_quest_update : public test_case {
             } else if (strcmp(t->name, "qu_resets") == 0) {
                 std::vector<int32_t> v = { 3, 0, (int32_t) (n_pages - 1), -5, 0 };
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "qu_bounds") == 0 && t->type == GGML_TYPE_I8) {
+                std::vector<uint8_t> v(ggml_nelements(t));
+                for (auto & b : v) { b = (uint8_t) (rng() & 0xff); }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size());
             } else if (strcmp(t->name, "qu_page_seqs") == 0 || strcmp(t->name, "qu_cell_meta") == 0) {
                 std::vector<int32_t> v(ggml_nelements(t), 0);
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
@@ -8234,27 +8241,28 @@ struct test_pyramidkv_quest_update : public test_case {
                 init_tensor_uniform(t, -2.0f, 2.0f);
             }
         }
-        GGML_UNUSED(rng);
     }
 };
 
 // PyramidKV Quest page choice: scores, top pages, base-list dedup.
 struct test_pyramidkv_quest_select : public test_case {
     const int64_t d, nh, nkv, n_tokens, n_seqs, n_cells, page_size, n_select, base_len;
+    const ggml_type type;
 
     std::string vars() override {
-        return VARS_TO_STR9(d, nh, nkv, n_tokens, n_seqs, n_cells, page_size, n_select, base_len);
+        return VARS_TO_STR9(d, nh, nkv, n_tokens, n_seqs, n_cells, page_size, n_select, base_len) +
+            "," + VARS_TO_STR1(type);
     }
 
     test_pyramidkv_quest_select(int64_t d, int64_t nh, int64_t nkv, int64_t n_tokens, int64_t n_seqs,
-            int64_t n_cells, int64_t page_size, int64_t n_select, int64_t base_len)
+            int64_t n_cells, int64_t page_size, int64_t n_select, int64_t base_len, ggml_type type = GGML_TYPE_F16)
         : d(d), nh(nh), nkv(nkv), n_tokens(n_tokens), n_seqs(n_seqs), n_cells(n_cells),
-          page_size(page_size), n_select(n_select), base_len(base_len) {}
+          page_size(page_size), n_select(n_select), base_len(base_len), type(type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t n_pages = (n_cells + page_size - 1)/page_size;
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nh, n_tokens);
-        ggml_tensor * bounds = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2*d, nkv, n_pages);
+        ggml_tensor * bounds = ggml_new_tensor_3d(ctx, type, 2*d, nkv, n_pages);
         ggml_tensor * page_seqs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pages);
         ggml_tensor * cell_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_cells);
         ggml_tensor * q_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_tokens);
@@ -8283,7 +8291,23 @@ struct test_pyramidkv_quest_select : public test_case {
             if (t->view_src != nullptr) {
                 continue;
             }
-            if (strcmp(t->name, "qs_bounds") == 0) {
+            if (strcmp(t->name, "qs_bounds") == 0 && t->type == GGML_TYPE_I8) {
+                // ordered codes: lo <= hi per channel
+                std::vector<uint8_t> v(ggml_nelements(t));
+                for (int64_t p = 0; p < n_pages; ++p) {
+                    for (int64_t h = 0; h < nkv; ++h) {
+                        uint8_t * row = v.data() + 2*d*(h + nkv*p);
+                        for (int64_t e = 0; e < d; ++e) {
+                            // codes 47..208 = values up to about +-8, like real keys; the
+                            // extreme codes would let a few channels tie whole pages
+                            const uint8_t a = (uint8_t) (47 + rng() % 162), b = (uint8_t) (47 + rng() % 162);
+                            row[e] = std::min(a, b);
+                            row[d + e] = std::max(a, b);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size());
+            } else if (strcmp(t->name, "qs_bounds") == 0) {
                 std::vector<ggml_fp16_t> v(ggml_nelements(t));
                 for (int64_t p = 0; p < n_pages; ++p) {
                     for (int64_t h = 0; h < nkv; ++h) {
@@ -11670,6 +11694,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 4, 8192, 1024, 8, 2100, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, true));
     test_cases.emplace_back(new test_pyramidkv_quest_update(128, 2, 37, 300, 16, true));
     test_cases.emplace_back(new test_pyramidkv_quest_update(256, 4, 9, 1000, 64, false));
+    test_cases.emplace_back(new test_pyramidkv_quest_update(128, 2, 37, 300, 16, true, GGML_TYPE_I8));
+    test_cases.emplace_back(new test_pyramidkv_quest_update(256, 4, 9, 1000, 64, false, GGML_TYPE_I8));
+    test_cases.emplace_back(new test_pyramidkv_quest_select(256, 24, 4, 8, 4, 5000, 64, 16, 300, GGML_TYPE_I8));
+    test_cases.emplace_back(new test_pyramidkv_quest_select(128, 8, 2, 3, 2, 1000, 16, 5, 40, GGML_TYPE_I8));
     test_cases.emplace_back(new test_pyramidkv_quest_select(128, 8, 2, 3, 2, 1000, 16, 5, 40));
     test_cases.emplace_back(new test_pyramidkv_quest_select(256, 24, 4, 8, 4, 5000, 64, 16, 300));
     test_cases.emplace_back(new test_pyramidkv_quest_select(256, 24, 4, 1, 1, 700, 32, 30, 10));

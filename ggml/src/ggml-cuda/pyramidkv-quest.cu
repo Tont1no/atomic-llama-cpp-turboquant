@@ -1,4 +1,5 @@
 #include "pyramidkv-quest.cuh"
+#include "ggml-quest8.h"
 
 #include <climits>
 
@@ -35,6 +36,36 @@ static __device__ __forceinline__ void quest_atomic_max_half(half * addr, const 
     } while (old != assumed);
 }
 
+// byte min/max through the aligned 32-bit word that holds the byte
+static __device__ __forceinline__ void quest_atomic_min_u8(uint8_t * addr, const uint8_t value) {
+    unsigned int * word = (unsigned int *) ((size_t) addr & ~(size_t) 3);
+    const unsigned int shift = ((unsigned int) ((size_t) addr & 3))*8;
+    unsigned int old = *word;
+    unsigned int assumed;
+    do {
+        assumed = old;
+        if (value >= ((assumed >> shift) & 0xffu)) {
+            return;
+        }
+        old = atomicCAS(word, assumed, (assumed & ~(0xffu << shift)) | ((unsigned int) value << shift));
+    } while (old != assumed);
+}
+
+static __device__ __forceinline__ void quest_atomic_max_u8(uint8_t * addr, const uint8_t value) {
+    unsigned int * word = (unsigned int *) ((size_t) addr & ~(size_t) 3);
+    const unsigned int shift = ((unsigned int) ((size_t) addr & 3))*8;
+    unsigned int old = *word;
+    unsigned int assumed;
+    do {
+        assumed = old;
+        if (value <= ((assumed >> shift) & 0xffu)) {
+            return;
+        }
+        old = atomicCAS(word, assumed, (assumed & ~(0xffu << shift)) | ((unsigned int) value << shift));
+    } while (old != assumed);
+}
+
+template<bool i8>
 static __global__ void quest_reset_kernel(
         char * bounds, int32_t * page_seqs, const int32_t * resets,
         const int64_t D, const int64_t n_kv, const int64_t n_pages,
@@ -48,9 +79,13 @@ static __global__ void quest_reset_kernel(
         return;
     }
     for (int64_t h = 0; h < n_kv; ++h) {
-        half * row = (half *) (bounds + h*b_nb1 + page*b_nb2);
+        char * row = bounds + h*b_nb1 + page*b_nb2;
         for (int64_t d = threadIdx.x; d < 2*D; d += blockDim.x) {
-            row[d] = __float2half(d < D ? INFINITY : -INFINITY);
+            if constexpr (i8) {
+                ((uint8_t *) row)[d] = d < D ? 255 : 0;
+            } else {
+                ((half *) row)[d] = __float2half(d < D ? INFINITY : -INFINITY);
+            }
         }
     }
     if (write_meta && threadIdx.x == 0) {
@@ -58,6 +93,7 @@ static __global__ void quest_reset_kernel(
     }
 }
 
+template<bool i8>
 static __global__ void quest_update_kernel(
         char * bounds, int32_t * page_seqs, int32_t * cell_meta,
         const char * k, const int32_t * writes,
@@ -75,12 +111,16 @@ static __global__ void quest_update_kernel(
         return;
     }
     const float * key = (const float *) (k + h*k_nb1 + t*k_nb2);
-    half * lo = (half *) (bounds + h*b_nb1 + page*b_nb2);
-    half * hi = lo + D;
+    char * row = bounds + h*b_nb1 + page*b_nb2;
     for (int64_t d = threadIdx.x; d < D; d += blockDim.x) {
         const float value = key[d];
-        quest_atomic_min_half(lo + d, value);
-        quest_atomic_max_half(hi + d, value);
+        if constexpr (i8) {
+            quest_atomic_min_u8((uint8_t *) row + d, ggml_quest8_encode_down(value));
+            quest_atomic_max_u8((uint8_t *) row + D + d, ggml_quest8_encode_up(value));
+        } else {
+            quest_atomic_min_half((half *) row + d, value);
+            quest_atomic_max_half((half *) row + D + d, value);
+        }
     }
     if (write_meta && h == 0 && threadIdx.x == 0) {
         const int32_t seq = writes[3*t + 2];
@@ -109,16 +149,19 @@ void ggml_cuda_op_pyramidkv_quest_update(ggml_backend_cuda_context & ctx, ggml_t
     const int64_t n_cells = cell_meta->ne[1];
     cudaStream_t stream = ctx.stream();
 
+    const bool i8 = bounds->type == GGML_TYPE_I8;
     const int64_t n_resets = resets->ne[0] - 1;
     if (n_resets > 0) {
-        quest_reset_kernel<<<(unsigned int) n_resets, 256, 0, stream>>>(
+        auto * reset = i8 ? quest_reset_kernel<true> : quest_reset_kernel<false>;
+        reset<<<(unsigned int) n_resets, 256, 0, stream>>>(
             (char *) bounds->data, (int32_t *) page_seqs->data, (const int32_t *) resets->data,
             D, n_kv, n_pages, bounds->nb[1], bounds->nb[2], write_meta);
         CUDA_CHECK(cudaGetLastError());
     }
     if (n_tok > 0) {
         const dim3 grid((unsigned int) n_tok, (unsigned int) n_kv, 1);
-        quest_update_kernel<<<grid, (unsigned int) std::min<int64_t>(D, 256), 0, stream>>>(
+        auto * update = i8 ? quest_update_kernel<true> : quest_update_kernel<false>;
+        update<<<grid, (unsigned int) std::min<int64_t>(D, 256), 0, stream>>>(
             (char *) bounds->data, (int32_t *) page_seqs->data, (int32_t *) cell_meta->data,
             (const char *) k->data, (const int32_t *) writes->data,
             D, n_pages, n_cells, page_size,
@@ -137,13 +180,22 @@ static __device__ __forceinline__ float quest_warp_sum(float value) {
 
 // One warp per page: the best bound over the slot's query tokens and the KV
 // head's query heads. Pages the sequence never wrote score -inf.
-template<int D>
+template<int D, bool i8>
 static __global__ void quest_score_kernel(
         float * scores, const char * q, const char * bounds, const int32_t * page_seqs,
         const int32_t * q_meta, const int32_t * seq_ids,
         const int64_t n_tokens, const int64_t n_q_heads, const int64_t n_kv, const int64_t n_pages,
         const size_t q_nb1, const size_t q_nb2, const size_t b_nb1, const size_t b_nb2) {
     constexpr int n_values = D/32;
+    // decode table in shared memory: per-lane codes differ, so a constant
+    // table would serialize
+    __shared__ float lut[i8 ? 256 : 1];
+    if constexpr (i8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+            lut[i] = ggml_quest8_decode((uint8_t) i);
+        }
+        __syncthreads();
+    }
     const int warp = threadIdx.x/32;
     const int lane = threadIdx.x%32;
     const int64_t page = (int64_t) blockIdx.x*(blockDim.x/32) + warp;
@@ -160,13 +212,18 @@ static __global__ void quest_score_kernel(
         }
         return;
     }
-    const half * lo = (const half *) (bounds + h*b_nb1 + page*b_nb2);
+    const char * row = bounds + h*b_nb1 + page*b_nb2;
     float lo_v[n_values];
     float hi_v[n_values];
 #pragma unroll
     for (int i = 0; i < n_values; ++i) {
-        lo_v[i] = __half2float(lo[lane + 32*i]);
-        hi_v[i] = __half2float(lo[D + lane + 32*i]);
+        if constexpr (i8) {
+            lo_v[i] = lut[((const uint8_t *) row)[lane + 32*i]];
+            hi_v[i] = lut[((const uint8_t *) row)[D + lane + 32*i]];
+        } else {
+            lo_v[i] = __half2float(((const half *) row)[lane + 32*i]);
+            hi_v[i] = __half2float(((const half *) row)[D + lane + 32*i]);
+        }
     }
     const int64_t group = n_q_heads/n_kv;
     float best = -INFINITY;
@@ -369,14 +426,17 @@ void ggml_cuda_op_pyramidkv_quest_select(ggml_backend_cuda_context & ctx, ggml_t
     constexpr int pages_per_block = 8;
     const dim3 score_grid((unsigned int) ((n_pages + pages_per_block - 1)/pages_per_block),
         (unsigned int) n_kv, (unsigned int) n_seqs);
+    const bool i8 = bounds->type == GGML_TYPE_I8;
     if (D == 128) {
-        quest_score_kernel<128><<<score_grid, 32*pages_per_block, 0, stream>>>(
+        auto * score = i8 ? quest_score_kernel<128, true> : quest_score_kernel<128, false>;
+        score<<<score_grid, 32*pages_per_block, 0, stream>>>(
             scores.get(), (const char *) q->data, (const char *) bounds->data,
             (const int32_t *) page_seqs->data, (const int32_t *) q_meta->data, (const int32_t *) seq_ids->data,
             n_tok, n_qh, n_kv, n_pages, q->nb[1], q->nb[2], bounds->nb[1], bounds->nb[2]);
     } else {
         GGML_ASSERT(D == 256);
-        quest_score_kernel<256><<<score_grid, 32*pages_per_block, 0, stream>>>(
+        auto * score = i8 ? quest_score_kernel<256, true> : quest_score_kernel<256, false>;
+        score<<<score_grid, 32*pages_per_block, 0, stream>>>(
             scores.get(), (const char *) q->data, (const char *) bounds->data,
             (const int32_t *) page_seqs->data, (const int32_t *) q_meta->data, (const int32_t *) seq_ids->data,
             n_tok, n_qh, n_kv, n_pages, q->nb[1], q->nb[2], bounds->nb[1], bounds->nb[2]);
