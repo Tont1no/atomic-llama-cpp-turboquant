@@ -20,13 +20,17 @@
 #include "../ggml/src/ggml-turbo4.h"
 
 #include <cinttypes>
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 static bool llama_context_type_is_turbo(ggml_type type) {
     return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
@@ -50,6 +54,59 @@ static llama_kv_cache * llama_context_attention_cache(llama_memory_i * memory) {
         return hybrid->get_mem_attn();
     }
     return nullptr;
+}
+
+static llama_kvzap_linear llama_kvzap_load(const char * path, const llama_model & model) {
+    if (model.arch != LLM_ARCH_QWEN35 || model.hparams.n_layer() != 64 || model.hparams.n_embd != 5120 ||
+            model.hparams.n_head() != 24 || model.hadamard_rotations.empty()) {
+        throw std::runtime_error("KVzap scorer requires the Bonsai Qwen35 64-layer, 5120-wide target");
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error(std::string("KVzap scorer file cannot be opened: ") + path);
+    }
+    std::array<char, 8> magic{};
+    std::array<uint32_t, 4> shape{};
+    std::array<char, 128> name{};
+    file.read(magic.data(), magic.size());
+    file.read(reinterpret_cast<char *>(shape.data()), sizeof(shape));
+    file.read(name.data(), name.size());
+    if (!file || magic != std::array<char, 8>{'K', 'V', 'Z', 'A', 'P', '1', 0, 0} ||
+            shape[0] != 64 || shape[1] != 5120 || shape[2] == 0 || shape[2] > 64 || shape[3] != 16 ||
+            !std::memchr(name.data(), 0, name.size()) || std::string(name.data()) != model.name) {
+        throw std::runtime_error("KVzap scorer header does not match the loaded model");
+    }
+    llama_kvzap_linear result;
+    result.n_embd = shape[1];
+    result.n_head_kv = shape[2];
+    result.weights.resize(shape[0]);
+    result.biases.resize(shape[0]);
+    uint32_t scored = 0;
+    for (uint32_t il = 0; il < shape[0]; ++il) {
+        if (model.hparams.is_recr(il)) {
+            continue;
+        }
+        uint32_t layer_id = UINT32_MAX;
+        file.read(reinterpret_cast<char *>(&layer_id), sizeof(layer_id));
+        if (!file || layer_id != il || model.hparams.n_head_kv(il) != shape[2]) {
+            throw std::runtime_error("KVzap scorer attention layer or KV-head geometry differs from the target");
+        }
+        auto & weights = result.weights[il];
+        auto & biases = result.biases[il];
+        weights.resize(static_cast<size_t>(shape[1]) * shape[2]);
+        biases.resize(shape[2]);
+        file.read(reinterpret_cast<char *>(weights.data()), weights.size() * sizeof(float));
+        file.read(reinterpret_cast<char *>(biases.data()), biases.size() * sizeof(float));
+        if (!file || !std::all_of(weights.begin(), weights.end(), [](float x) { return std::isfinite(x); }) ||
+                !std::all_of(biases.begin(), biases.end(), [](float x) { return std::isfinite(x); })) {
+            throw std::runtime_error("KVzap scorer has missing or non-finite weights");
+        }
+        ++scored;
+    }
+    if (scored != shape[3] || file.peek() != std::char_traits<char>::eof()) {
+        throw std::runtime_error("KVzap scorer has an unexpected layer count or trailing data");
+    }
+    return result;
 }
 
 // Diagnostic only: callback boundaries synchronize execution and can prevent graph/kernel fusion.
@@ -578,6 +635,12 @@ llama_context::llama_context(
             throw std::runtime_error(
                 "PyramidKV C1 requires Qwen2 or Qwen35 attention, symmetric TQ4 or TQ3.5 K/V, causal FlashAttention, "
                 "one sequence, explicit KV buffer, no SWA/shared context, and embeddings=false");
+        }
+        const char * kvzap_path = std::getenv("LLAMA_PYRAMIDKV_KVZAP_PATH");
+        if (kvzap_path != nullptr && kvzap_path[0] != '\0') {
+            kvzap = llama_kvzap_load(kvzap_path, model);
+            kvzap_cell_scores.resize(hparams.n_layer());
+            LLAMA_LOG_INFO("%s: KVzap linear scorer enabled for %s\n", __func__, model.name.c_str());
         }
     }
 
@@ -3520,6 +3583,19 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype,
                               bool pyramidkv_observer) const {
     const auto * key_center_kv = cparams.tq4_key_center ? dynamic_cast<const llama_kv_cache *>(memory.get()) : nullptr;
+    const auto * kvzap_kv = kvzap.n_embd ? llama_context_attention_cache(memory.get()) : nullptr;
+    bool kvzap_score = kvzap_kv != nullptr && ubatch.token != nullptr &&
+        !kvzap_kv->pyramidkv_c1_is_compacted();
+    if (kvzap_score && cparams.pyramidkv_c1.paged && ubatch.seq_id != nullptr && ubatch.n_seq_id != nullptr) {
+        kvzap_score = false;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr ||
+                    !kvzap_kv->pyramidkv_c1_paged_seq_compacted(ubatch.seq_id[i][0])) {
+                kvzap_score = true;
+                break;
+            }
+        }
+    }
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -3534,9 +3610,10 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.hadamard_rotations =*/ hadamard_rotations.empty() ? nullptr : &hadamard_rotations,
         /*.hadamard_inverses  =*/ hadamard_inverses.empty()  ? nullptr : &hadamard_inverses,
+        /*.kvzap       =*/ kvzap_score ? &kvzap : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.pyramidkv_observer =*/ pyramidkv_observer,
+        /*.pyramidkv_observer =*/ pyramidkv_observer && !kvzap.n_embd,
         /*.tq4_key_center_capture =*/ key_center_kv && key_center_kv->tq4_key_center_capture(),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3597,6 +3674,203 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
     };
+}
+
+bool llama_context::extract_kvzap_scores(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    const auto & nodes = res->get_kvzap_scores();
+    if (nodes.empty()) {
+        return true;
+    }
+    auto * kv = llama_context_attention_cache(memory.get());
+    if (kv == nullptr || ubatch.pos == nullptr || ubatch.seq_id == nullptr || ubatch.n_seq_id == nullptr ||
+            nodes.size() != 16) {
+        return false;
+    }
+    const size_t capacity = kv->get_size();
+    const size_t heads = kvzap.n_head_kv;
+    if (capacity == 0 || heads == 0 || capacity > SIZE_MAX / heads) {
+        return false;
+    }
+    if (kvzap_cell_positions.size() != capacity) {
+        kvzap_cell_positions.assign(capacity, -1);
+        kvzap_cell_sequences.assign(capacity, -1);
+    }
+
+    std::unordered_map<llama_seq_id, std::unordered_map<llama_pos, uint32_t>> cells_by_seq;
+    for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+        if (ubatch.n_seq_id[token] != 1 || ubatch.seq_id[token] == nullptr || ubatch.pos[token] < 0) {
+            return false;
+        }
+        const llama_seq_id seq = ubatch.seq_id[token][0];
+        if (cells_by_seq.count(seq) != 0) {
+            continue;
+        }
+        const auto & cells = kv->get_cells(seq);
+        auto & positions = cells_by_seq[seq];
+        for (uint32_t cell = 0; cell < cells.used_max_p1(); ++cell) {
+            if (!cells.is_empty(cell) && cells.seq_has(cell, seq)) {
+                positions[cells.pos_get(cell)] = cell;
+            }
+        }
+    }
+
+    size_t max_cell = 0;
+    for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+        const llama_seq_id seq = ubatch.seq_id[token][0];
+        const auto it = cells_by_seq.at(seq).find(ubatch.pos[token]);
+        if (it == cells_by_seq.at(seq).end() || it->second >= capacity) {
+            return false;
+        }
+        max_cell = std::max(max_cell, static_cast<size_t>(it->second));
+    }
+
+    synchronize();
+    for (const auto & [il, tensor] : nodes) {
+        if (il < 0 || static_cast<size_t>(il) >= kvzap_cell_scores.size() ||
+                tensor == nullptr || tensor->type != GGML_TYPE_F32 ||
+                tensor->ne[0] != static_cast<int64_t>(heads) ||
+                tensor->ne[1] != ubatch.n_tokens || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            return false;
+        }
+        std::vector<float> row_scores(heads * ubatch.n_tokens);
+        ggml_backend_tensor_get(tensor, row_scores.data(), 0, row_scores.size() * sizeof(float));
+        auto & cached = kvzap_cell_scores[il];
+        if (cached.size() < (max_cell + 1) * heads) {
+            cached.resize((max_cell + 1) * heads, std::numeric_limits<float>::quiet_NaN());
+        }
+        for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+            const llama_seq_id seq = ubatch.seq_id[token][0];
+            const auto it = cells_by_seq.at(seq).find(ubatch.pos[token]);
+            if (it == cells_by_seq.at(seq).end() || it->second >= capacity) {
+                return false;
+            }
+            const size_t cell = it->second;
+            for (size_t head = 0; head < heads; ++head) {
+                const float value = row_scores[token * heads + head];
+                if (!std::isfinite(value)) {
+                    return false;
+                }
+                cached[cell * heads + head] = value;
+            }
+            kvzap_cell_positions[cell] = ubatch.pos[token];
+            kvzap_cell_sequences[cell] = seq;
+        }
+    }
+    return true;
+}
+
+bool llama_context::select_kvzap_scores(const llama_ubatch & ubatch, bool has_output, std::string & error) {
+    auto * kv = llama_context_attention_cache(memory.get());
+    if (kv == nullptr) {
+        error = "KVzap has no attention cache";
+        return false;
+    }
+    const bool paged = cparams.pyramidkv_c1.paged;
+    if (paged) {
+        pyramidkv_c1_pending_paged.clear();
+    } else {
+        pyramidkv_c1_pending.clear();
+        if (kv->pyramidkv_c1_is_compacted()) {
+            return !kv->pyramidkv_c1_should_maintain(ubatch.n_tokens, cparams.n_ubatch) ||
+                kv->pyramidkv_c1_keep_all(pyramidkv_c1_pending, error);
+        }
+    }
+    if (!has_output) {
+        return true;
+    }
+    const auto layers = kv->get_layer_ids();
+    std::map<llama_seq_id, llama_pos> ending;
+    for (uint32_t token = 0; token < ubatch.n_tokens; ++token) {
+        if (ubatch.output[token] != 0) {
+            ending[ubatch.seq_id[token][0]] = ubatch.pos[token];
+        }
+    }
+    for (const auto & [seq, last_pos] : ending) {
+        if (paged && kv->pyramidkv_c1_paged_seq_compacted(seq)) {
+            continue;
+        }
+        std::vector<llama_pyramidkv_c1_layer_selection> selections;
+        for (size_t index = 0; index < layers.size(); ++index) {
+            const uint32_t il = layers[index];
+            if (il >= kvzap_cell_scores.size() || kvzap_cell_scores[il].empty()) {
+                error = "KVzap lacks scores for an attention layer";
+                return false;
+            }
+            llama_pyramidkv_c1_score score;
+            score.il = il;
+            score.query_heads = model.hparams.n_head(il);
+            score.kv_heads = model.hparams.n_head_kv(il);
+            score.query_tokens = 1;
+            score.query_positions = {last_pos};
+            score.observation_window = 1;
+            score.key_stride = kv->get_size();
+            score.head_scores.assign(score.key_stride * score.kv_heads, 0.0f);
+            uint32_t active_tokens = 0;
+            if (!kv->pyramidkv_c1_key_positions(il, kv->get_size(), score.key_positions_per_head,
+                    score.key_cells_per_head, score.key_score_slots_per_head, active_tokens, error, seq, false)) {
+                return false;
+            }
+            score.logical_key_tokens = active_tokens;
+            for (size_t head = 0; head < score.kv_heads; ++head) {
+                auto & positions = score.key_positions_per_head[head];
+                auto & cells = score.key_cells_per_head[head];
+                auto & slots = score.key_score_slots_per_head[head];
+                size_t kept = 0;
+                for (size_t i = 0; i < positions.size(); ++i) {
+                    if (kv->pyramidkv_c1_is_protected(seq, static_cast<llama_pos>(positions[i]))) {
+                        continue;
+                    }
+                    const size_t cell = cells[i];
+                    if (cell >= kvzap_cell_positions.size() ||
+                            kvzap_cell_positions[cell] != positions[i] || kvzap_cell_sequences[cell] != seq ||
+                            cell * score.kv_heads + head >= kvzap_cell_scores[il].size() ||
+                            !std::isfinite(kvzap_cell_scores[il][cell * score.kv_heads + head])) {
+                        error = "KVzap score is missing or stale for a retained KV cell";
+                        return false;
+                    }
+                    score.head_scores[slots[i] + score.key_stride * head] =
+                        kvzap_cell_scores[il][cell * score.kv_heads + head];
+                    positions[kept] = positions[i];
+                    cells[kept] = cells[i];
+                    slots[kept] = slots[i];
+                    ++kept;
+                }
+                positions.resize(kept);
+                cells.resize(kept);
+                slots.resize(kept);
+                // C1 pools importance, so restore positive scores before pooling.
+                if (kept != 0) {
+                    float max_log_score = -std::numeric_limits<float>::infinity();
+                    for (size_t i = 0; i < kept; ++i) {
+                        max_log_score = std::max(max_log_score,
+                            score.head_scores[slots[i] + score.key_stride * head]);
+                    }
+                    for (size_t i = 0; i < kept; ++i) {
+                        float & value = score.head_scores[slots[i] + score.key_stride * head];
+                        value = std::exp(value - max_log_score);
+                    }
+                }
+                score.key_tokens = std::max(score.key_tokens, kept);
+            }
+            auto config = cparams.pyramidkv_c1;
+            config.layer_index = index;
+            llama_pyramidkv_c1_layer_selection selection;
+            if (!llama_pyramidkv_c1_select(score, config, selection, error)) {
+                return false;
+            }
+            selections.push_back(std::move(selection));
+        }
+        if (selections.size() != layers.size()) {
+            error = "KVzap selection missed an attention layer";
+            return false;
+        }
+        if (paged) {
+            pyramidkv_c1_pending_paged.emplace_back(seq, std::move(selections));
+        } else {
+            pyramidkv_c1_pending = std::move(selections);
+        }
+    }
+    return true;
 }
 
 bool llama_context::extract_pyramidkv_scores(
@@ -3679,6 +3953,15 @@ bool llama_context::extract_pyramidkv_scores(
             [](int8_t output) { return output != 0; });
     if (image_rows && (has_output || !res->get_pyramidkv_scores().empty())) {
         return fail("C1 does not score image rows; a prompt must end with text");
+    }
+    if (kvzap.n_embd) {
+        if (!extract_kvzap_scores(res, ubatch)) {
+            return fail("KVzap graph scores have invalid geometry or cache-cell mapping");
+        }
+        if (!select_kvzap_scores(ubatch, has_output, error)) {
+            return fail(error);
+        }
+        return true;
     }
     if (paged) {
         // Selected sequences need no maintenance (the arena copy of every

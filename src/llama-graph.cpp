@@ -1532,6 +1532,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
     pyramidkv_scores.clear();
+    kvzap_scores.clear();
     pyramidkv_observer_bytes = 0;
     pyramidkv_observer_output_bytes = 0;
 
@@ -1601,6 +1602,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(score.tensor);
         }
     }
+    for (const auto & score : kvzap_scores) {
+        ggml_set_output(score.second);
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1646,6 +1650,10 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
 
 void llm_graph_result::add_pyramidkv_score(llm_graph_pyramidkv_score result) {
     pyramidkv_scores.push_back(result);
+}
+
+void llm_graph_result::add_kvzap_score(int il, ggml_tensor * tensor) {
+    kvzap_scores.emplace_back(il, tensor);
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1697,6 +1705,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses (params.hadamard_inverses),
+    kvzap            (params.kvzap),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1717,6 +1726,44 @@ ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
     return cvec->apply_to(ctx0, cur, il);
+}
+
+class llm_graph_input_kvzap : public llm_graph_input_i {
+public:
+    llm_graph_input_kvzap(const llama_kvzap_linear * model, int il) : model(model), il(il) {}
+
+    void set_input(const llama_ubatch *) override {
+        const auto & weights = model->weights[il];
+        const auto & biases = model->biases[il];
+        ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(float));
+        ggml_backend_tensor_set(b, biases.data(), 0, biases.size() * sizeof(float));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.kvzap == model;
+    }
+
+    const llama_kvzap_linear * model;
+    int il;
+    ggml_tensor * w = nullptr;
+    ggml_tensor * b = nullptr;
+};
+
+void llm_graph_context::build_kvzap_score(ggml_tensor * attn_norm, int il) const {
+    if (kvzap == nullptr || il < 0 || static_cast<size_t>(il) >= kvzap->weights.size() ||
+            kvzap->weights[il].empty()) {
+        return;
+    }
+    auto input = std::make_unique<llm_graph_input_kvzap>(kvzap, il);
+    input->w = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kvzap->n_embd, kvzap->n_head_kv);
+    input->b = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, kvzap->n_head_kv, 1);
+    ggml_set_input(input->w);
+    ggml_set_input(input->b);
+    ggml_tensor * score = ggml_add(ctx0, ggml_mul_mat(ctx0, input->w, attn_norm), input->b);
+    cb(score, "kvzap_log_score", il);
+    res->add_kvzap_score(il, score);
+    res->add_input(std::move(input));
+    ggml_build_forward_expand(gf, score);
 }
 
 ggml_tensor * llm_graph_context::build_hadamard_input(

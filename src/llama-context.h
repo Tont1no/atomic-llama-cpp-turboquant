@@ -272,6 +272,8 @@ private:
     bool extract_pyramidkv_scores(
             const llm_graph_result * res,
             const llama_ubatch & ubatch);
+    bool extract_kvzap_scores(const llm_graph_result * res, const llama_ubatch & ubatch);
+    bool select_kvzap_scores(const llama_ubatch & ubatch, bool has_output, std::string & error);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -416,6 +418,10 @@ private:
     std::vector<llama_pyramidkv_c1_layer_selection> pyramidkv_c1_pending;
     // Paged selections are committed before the next ubatch or before decode returns.
     std::vector<std::pair<llama_seq_id, std::vector<llama_pyramidkv_c1_layer_selection>>> pyramidkv_c1_pending_paged;
+    llama_kvzap_linear kvzap;
+    std::vector<std::vector<float>> kvzap_cell_scores;
+    std::vector<llama_pos> kvzap_cell_positions;
+    std::vector<llama_seq_id> kvzap_cell_sequences;
     void pyramidkv_c1_drop_stale_paged(const std::vector<llama_seq_id> & stale);
     bool pyramidkv_c1_apply_pending_paged();
 

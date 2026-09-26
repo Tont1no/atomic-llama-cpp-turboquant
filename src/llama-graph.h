@@ -811,6 +811,13 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+struct llama_kvzap_linear {
+    uint32_t n_embd = 0;
+    uint32_t n_head_kv = 0;
+    std::vector<std::vector<float>> weights;
+    std::vector<std::vector<float>> biases;
+};
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -832,6 +839,7 @@ struct llm_graph_params {
     // folded-weight transforms; nullptr when the model has none
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_kvzap_linear * kvzap = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -932,6 +940,7 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             pyramidkv_observer == other.pyramidkv_observer &&
+            kvzap == other.kvzap &&
             tq4_key_center_capture == other.tq4_key_center_capture &&
             cvec  == other.cvec  &&
             loras == other.loras &&
@@ -998,9 +1007,11 @@ public:
     void add_fused_node(llm_graph_fused_node result);
 
     void add_pyramidkv_score(llm_graph_pyramidkv_score result);
+    void add_kvzap_score(int il, ggml_tensor * tensor);
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
     const std::vector<llm_graph_pyramidkv_score> & get_pyramidkv_scores() const { return pyramidkv_scores; }
+    const std::vector<std::pair<int, ggml_tensor *>> & get_kvzap_scores() const { return kvzap_scores; }
 
     void set_params(const llm_graph_params & params);
 
@@ -1022,6 +1033,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
     std::vector<llm_graph_pyramidkv_score> pyramidkv_scores;
+    std::vector<std::pair<int, ggml_tensor *>> kvzap_scores;
     // Peak observer bytes charged for one layer (the allocator reuses the
     // intermediates across layers) plus the retained per-layer score outputs.
     size_t pyramidkv_observer_bytes = 0;
@@ -1111,6 +1123,7 @@ struct llm_graph_context {
 
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_kvzap_linear * kvzap;
 
     // one transform per (activation, rotation): q/k/v or gate/up read the same input
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
@@ -1141,6 +1154,8 @@ struct llm_graph_context {
     ggml_tensor * build_hadamard_input(
               ggml_tensor * w,
               ggml_tensor * cur) const;
+
+    void build_kvzap_score(ggml_tensor * attn_norm, int il) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
