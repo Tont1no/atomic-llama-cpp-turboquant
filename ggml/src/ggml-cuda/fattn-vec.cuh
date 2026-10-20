@@ -207,7 +207,13 @@ static __global__ void flash_attn_ext_vec(
 #else
     typedef float2 Q_sh_t;
 #endif // V_DOT2_F32_F16_AVAILABLE
-    constexpr bool q_shared = gqa_cols && ncols2 > 2;
+    // Keep the D256 query out of each thread's registers on SM120.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !defined(GGML_USE_HIP)
+    constexpr bool tq4_shared_query = type_K == GGML_TYPE_TURBO4_0 && type_V == GGML_TYPE_TURBO4_0 && D == 256 && ncols == 1 && ncols2 == 1;
+#else
+    constexpr bool tq4_shared_query = false;
+#endif
+    constexpr bool q_shared = (gqa_cols && ncols2 > 2) || tq4_shared_query;
     __shared__ Q_sh_t Q_sh[q_shared ? ncols*(D/2) : 1];
 
     ggml_cuda_pdl_sync();
