@@ -21,6 +21,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-turbo4.h"
+#include "../ggml/src/ggml-quest8.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2316,16 +2317,19 @@ struct test_get_rows : public test_case {
 };
 
 struct test_get_rows_quantized : public test_case {
+    const ggml_type type;
     ggml_tensor * source = nullptr;
     ggml_tensor * index_storage = nullptr;
     std::vector<uint8_t> expected;
 
     std::string vars() override {
-        return "case=tq4_packed_gather";
+        return type == GGML_TYPE_Q8_0 ? "case=q8_packed_gather" : "case=tq4_packed_gather";
     }
 
+    explicit test_get_rows_quantized(ggml_type type = GGML_TYPE_TURBO4_0) : type(type) {}
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        source = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO4_0, 256, 12, 2, 2);
+        source = ggml_new_tensor_4d(ctx, type, 256, 12, 2, 2);
         ggml_set_name(source, "packed_source");
         ggml_tensor * in = ggml_view_4d(ctx, source, 256, 5, 2, 2,
             2*source->nb[1], source->nb[2], source->nb[3], source->nb[1]);
@@ -2378,7 +2382,7 @@ struct test_get_rows_quantized : public test_case {
         }
         std::vector<uint8_t> actual(ggml_nbytes(tensor));
         ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
-        return tensor->type == GGML_TYPE_TURBO4_0 && actual == expected;
+        return tensor->type == type && actual == expected;
     }
 };
 
@@ -7873,10 +7877,11 @@ struct test_flash_attn_ext_hybrid : public test_case {
     const float max_bias;
     const float logit_softcap;
     const bool sinks;
+    const ggml_type type_kv;
     ggml_tensor * dense_ref = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR13(logical_d, nh, nkv, nq, n_cold, n_hot, nseq, positions, all_masked, cold_masked, max_bias, logit_softcap, sinks);
+        return VARS_TO_STR13(logical_d, nh, nkv, nq, n_cold, n_hot, nseq, positions, all_masked, cold_masked, max_bias, logit_softcap, sinks) + "," + VARS_TO_STR1(type_kv);
     }
 
     double max_nmse_err() override {
@@ -7925,10 +7930,11 @@ struct test_flash_attn_ext_hybrid : public test_case {
             bool cold_masked = false,
             float max_bias = 0.0f,
             float logit_softcap = 0.0f,
-            bool sinks = false)
+            bool sinks = false,
+            ggml_type type_kv = GGML_TYPE_TURBO4_0)
         : logical_d(logical_d), nh(nh), nkv(nkv), nq(nq), n_cold(n_cold), n_hot(n_hot), nseq(nseq),
           positions(positions), all_masked(all_masked), cold_masked(cold_masked),
-          max_bias(max_bias), logit_softcap(logit_softcap), sinks(sinks) {}
+          max_bias(max_bias), logit_softcap(logit_softcap), sinks(sinks), type_kv(type_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t storage_d = logical_d == 64 ? 128 : logical_d;
@@ -7936,9 +7942,9 @@ struct test_flash_attn_ext_hybrid : public test_case {
 
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, storage_d, nq, nh, nseq);
         ggml_set_name(q, "hy_q");
-        ggml_tensor * k_cold = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO4_0, storage_d, n_cold, nkv, nseq);
+        ggml_tensor * k_cold = ggml_new_tensor_4d(ctx, type_kv, storage_d, n_cold, nkv, nseq);
         ggml_set_name(k_cold, "hy_k_cold");
-        ggml_tensor * v_cold = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO4_0, storage_d, n_cold, nkv, nseq);
+        ggml_tensor * v_cold = ggml_new_tensor_4d(ctx, type_kv, storage_d, n_cold, nkv, nseq);
         ggml_set_name(v_cold, "hy_v_cold");
         ggml_tensor * k_hot = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, storage_d, n_hot, nkv, nseq);
         ggml_set_name(k_hot, "hy_k_hot");
@@ -8073,8 +8079,8 @@ struct test_flash_attn_ext_hybrid : public test_case {
             return ::ggml_new_tensor_4d(ref_ctx.get(), type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
         };
         ggml_tensor * rq = make_like(GGML_TYPE_F32, q);
-        ggml_tensor * rkc = make_like(GGML_TYPE_TURBO4_0, k_cold);
-        ggml_tensor * rvc = make_like(GGML_TYPE_TURBO4_0, v_cold);
+        ggml_tensor * rkc = make_like(type_kv, k_cold);
+        ggml_tensor * rvc = make_like(type_kv, v_cold);
         ggml_tensor * rkh = make_like(GGML_TYPE_F16, k_hot);
         ggml_tensor * rvh = make_like(GGML_TYPE_F16, v_hot);
         ggml_tensor * rmask = ::ggml_new_tensor_4d(ref_ctx.get(), GGML_TYPE_F16, n_keys, nq, mask_heads, nseq);
@@ -8202,6 +8208,7 @@ struct test_pyramidkv_quest_update : public test_case {
         ggml_tensor * page_seqs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pages);
         ggml_tensor * cell_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_cells);
         ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nkv, n_tokens);
+        ggml_set_name(k, "qu_keys");
         ggml_tensor * writes = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n_tokens);
         ggml_tensor * resets = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1 + 4);
         ggml_set_name(page_seqs, "qu_page_seqs");
@@ -8230,6 +8237,13 @@ struct test_pyramidkv_quest_update : public test_case {
             } else if (strcmp(t->name, "qu_resets") == 0) {
                 std::vector<int32_t> v = { 3, 0, (int32_t) (n_pages - 1), -5, 0 };
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "qu_keys") == 0) {
+                const float keys[] = { -500.0f, 500.0f, -1.0001f, 1.0001f, -1.0e-8f, 1.0e-8f };
+                std::vector<float> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) {
+                    v[i] = keys[(i % d) % 6];
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
             } else if (strcmp(t->name, "qu_bounds") == 0 && t->type == GGML_TYPE_I8) {
                 std::vector<uint8_t> v(ggml_nelements(t));
                 for (auto & b : v) { b = (uint8_t) (rng() & 0xff); }
@@ -8241,6 +8255,40 @@ struct test_pyramidkv_quest_update : public test_case {
                 init_tensor_uniform(t, -2.0f, 2.0f);
             }
         }
+    }
+
+    bool validate_result(const ggml_tensor * tensor) override {
+        if (tensor->op != GGML_OP_PYRAMIDKV_QUEST_UPDATE) {
+            return true;
+        }
+        const auto * k = tensor->src[3];
+        const auto * writes = tensor->src[4];
+        std::vector<float> keys(ggml_nelements(k));
+        std::vector<int32_t> cells(ggml_nelements(writes));
+        std::vector<uint8_t> bounds(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(k, keys.data(), 0, keys.size()*sizeof(float));
+        ggml_backend_tensor_get(writes, cells.data(), 0, cells.size()*sizeof(int32_t));
+        ggml_backend_tensor_get(tensor, bounds.data(), 0, bounds.size());
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const int32_t cell = cells[3*t];
+            if (cell < 0 || cell >= n_cells) {
+                continue;
+            }
+            for (int64_t h = 0; h < nkv; ++h) {
+                const size_t row = h*tensor->nb[1] + (cell/page_size)*tensor->nb[2];
+                const auto value = [&](int64_t channel) {
+                    return type == GGML_TYPE_I8 ? ggml_quest8_decode(bounds[row + channel]) :
+                        ggml_fp16_to_fp32(((const ggml_fp16_t *) (bounds.data() + row))[channel]);
+                };
+                for (int64_t channel = 0; channel < d; ++channel) {
+                    const float key = keys[channel + d*(h + nkv*t)];
+                    if (!(value(channel) <= key && key <= value(d + channel))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 };
 
@@ -10035,6 +10083,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
     test_cases.emplace_back(new test_get_rows_quantized());
+    test_cases.emplace_back(new test_get_rows_quantized(GGML_TYPE_Q8_0));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -11675,6 +11724,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // multi-row queries take the key split too, with causal masking.
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 32, 4, 4, 4864, 1024, 1, true,  false, false));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 4, 1280, 1024, 1, true,  false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 8, 2, 3, 5, 3, 2, true, false, false, 8.0f, 30.0f, true, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 16, 2, 1, 1024, 96, 1, true, true, false, 0.0f, 0.0f, false, GGML_TYPE_Q8_0));
 
     // Paged lists (multi-sequence): small ragged lists with freed and
     // out-of-range entries, D128 and D256, the verification width, long
@@ -11685,6 +11736,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 32, 4, 4, 8192, 1024, 8, 2100));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 4, 1, 5, 32, 4, 1, 7));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 3, 64, 16, 2, 24, 30.0f, false, 4, GGML_TYPE_TURBO3_5));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 3, 64, 16, 2, 24, 30.0f, false, 4, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 8, 128, 64, 2, 48, 0.0f, false, 4, GGML_TYPE_Q8_0, 33, true));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 16, 2, 1, 4096, 1024, 4, 2100, 0.0f, false, 4, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 16, 8192, 1024, 4, 2100, 0.0f, false, 4, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged_prefix(GGML_TYPE_Q8_0, 32));
     // quest lists: plain and GQA6 kernels, split-K through a long base list
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(128, 8, 2, 3, 64, 16, 2, 24, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 10));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 8, 128, 64, 2, 48, 0.0f, false, 4, GGML_TYPE_TURBO4_0, 33));

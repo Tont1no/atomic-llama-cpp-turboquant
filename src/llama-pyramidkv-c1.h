@@ -13,6 +13,9 @@
 
 struct llama_pyramidkv_c1_params;
 
+std::size_t llama_pyramidkv_c1_list_headroom(std::size_t capacity,
+        std::size_t retained, std::size_t protected_rows);
+
 // Local, compile-time opt-in.  The default build keeps all timers and the
 // summary log disabled; no runtime or process-wide setting is added.
 #ifndef LLAMA_PYRAMIDKV_C1_PHASE_TIMING
@@ -147,7 +150,8 @@ bool llama_pyramidkv_c1_make_config(
         std::size_t continuation_headroom,
         std::size_t n_seq_max,
         llama_pyramidkv_c1_config & output,
-        std::string & error);
+        std::string & error,
+        std::size_t arena_cells = 1u << 20);
 
 bool llama_pyramidkv_c1_prefill_rows(
         const llama_pyramidkv_c1_config & config,

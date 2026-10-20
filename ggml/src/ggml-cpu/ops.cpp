@@ -5026,7 +5026,7 @@ void ggml_compute_forward_get_rows(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_5) {
+    if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_5 || dst->type == GGML_TYPE_Q8_0) {
         const ggml_tensor * ids = dst->src[1];
         GGML_ASSERT(src0->type == dst->type && ids->type == GGML_TYPE_I32);
         GGML_ASSERT(src0->ne[0] == dst->ne[0] && ggml_is_contiguous(dst));
@@ -8760,7 +8760,7 @@ static void ggml_compute_forward_flash_attn_ext_hybrid(
     const ggml_tensor * k_positions = dst->src[8];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5 || k_cold->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->nb[0] == sizeof(float));
@@ -8925,7 +8925,7 @@ static void ggml_compute_forward_flash_attn_ext_hybrid_paged(
     const ggml_tensor * k_list_len = dst->src[9];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5 || k_cold->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q_meta && k_list && k_list_len);
@@ -12531,11 +12531,13 @@ void ggml_compute_forward_pyramidkv_quest_update(
             }
             ggml_fp16_t * row = (ggml_fp16_t *) raw;
             for (int64_t d = 0; d < D; ++d) {
+                const ggml_fp16_t rounded = GGML_CPU_FP32_TO_FP16(key[d]);
+                const float value = GGML_CPU_FP16_TO_FP32(rounded);
                 if (key[d] < GGML_CPU_FP16_TO_FP32(row[d])) {
-                    row[d] = GGML_CPU_FP32_TO_FP16(key[d]);
+                    row[d] = value > key[d] ? rounded + ((rounded & 0x8000) ? 1 : -1) : rounded;
                 }
                 if (key[d] > GGML_CPU_FP16_TO_FP32(row[D + d])) {
-                    row[D + d] = GGML_CPU_FP32_TO_FP16(key[d]);
+                    row[D + d] = value < key[d] ? rounded + ((rounded & 0x8000) ? -1 : 1) : rounded;
                 }
             }
         }
@@ -12613,7 +12615,9 @@ void ggml_compute_forward_pyramidkv_quest_select(
                         const float * qr = (const float *) ((const char *) q->data + t*q->nb[2] + (h*group + g)*q->nb[1]);
                         float sum = 0.0f;
                         for (int64_t d = 0; d < D; ++d) {
-                            sum += qr[d] >= 0.0f ? qr[d]*hi_v[d] : qr[d]*lo_v[d];
+                            if (qr[d] != 0.0f) {
+                                sum += qr[d] > 0.0f ? qr[d]*hi_v[d] : qr[d]*lo_v[d];
+                            }
                         }
                         scores[p] = fmaxf(scores[p], sum);
                     }

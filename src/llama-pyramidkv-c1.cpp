@@ -51,6 +51,14 @@ void pool_average(const std::vector<float> & scores, std::size_t offset,
 
 } // namespace
 
+std::size_t llama_pyramidkv_c1_list_headroom(std::size_t capacity,
+        std::size_t retained, std::size_t protected_rows) {
+    if (retained > capacity || protected_rows > capacity - retained) {
+        return 0;
+    }
+    return capacity - retained - protected_rows;
+}
+
 namespace {
 
 bool copy_c1_value(const char * name, uint64_t value, uint64_t minimum,
@@ -75,7 +83,8 @@ bool llama_pyramidkv_c1_make_config(
         std::size_t continuation_headroom,
         std::size_t n_seq_max,
         llama_pyramidkv_c1_config & output,
-        std::string & error) {
+        std::string & error,
+        std::size_t arena_cells) {
     output = {};
     if (!params.enabled) {
         return true;
@@ -84,7 +93,7 @@ bool llama_pyramidkv_c1_make_config(
         error = "invalid attention layer count";
         return false;
     }
-    if (continuation_headroom == 0 || n_seq_max == 0) {
+    if (continuation_headroom == 0 || n_seq_max == 0 || arena_cells == 0) {
         error = "PyramidKV C1 requires non-zero sequence capacity and effective ubatch headroom";
         return false;
     }
@@ -166,12 +175,20 @@ bool llama_pyramidkv_c1_make_config(
                 1, kMaxListCapacity, output.list_capacity, error)) {
             return false;
         }
-        if (output.list_capacity < output.max_capacity_prompt + output.continuation_headroom) {
-            error = "PyramidKV C1 list_capacity must cover max_capacity_prompt plus effective ubatch headroom";
-            return false;
-        }
         if (!copy_c1_value("pyramidkv_c1.paged_union_factor", params.paged_union_factor,
                 1, 1024, output.paged_union_factor, error)) {
+            return false;
+        }
+        bool union_ok = true;
+        const std::size_t union_rows = checked_mul(output.max_capacity_prompt, output.paged_union_factor, union_ok);
+        const std::size_t base = output.max_capacity_prompt - output.recent_window;
+        const std::size_t prefill_rows = output.max_prefill_cells == 0 ? arena_cells :
+            std::min(arena_cells, output.max_prefill_cells);
+        const std::size_t max_head_rows = std::min({union_rows, prefill_rows,
+            output.recent_window + 2 * base - base / output.beta});
+        if (!union_ok || output.continuation_headroom > std::numeric_limits<std::size_t>::max() - max_head_rows ||
+                output.list_capacity < max_head_rows + output.continuation_headroom) {
+            error = "PyramidKV C1 list_capacity must cover the largest per-head pyramid selection plus effective ubatch headroom";
             return false;
         }
     }

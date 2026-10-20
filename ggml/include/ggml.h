@@ -1684,7 +1684,7 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
-    // Gather packed Turbo4/Turbo3.5 rows without decoding or applying a second rotation.
+    // Gather packed TQ4/TQ3.5/Q8_0 rows without decoding or re-encoding.
     GGML_API struct ggml_tensor * ggml_get_rows_quantized(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2456,9 +2456,9 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
-    // Hybrid KV attention. src[1]/src[2] hold cold TurboQuant4 K/V rows.
-    // The hot rows stay in F16 and are read from src[5]/src[6]. K/V and Q
-    // use the same signed-WHT rotated coordinate basis. The mask covers
+    // Hybrid KV attention. src[1]/src[2] hold cold TQ4, TQ3.5, or Q8_0 K/V rows.
+    // The hot rows stay in F16 and are read from src[5]/src[6]. Turbo K/V and Q
+    // use the same signed-WHT basis; Q8_0 stays unrotated. The mask covers
     // [cold, hot], and scale is one shared softmax scale (1/sqrt(logical D)).
     // A logical D64 head uses zero-padded D128 storage for every row.
     // q_positions is I32 [n_q, n_q_heads or 1, n_seq, 1]. k_positions is

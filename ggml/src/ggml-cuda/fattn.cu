@@ -429,7 +429,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (Q == nullptr || K == nullptr || V == nullptr || V_hot == nullptr ||
                 q_pos == nullptr || k_pos == nullptr || k_len == nullptr ||
                 dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
-                !ggml_cuda_fattn_type_is_turbo(K->type) || V->type != K->type ||
+                (!ggml_cuda_fattn_type_is_turbo(K->type) && K->type != GGML_TYPE_Q8_0) || V->type != K->type ||
                 K_hot->type != GGML_TYPE_F16 || V_hot->type != GGML_TYPE_F16 ||
                 q_pos->type != GGML_TYPE_I32 || k_pos->type != GGML_TYPE_I32 || k_len->type != GGML_TYPE_I32 ||
                 !ggml_is_contiguous(q_pos) || !ggml_is_contiguous(k_pos) || !ggml_is_contiguous(k_len) ||
@@ -472,7 +472,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
              (k_pos->ne[2] == 1 || k_pos->ne[2] == Q->ne[3]) && k_pos->ne[3] == 1);
         if (Q == nullptr || K == nullptr || V == nullptr || K_hot == nullptr || V_hot == nullptr ||
                 dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
-                !ggml_cuda_fattn_type_is_turbo(K->type) || V->type != K->type ||
+                (!ggml_cuda_fattn_type_is_turbo(K->type) && K->type != GGML_TYPE_Q8_0) || V->type != K->type ||
                 K_hot->type != GGML_TYPE_F16 || V_hot->type != GGML_TYPE_F16 ||
                 Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] || Q->ne[0] != K_hot->ne[0] ||
                 Q->ne[0] != V_hot->ne[0] || (Q->ne[0] != 128 && Q->ne[0] != 256) ||

@@ -2,7 +2,7 @@
 
 // 8-bit PyramidKV Quest page bounds (ggml_pyramidkv_quest_update/_select with
 // I8 bounds): an E4M3-like magnitude (4 exponent bits, bias 7, 3 mantissa
-// bits, subnormals, no NaN code, largest value 480) stored as an ORDERED byte:
+// bits, subnormals, no NaN code, largest finite value 448, infinite endpoints) stored as an ORDERED byte:
 // 128 + m for x >= 0, 127 - m for x < 0. Byte order is number order, so the
 // running page min/max stays a plain byte min/max. Lower bounds round toward
 // -inf and upper bounds toward +inf, so the codes still bound the keys.
@@ -17,6 +17,9 @@
 #endif
 
 GGML_QUEST8_HD static inline float ggml_quest8_mag_value(int m) {
+    if (m == 127) {
+        return INFINITY;
+    }
     const int e = m >> 3;
     const int f = m & 7;
     return e == 0 ? (float) f * 0.001953125f : ldexpf(1.0f + (float) f * 0.125f, e - 7);
@@ -27,8 +30,11 @@ GGML_QUEST8_HD static inline int ggml_quest8_mag_floor(float a) {
     if (!(a > 0.0f)) {
         return 0;
     }
-    if (a >= 480.0f) {
+    if (isinf(a)) {
         return 127;
+    }
+    if (a >= 448.0f) {
+        return 126;
     }
     int ex = 0;
     const float fr = frexpf(a, &ex);   // a = fr * 2^ex, fr in [0.5, 1)
@@ -43,7 +49,7 @@ GGML_QUEST8_HD static inline int ggml_quest8_mag_floor(float a) {
     return m > 127 ? 127 : m;
 }
 
-// smallest code whose value is not below a (saturates at 480)
+// smallest code whose value is not below a
 GGML_QUEST8_HD static inline int ggml_quest8_mag_ceil(float a) {
     const int m = ggml_quest8_mag_floor(a);
     return ggml_quest8_mag_value(m) < a && m < 127 ? m + 1 : m;

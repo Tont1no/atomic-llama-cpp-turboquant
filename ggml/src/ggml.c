@@ -3999,7 +3999,7 @@ struct ggml_tensor * ggml_get_rows_quantized(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
-    GGML_ASSERT(a->type == GGML_TYPE_TURBO4_0 || a->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(a->type == GGML_TYPE_TURBO4_0 || a->type == GGML_TYPE_TURBO3_5 || a->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(a->ne[0] % ggml_blck_size(a->type) == 0);
     GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
     GGML_ASSERT(a->nb[1] >= ggml_row_size(a->type, a->ne[0]));
@@ -5593,7 +5593,7 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid(
         float                 logit_softcap) {
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5 || k_cold->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q->nb[0] == sizeof(float));
@@ -5676,7 +5676,7 @@ struct ggml_tensor * ggml_flash_attn_ext_hybrid_paged(
         int32_t               recent_window) {
     GGML_ASSERT(q && k_cold && v_cold && k_hot && v_hot && q_meta && k_list && k_list_len);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5);
+    GGML_ASSERT(k_cold->type == GGML_TYPE_TURBO4_0 || k_cold->type == GGML_TYPE_TURBO3_5 || k_cold->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(v_cold->type == k_cold->type);
     GGML_ASSERT(k_hot->type == GGML_TYPE_F16 && v_hot->type == GGML_TYPE_F16);
     GGML_ASSERT(q_meta->type == GGML_TYPE_I32 && k_list->type == GGML_TYPE_I32 && k_list_len->type == GGML_TYPE_I32);

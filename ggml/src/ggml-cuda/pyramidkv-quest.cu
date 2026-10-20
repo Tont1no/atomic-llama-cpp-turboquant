@@ -19,7 +19,7 @@ static __device__ __forceinline__ void quest_atomic_min_half(half * addr, const 
         if (!(value < __half2float(__ushort_as_half(assumed)))) {
             return;
         }
-        old = atomicCAS(p, assumed, __half_as_ushort(__float2half(value)));
+        old = atomicCAS(p, assumed, __half_as_ushort(__float2half_rd(value)));
     } while (old != assumed);
 }
 
@@ -32,7 +32,7 @@ static __device__ __forceinline__ void quest_atomic_max_half(half * addr, const 
         if (!(value > __half2float(__ushort_as_half(assumed)))) {
             return;
         }
-        old = atomicCAS(p, assumed, __half_as_ushort(__float2half(value)));
+        old = atomicCAS(p, assumed, __half_as_ushort(__float2half_ru(value)));
     } while (old != assumed);
 }
 
@@ -237,7 +237,9 @@ static __global__ void quest_score_kernel(
 #pragma unroll
             for (int i = 0; i < n_values; ++i) {
                 const float qd = q_row[lane + 32*i];
-                sum += qd >= 0.0f ? qd*hi_v[i] : qd*lo_v[i];
+                if (qd != 0.0f) {
+                    sum += qd > 0.0f ? qd*hi_v[i] : qd*lo_v[i];
+                }
             }
             best = fmaxf(best, quest_warp_sum(sum));
         }

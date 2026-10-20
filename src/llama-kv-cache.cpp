@@ -29,6 +29,10 @@ static bool llama_kv_type_is_turbo(ggml_type type) {
     return type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO3_5;
 }
 
+static bool llama_kv_type_is_pyramidkv_cold(ggml_type type) {
+    return llama_kv_type_is_turbo(type) || type == GGML_TYPE_Q8_0;
+}
+
 static uint32_t llama_turbo4_padded_head(uint32_t head_dim) {
     if (head_dim == 64 || head_dim == GGML_TURBO4_QK) {
         return GGML_TURBO4_QK;
@@ -175,8 +179,8 @@ llama_kv_cache::llama_kv_cache(
     }
 
     if (pyramidkv_c1_config.enabled) {
-        if (!llama_kv_type_is_turbo(type_k) || type_v != type_k) {
-            throw std::runtime_error("PyramidKV C1 requires symmetric TQ4 or TQ3.5 cold K/V");
+        if (!llama_kv_type_is_pyramidkv_cold(type_k) || type_v != type_k) {
+            throw std::runtime_error("PyramidKV C1 requires symmetric TQ4, TQ3.5, or Q8_0 cold K/V");
         }
         // Preserve the full prompt until its first requested output. Earlier
         // chunks cannot score facts against a question that has not arrived.
@@ -358,8 +362,12 @@ llama_kv_cache::llama_kv_cache(
         }
 
         if (pyramidkv_c1_hot_enabled) {
-            const uint32_t hot_k_head = llama_turbo4_padded_head(n_embd_head_k);
-            const uint32_t hot_v_head = llama_turbo4_padded_head(n_embd_head_v);
+            if (type_k == GGML_TYPE_Q8_0 &&
+                    ((n_embd_head_k != 128 && n_embd_head_k != 256) || n_embd_head_v != n_embd_head_k)) {
+                throw std::runtime_error("PyramidKV Q8_0 requires equal D128 or D256 K/V heads");
+            }
+            const uint32_t hot_k_head = llama_kv_type_is_turbo(type_k) ? llama_turbo4_padded_head(n_embd_head_k) : n_embd_head_k;
+            const uint32_t hot_v_head = llama_kv_type_is_turbo(type_v) ? llama_turbo4_padded_head(n_embd_head_v) : n_embd_head_v;
             if (hot_k_head == 0 || hot_v_head == 0 ||
                     c1_config.hot_capacity > std::numeric_limits<uint32_t>::max() / n_head_kv) {
                 throw std::runtime_error("PyramidKV C1 hot-row geometry is unsupported");
@@ -541,6 +549,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k =
             !attn_rot_disable &&
+            !pyramidkv_c1_config.enabled &&
             !llama_kv_type_is_turbo(type_k) &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
@@ -556,6 +565,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_v =
             !attn_rot_disable &&
+            !pyramidkv_c1_config.enabled &&
             !llama_kv_type_is_turbo(type_v) &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
@@ -2651,7 +2661,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    if (tq4_key_center_enabled_flag || llama_kv_type_is_turbo(type_k())) {
+    if (tq4_key_center_enabled_flag || pyramidkv_c1_config.enabled || llama_kv_type_is_turbo(type_k())) {
         return false;
     }
 
@@ -2766,9 +2776,9 @@ bool llama_kv_cache::pyramidkv_c1_supported(std::string & error) const {
         error = "PyramidKV C1 found no dense KV layers";
         return false;
     }
-    if (!pyramidkv_c1_hot_enabled || !llama_kv_type_is_turbo(type_k()) ||
+    if (!pyramidkv_c1_hot_enabled || !llama_kv_type_is_pyramidkv_cold(type_k()) ||
             type_v() != type_k()) {
-        error = "PyramidKV C1 requires TQ4 or TQ3.5 cold K/V plus an F16 hot window";
+        error = "PyramidKV C1 requires TQ4, TQ3.5, or Q8_0 cold K/V plus an F16 hot window";
         return false;
     }
     if (hparams.n_layer_all == 0) {
@@ -3634,7 +3644,8 @@ bool llama_kv_cache::pyramidkv_c1_compact(
         if (plan.hot_source_rows.empty()) {
             return;
         }
-        if (turbo_rotation_inv == nullptr || plan.hot_source_rows.size() != plan.hot_destination_rows.size()) {
+        if ((llama_kv_type_is_turbo(destination.k->type) && turbo_rotation_inv == nullptr) ||
+                plan.hot_source_rows.size() != plan.hot_destination_rows.size()) {
             throw std::runtime_error("PyramidKV hot promotion has no rotation or complete row map");
         }
         const auto device = ggml_backend_buft_get_device(kv_buffer_type);
@@ -3670,16 +3681,17 @@ bool llama_kv_cache::pyramidkv_c1_compact(
         auto encode = [&](ggml_tensor * hot, ggml_tensor * cold) {
             auto * hot_rows = ggml_reshape_2d(promotion_ctx.get(), hot, hot->ne[0], hot->ne[1]);
             auto * selected = ggml_get_rows(promotion_ctx.get(), hot_rows, source_indices);
-            // Hot is already in the WHT basis. Undo that rotation before the
-            // existing TQ4 encoder applies it once to newly promoted rows.
-            auto * flat = ggml_reshape_2d(promotion_ctx.get(), selected,
-                GGML_TURBO4_QK, ggml_nelements(selected) / GGML_TURBO4_QK);
-            auto * unrotated = ggml_mul_mat(promotion_ctx.get(), turbo_rotation_inv, flat);
-            ggml_mul_mat_set_prec(unrotated, GGML_PREC_F32);
-            ggml_mul_mat_set_hint(unrotated, GGML_HINT_SRC0_IS_TURBO_INVERSE);
-            unrotated = ggml_reshape_2d(promotion_ctx.get(), unrotated, cold->ne[0], plan.hot_source_rows.size());
+            if (llama_kv_type_is_turbo(cold->type)) {
+                // Undo the hot WHT basis before the Turbo encoder rotates once.
+                auto * flat = ggml_reshape_2d(promotion_ctx.get(), selected,
+                    GGML_TURBO4_QK, ggml_nelements(selected) / GGML_TURBO4_QK);
+                selected = ggml_mul_mat(promotion_ctx.get(), turbo_rotation_inv, flat);
+                ggml_mul_mat_set_prec(selected, GGML_PREC_F32);
+                ggml_mul_mat_set_hint(selected, GGML_HINT_SRC0_IS_TURBO_INVERSE);
+            }
+            selected = ggml_reshape_2d(promotion_ctx.get(), selected, cold->ne[0], plan.hot_source_rows.size());
             auto * cold_rows = ggml_reshape_2d(promotion_ctx.get(), cold, cold->ne[0], cold->ne[1]);
-            auto * encoded = ggml_set_rows(promotion_ctx.get(), cold_rows, unrotated, destination_indices);
+            auto * encoded = ggml_set_rows(promotion_ctx.get(), cold_rows, selected, destination_indices);
             ggml_format_name(encoded, "pyramidkv_promote_l%d_%s", source.il, hot == source.k_hot ? "k" : "v");
             ggml_build_forward_expand(graph, encoded);
         };
@@ -3846,7 +3858,7 @@ ggml_tensor * llama_kv_cache::get_k(
         throw std::runtime_error("PyramidKV C1 logical K rows exceed the bounded physical cache");
     }
 
-    if (!llama_kv_type_is_turbo(k->type)) {
+    if (!pyramidkv_c1_compacted && !llama_kv_type_is_turbo(k->type)) {
         assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
     }
 
@@ -3895,7 +3907,7 @@ ggml_tensor * llama_kv_cache::get_v(
     }
 
     // [TAG_V_CACHE_VARIABLE]
-    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+    assert(pyramidkv_c1_compacted || n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
     const uint32_t n_head_kv = hparams.n_head_kv(il);
     const uint32_t n_embd_head_v = llama_kv_type_is_turbo(v->type) ?
@@ -6291,7 +6303,7 @@ ggml_tensor * llama_kv_cache_context::get_kq_mask(
     GGML_UNUSED(ctx);
     GGML_UNUSED(base_mask);
     if (!kv->pyramidkv_c1_hybrid_ready(il)) {
-        throw std::runtime_error("PyramidKV C1 compacted attention requires the TQ4/F16 hybrid kernel");
+        throw std::runtime_error("PyramidKV C1 compacted attention requires the cold/F16 hybrid kernel");
     }
     // A single logical mask cannot represent head-local cold rows.  The
     // hybrid kernel applies causal validity from q_positions/k_positions.
@@ -6436,7 +6448,7 @@ void llama_kv_cache_context::set_input_prefill_idxs(ggml_tensor * dst) const {
 
 static ggml_tensor * llama_pyramidkv_prefill_gather(ggml_context * ctx, ggml_tensor * cache,
         ggml_tensor * read_idxs, uint32_t heads) {
-    GGML_ASSERT(llama_kv_type_is_turbo(cache->type) && cache->ne[2] == 1 && cache->ne[3] == 1);
+    GGML_ASSERT(llama_kv_type_is_pyramidkv_cold(cache->type) && cache->ne[2] == 1 && cache->ne[3] == 1);
     GGML_ASSERT(heads > 0 && cache->ne[0] % heads == 0);
     ggml_tensor * rows = ggml_view_2d(ctx, cache, cache->ne[0], cache->ne[1], cache->nb[1], 0);
     rows = ggml_get_rows_quantized(ctx, rows, read_idxs);

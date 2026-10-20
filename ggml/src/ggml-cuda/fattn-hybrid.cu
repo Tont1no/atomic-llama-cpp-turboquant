@@ -21,11 +21,14 @@ static __device__ __forceinline__ float ggml_cuda_hybrid_turbo4_value(
     return ggml_cuda_turbo4_centroid_shfl(code, lane_centroid) * __half2float(block->norm);
 }
 
-// Both packed formats share the same rotation, causal sources and reductions.
+// Cold formats share causal sources and reductions; Q8_0 has no rotation.
 template<ggml_type type>
 static __device__ __forceinline__ float ggml_cuda_hybrid_turbo_value(
         const char * row, const int index, const float lane_centroid) {
-    if constexpr (type == GGML_TYPE_TURBO3_5) {
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        const block_q8_0 * block = (const block_q8_0 *) row + index/QK8_0;
+        return block->qs[index % QK8_0]*__half2float(block->d);
+    } else if constexpr (type == GGML_TYPE_TURBO3_5) {
         return ggml_cuda_turbo35_dequant_value_lane(row, index, lane_centroid);
     } else {
         return ggml_cuda_hybrid_turbo4_value(row, index, lane_centroid);
@@ -120,7 +123,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_kernel(
     }
     const int lane = threadIdx.x & 31;
     constexpr unsigned int warp_mask = 0xffffffffu;
-    const float lane_centroid = type == GGML_TYPE_TURBO3_5
+    const float lane_centroid = type == GGML_TYPE_Q8_0 ? 0.0f : type == GGML_TYPE_TURBO3_5
         ? ggml_cuda_turbo35_centroid_lane() : ggml_cuda_turbo4_centroid_lane();
 
     const int64_t iq3 = row/(NQ_HEADS*NQ);
@@ -543,7 +546,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
         return;
     }
     const int lane = threadIdx.x & 31;
-    const float lane_centroid = type == GGML_TYPE_TURBO3_5
+    const float lane_centroid = type == GGML_TYPE_Q8_0 ? 0.0f : type == GGML_TYPE_TURBO3_5
         ? ggml_cuda_turbo35_centroid_lane() : ggml_cuda_turbo4_centroid_lane();
 
     // row = iq2*NQ + iq1 (head-major, like the dense kernel with NSEQ == 1)
@@ -763,7 +766,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
         return;
     }
     const int lane = threadIdx.x & 31;
-    const float lane_centroid = type == GGML_TYPE_TURBO3_5
+    const float lane_centroid = type == GGML_TYPE_Q8_0 ? 0.0f : type == GGML_TYPE_TURBO3_5
         ? ggml_cuda_turbo35_centroid_lane() : ggml_cuda_turbo4_centroid_lane();
     const int64_t kv_head = group/NQ;
     const int64_t iq1 = group - kv_head*NQ;
@@ -1068,22 +1071,26 @@ static void ggml_cuda_flash_attn_ext_hybrid_paged_impl(ggml_backend_cuda_context
 
 void ggml_cuda_flash_attn_ext_hybrid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (dst->src[1]->type) {
+        case GGML_TYPE_Q8_0:
+            return ggml_cuda_flash_attn_ext_hybrid_impl<GGML_TYPE_Q8_0>(ctx, dst);
         case GGML_TYPE_TURBO4_0:
             return ggml_cuda_flash_attn_ext_hybrid_impl<GGML_TYPE_TURBO4_0>(ctx, dst);
         case GGML_TYPE_TURBO3_5:
             return ggml_cuda_flash_attn_ext_hybrid_impl<GGML_TYPE_TURBO3_5>(ctx, dst);
         default:
-            GGML_ABORT("unsupported hybrid TurboQuant cache type");
+            GGML_ABORT("unsupported hybrid cold cache type");
     }
 }
 
 void ggml_cuda_flash_attn_ext_hybrid_paged(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (dst->src[1]->type) {
+        case GGML_TYPE_Q8_0:
+            return ggml_cuda_flash_attn_ext_hybrid_paged_impl<GGML_TYPE_Q8_0>(ctx, dst);
         case GGML_TYPE_TURBO4_0:
             return ggml_cuda_flash_attn_ext_hybrid_paged_impl<GGML_TYPE_TURBO4_0>(ctx, dst);
         case GGML_TYPE_TURBO3_5:
             return ggml_cuda_flash_attn_ext_hybrid_paged_impl<GGML_TYPE_TURBO3_5>(ctx, dst);
         default:
-            GGML_ABORT("unsupported hybrid TurboQuant cache type");
+            GGML_ABORT("unsupported hybrid cold cache type");
     }
 }

@@ -2863,7 +2863,8 @@ static const llama_kv_cache_context * llama_graph_attention_memory_context(const
 static ggml_backend_t llama_graph_pyramidkv_backend(ggml_backend_sched_t sched, const ggml_tensor * tensor) {
     const ggml_tensor * cache_root = tensor;
     while (cache_root->view_src != nullptr ||
-            (cache_root->op == GGML_OP_GET_ROWS && llama_graph_type_is_turbo(cache_root->type))) {
+            (cache_root->op == GGML_OP_GET_ROWS &&
+                (llama_graph_type_is_turbo(cache_root->type) || cache_root->type == GGML_TYPE_Q8_0))) {
         cache_root = cache_root->view_src != nullptr ? cache_root->view_src : cache_root->src[0];
     }
     if (cache_root->buffer == nullptr || ggml_backend_buffer_is_host(cache_root->buffer)) {
@@ -3242,7 +3243,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     const bool use_pyramidkv_c1 = cparams.pyramidkv_c1.enabled;
     const bool c1_dense_types =
-        (llama_graph_type_is_turbo(k->type) && v->type == k->type) ||
+        ((llama_graph_type_is_turbo(k->type) || k->type == GGML_TYPE_Q8_0) && v->type == k->type) ||
         ((k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) &&
          (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32));
     const bool qwen35_c1_geometry = use_pyramidkv_c1 &&
@@ -3608,6 +3609,9 @@ ggml_tensor * llm_graph_context::build_attn(
         k_hot_cur = llama_graph_turbo4_rotate(ctx0, k_cur, mctx_cur->get_turbo_rotation());
         v_hot_cur = llama_graph_turbo4_rotate(ctx0, v_cur, mctx_cur->get_turbo_rotation());
         turbo4_q_rotated = true;
+    } else if (cparams.pyramidkv_c1.enabled) {
+        k_hot_cur = k_cur;
+        v_hot_cur = v_cur;
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -3680,7 +3684,7 @@ ggml_tensor * llm_graph_context::build_attn(
             }
             auto backend = llama_graph_pyramidkv_backend(sched, gathered);
             if (gathered->op != GGML_OP_GET_ROWS || !ggml_backend_supports_op(backend, gathered)) {
-                throw std::runtime_error("PyramidKV local prefill requires packed TurboQuant row gather on the KV device");
+                throw std::runtime_error("PyramidKV local prefill requires packed KV row gather on the KV device");
             }
             ggml_backend_sched_set_tensor_backend(sched, gathered, backend);
         }

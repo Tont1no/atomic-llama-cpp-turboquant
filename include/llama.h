@@ -909,6 +909,10 @@ extern "C" {
     LLAMA_API bool llama_pyramidkv_c1_protect_positions(struct llama_context * ctx, llama_seq_id seq_id,
             const llama_pos * begin, const llama_pos * end, int32_t n);
 
+    // Rows available in every C1 paged head list, or -1 before selection / without C1.
+    // A pending selection includes all protected cells before its union can shrink it.
+    LLAMA_API int64_t llama_pyramidkv_c1_append_headroom(const struct llama_context * ctx, llama_seq_id seq_id);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

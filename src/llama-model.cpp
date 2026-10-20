@@ -2630,10 +2630,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         return n_attention_layers == 16;
     }();
     const bool c1_arch_supported = arch == LLM_ARCH_QWEN2 || qwen35_c1_geometry;
+    const bool c1_q8_geometry_supported = params.type_k != GGML_TYPE_Q8_0 || [&]() {
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (!hparams.is_recr(il) &&
+                    (hparams.n_embd_head_k(il) != hparams.n_embd_head_v(il) ||
+                     (hparams.n_embd_head_k(il) != 128 && hparams.n_embd_head_k(il) != 256))) {
+                return false;
+            }
+        }
+        return true;
+    }();
 
     if (params.pyramidkv_c1.enabled &&
-            (!c1_arch_supported ||
-             (params.type_k != GGML_TYPE_TURBO4_0 && params.type_k != GGML_TYPE_TURBO3_5) ||
+            (!c1_arch_supported || !c1_q8_geometry_supported ||
+             (params.type_k != GGML_TYPE_TURBO4_0 && params.type_k != GGML_TYPE_TURBO3_5 &&
+              params.type_k != GGML_TYPE_Q8_0) ||
              params.type_k != params.type_v ||
              !cparams.flash_attn || !cparams.causal_attn ||
              (cparams.n_seq_max != 1 && !params.pyramidkv_c1.paged) ||
@@ -2645,8 +2656,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // takes a rejected draft tail as a partial seq_rm.
         throw std::runtime_error(
             "PyramidKV C1 memory requires dense Qwen2 or target Qwen35-27B hybrid geometry, "
-            "symmetric TQ4 K/V, causal FlashAttention, "
-            "one sequence, explicit KV buffer, no SWA/shared context, and embeddings=false");
+            "symmetric TQ4/TQ3.5 or Q8_0 K/V (Q8 heads D128/D256), causal FlashAttention, "
+            "one sequence or paging, explicit KV buffer, no SWA/shared context, and embeddings=false");
     }
 
     if (params.kv_buffer_type != nullptr) {

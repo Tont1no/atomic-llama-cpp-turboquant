@@ -493,9 +493,9 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
-    if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_5) {
+    if (dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_5 || dst->type == GGML_TYPE_Q8_0) {
         GGML_ASSERT(src0->type == dst->type);
-        GGML_ASSERT(ne00 > 0 && ne00 % GGML_TURBO4_QK == 0);
+        GGML_ASSERT(ne00 > 0 && ne00 % ggml_blck_size(dst->type) == 0);
         GGML_ASSERT(ne10 > 0 && ne11 > 0 && ne12 > 0);
         GGML_ASSERT(ne02 == ne11 && ne03 == ne12);
         GGML_ASSERT(ne0 == ne00 && ne1 == ne10 && ne2 == ne11 && ne3 == ne12);
@@ -509,7 +509,7 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const dim3 block_nums(MIN(dst_rows, (int64_t) UINT16_MAX), 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
 
-        // Preserve the rotated cache representation without decode/re-encode.
+        // Preserve packed cache bytes without decode/re-encode.
         ggml_cuda_kernel_launch(k_get_rows_quantized, launch_params,
             (const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data,
             row_bytes, ne01, dst_rows, ne10, ne11, nb01, nb02, nb03,

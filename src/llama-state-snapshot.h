@@ -26,6 +26,7 @@ struct llama_state_seq_snapshot : llama_io_write_i {
         std::unique_ptr<uint8_t[]> metadata;
         ggml_tensor * source = nullptr;
         ggml_tensor * copy = nullptr;
+        ggml_backend_buffer_type_t copy_buft = nullptr;
         size_t offset = 0;
         size_t size = 0;
     };
@@ -71,27 +72,43 @@ struct llama_state_seq_snapshot : llama_io_write_i {
         if (size) memcpy(value.metadata.get(), src, size);
         append(std::move(value));
     }
+    static ggml_backend_buffer_type_t copy_buffer_type(ggml_backend_buffer_type_t source) {
+        if (!source) return nullptr;
+        if (source == ggml_backend_cpu_buffer_type()) return source;
+        const auto device = ggml_backend_buft_get_device(source);
+        const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
+        if (!reg || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) return nullptr;
+        const auto standard = ggml_backend_dev_buffer_type(device);
+        if (source == standard) return standard;
+        using kv_buffer_type_fn = ggml_backend_buffer_type_t (*)(int);
+        const auto kv_buffer_type = reinterpret_cast<kv_buffer_type_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_buffer_type"));
+        if (!kv_buffer_type) return nullptr;
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg) && i <= size_t(std::numeric_limits<int>::max()); ++i) {
+            if (ggml_backend_reg_dev_get(reg, i) == device) {
+                // Only the explicit KV pool is supported. Copies use the standard same-device buffer.
+                return source == kv_buffer_type(int(i)) ? standard : nullptr;
+            }
+        }
+        return nullptr;
+    }
     void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
         if (!size) return;
         if (!tensor || !tensor->buffer || offset > ggml_nbytes(tensor) || size > ggml_nbytes(tensor) - offset ||
             size % ggml_type_size(tensor->type) || offset % ggml_type_size(tensor->type))
             throw llama_state_snapshot_error(LLAMA_STATE_SEQ_SNAPSHOT_INVALID, "invalid snapshot tensor range");
-        const auto buft = ggml_backend_buffer_get_type(tensor->buffer);
-        const auto device = ggml_backend_buft_get_device(buft);
-        const auto reg = device ? ggml_backend_dev_backend_reg(device) : nullptr;
-        const char * name = reg ? ggml_backend_reg_name(reg) : "";
-        const bool cpu = buft == ggml_backend_cpu_buffer_type();
-        const bool cuda = device && strcmp(name, "CUDA") == 0 && buft == ggml_backend_dev_buffer_type(device);
-        if (!cpu && !cuda)
+        const auto copy_buft = copy_buffer_type(ggml_backend_buffer_get_type(tensor->buffer));
+        if (!copy_buft)
             throw llama_state_snapshot_error(LLAMA_STATE_SEQ_SNAPSHOT_UNSUPPORTED, "snapshot backend is not supported");
-        auto found = groups.find(buft);
+        auto found = groups.find(copy_buft);
         if (found == groups.end()) {
             charge(sizeof(group) + 256);
-            found = groups.emplace(buft, group{}).first;
+            found = groups.emplace(copy_buft, group{}).first;
         }
         ++found->second.count;
         part value;
         value.source = tensor;
+        value.copy_buft = copy_buft;
         value.offset = offset;
         value.size = size;
         append(std::move(value));
@@ -111,7 +128,7 @@ struct llama_state_seq_snapshot : llama_io_write_i {
         }
         for (auto & p : parts) {
             if (!p.source) continue;
-            auto & g = groups.at(ggml_backend_buffer_get_type(p.source->buffer));
+            auto & g = groups.at(p.copy_buft);
             const int64_t n = (p.size / ggml_type_size(p.source->type)) * ggml_blck_size(p.source->type);
             p.copy = ggml_new_tensor_1d(g.ctx.get(), p.source->type, n);
         }
@@ -126,7 +143,7 @@ struct llama_state_seq_snapshot : llama_io_write_i {
         }
         for (auto & p : parts) {
             if (!p.source) continue;
-            auto & g = groups.at(ggml_backend_buffer_get_type(p.source->buffer));
+            auto & g = groups.at(p.copy_buft);
             auto * view = ggml_view_1d(g.ctx.get(), p.source, p.copy->ne[0], p.offset);
             ggml_backend_view_init(view);
             ggml_backend_tensor_copy(view, p.copy);
