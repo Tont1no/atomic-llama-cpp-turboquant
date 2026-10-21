@@ -913,6 +913,10 @@ extern "C" {
     // A pending selection includes all protected cells before its union can shrink it.
     LLAMA_API int64_t llama_pyramidkv_c1_append_headroom(const struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Applied or pending C1 selection state, independent of freed cells.
+    // Pending observations count before memory_update installs them; false for null, invalid sequences, or without C1.
+    LLAMA_API bool llama_pyramidkv_c1_seq_compacted(const struct llama_context * ctx, llama_seq_id seq_id);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

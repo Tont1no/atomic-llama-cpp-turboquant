@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-device-feature.h"
 #include "llama-io.h"
 #include "llama-state-snapshot.h"
 #include "llama-memory.h"
@@ -1417,6 +1418,24 @@ bool llama_context::pyramidkv_c1_apply_pending_paged() {
     return true;
 }
 
+bool llama_context::pyramidkv_c1_seq_compacted(llama_seq_id seq_id) const {
+    const auto * kv = llama_context_attention_cache(memory.get());
+    if (kv == nullptr || !cparams.pyramidkv_c1.enabled || seq_id < 0 ||
+            static_cast<uint32_t>(seq_id) >= cparams.n_seq_max) {
+        return false;
+    }
+    if (kv->pyramidkv_c1_paged()) {
+        return kv->pyramidkv_c1_paged_seq_compacted(seq_id) ||
+            (kv->get_cells(seq_id).seq_pos_max(seq_id) >= 0 &&
+             std::any_of(pyramidkv_c1_pending_paged.begin(), pyramidkv_c1_pending_paged.end(),
+                [seq_id](const auto & pending) { return pending.first == seq_id && !pending.second.empty(); }));
+    }
+    // Nonpaged C1 has one sequence. Observation precedes memory_update(), so
+    // a request can finish with selection recorded but not yet installed.
+    return kv->pyramidkv_c1_is_compacted() || (seq_id == 0 && !pyramidkv_c1_pending.empty() &&
+        kv->get_cells(seq_id).seq_pos_max(seq_id) >= 0);
+}
+
 int64_t llama_context::pyramidkv_c1_append_headroom(llama_seq_id seq_id) const {
     const auto * kv = llama_context_attention_cache(memory.get());
     if (kv == nullptr || !kv->pyramidkv_c1_paged() || seq_id < 0 ||
@@ -1996,7 +2015,19 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
-    cparams.embeddings_layer_inp[lid] = enable;
+    if (cparams.embeddings_layer_inp[lid] != enable) {
+        synchronize();
+        for (size_t i = 0; i < device_layer_inputs.size(); ++i) {
+            if (device_layer_inputs[i].tensor && device_layer_inputs[i].rows) {
+                get_embeddings_layer_inp(i);
+                break; // The getter materializes all taps before applying their permutation.
+            }
+        }
+        for (auto & retained : device_layer_inputs) {
+            retained = {};
+        }
+        cparams.embeddings_layer_inp[lid] = enable;
+    }
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
@@ -2969,7 +3000,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens, n_tokens_all);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -3240,7 +3271,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, size_t total_tokens) {
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -3270,22 +3301,26 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         if (token_offset == 0) retained.rows = 0;
         const char * bridge = std::getenv("LLAMA_DFLASH_DEVICE_FEATURES");
         const size_t enabled = std::count(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true);
-        const size_t layer_bytes = (size_t) model.hparams.n_embd * cparams.n_batch * sizeof(float);
+        const size_t capacity = llama_device_feature_capacity(cparams.n_batch, enabled, row_floats);
         auto buft = ggml_backend_buffer_get_type(t->buffer);
         auto device = ggml_backend_buft_get_device(buft);
         const bool supported = device && !ggml_backend_buffer_is_host(t->buffer) &&
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device),
                 "ggml_backend_tensor_copy_2d_v1");
-        if (bridge && std::strcmp(bridge, "1") == 0 && supported && enabled &&
-                layer_bytes <= (60ULL << 20) / enabled) {
-            if (!retained.tensor || ggml_backend_buffer_get_type(retained.buffer.get()) != buft) {
-                // A placement change materializes earlier chunks before releasing their buffer.
+        // An oversized logical batch cannot use the retained prefix, so copy it straight to host.
+        if (bridge && std::strcmp(bridge, "1") == 0 && supported &&
+                llama_device_feature_fits(capacity, 0, total_tokens) &&
+                llama_device_feature_fits(capacity, token_offset, n_tokens)) {
+            if (!retained.tensor || ggml_backend_buffer_get_type(retained.buffer.get()) != buft ||
+                    retained.tensor->type != GGML_TYPE_F32 || retained.tensor->ne[0] != (int64_t) row_floats ||
+                    retained.tensor->ne[1] != (int64_t) capacity) {
+                // Placement or shape changes materialize earlier chunks before releasing their buffer.
                 if (retained.rows) get_embeddings_layer_inp(il);
                 retained = {};
                 retained.context.reset(ggml_init({ggml_tensor_overhead() + 1024, nullptr, true}));
                 if (retained.context) {
                     retained.tensor = ggml_new_tensor_2d(retained.context.get(), GGML_TYPE_F32,
-                            model.hparams.n_embd, cparams.n_batch);
+                            row_floats, capacity);
                     retained.buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(retained.context.get(), buft));
                     if (!retained.buffer) retained = {};
                 }
@@ -5734,6 +5769,10 @@ bool llama_pyramidkv_c1_protect_positions(struct llama_context * ctx, llama_seq_
 
 int64_t llama_pyramidkv_c1_append_headroom(const struct llama_context * ctx, llama_seq_id seq_id) {
     return ctx ? ctx->pyramidkv_c1_append_headroom(seq_id) : -1;
+}
+
+bool llama_pyramidkv_c1_seq_compacted(const struct llama_context * ctx, llama_seq_id seq_id) {
+    return ctx && ctx->pyramidkv_c1_seq_compacted(seq_id);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

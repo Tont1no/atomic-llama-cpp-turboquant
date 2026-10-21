@@ -5543,8 +5543,10 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
+    GGML_ASSERT(k->ne[2] > 0 && k->ne[3] > 0);
     GGML_ASSERT(ggml_can_mul_mat(k, q));
-    // TODO: check if vT can be multiplied by (k*qT)
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
 
     GGML_ASSERT(q->ne[3] == k->ne[3]);
     GGML_ASSERT(q->ne[3] == v->ne[3]);
@@ -5552,7 +5554,9 @@ struct ggml_tensor * ggml_flash_attn_ext(
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
         GGML_ASSERT(ggml_is_contiguous(mask));
-        //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
+        GGML_ASSERT(mask->ne[0] == k->ne[1]);
+        GGML_ASSERT(mask->ne[1] >= q->ne[1]);
+        GGML_ASSERT(mask->ne[2] > 0 && mask->ne[3] > 0);
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
         GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);

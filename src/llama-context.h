@@ -147,6 +147,7 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
     int64_t pyramidkv_c1_append_headroom(llama_seq_id seq_id) const;
+    bool pyramidkv_c1_seq_compacted(llama_seq_id seq_id) const;
 
     //
     // state save/load
@@ -239,7 +240,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, size_t total_tokens);
 
     //
     // graph

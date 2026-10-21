@@ -2216,7 +2216,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // Keep the minimum-confidence gate even when the caller needs fewer proposals.
+                const int n_max = dp.n_max > 0 ? std::min(params.n_max, std::max(dp.n_max, params.n_min)) : params.n_max;
+                if (n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

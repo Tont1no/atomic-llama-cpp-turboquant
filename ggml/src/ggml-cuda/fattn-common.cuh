@@ -85,6 +85,15 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+static inline bool ggml_cuda_fattn_v_is_k_view(const ggml_tensor * K, const ggml_tensor * V) {
+    // MLA V may be a shorter prefix of each K row, but must keep the row layout.
+    return V->view_src && V->type == K->type && V->ne[0] <= K->ne[0] &&
+        V->ne[1] == K->ne[1] && V->ne[2] == K->ne[2] && V->ne[3] == K->ne[3] &&
+        ggml_are_same_stride(K, V) &&
+        ((V->view_src == K && V->view_offs == 0) ||
+         (V->view_src == K->view_src && V->view_offs == K->view_offs));
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
@@ -95,7 +104,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool V_is_K_view = ggml_cuda_fattn_v_is_k_view(K, V);
 
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
@@ -944,7 +953,7 @@ template <int ncols1>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
         const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33,
-        const int64_t ne33) {
+        const int64_t ne33, const int64_t n_queries) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -968,6 +977,9 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
+            if (jt*ncols1 + j >= n_queries) {
+                break;
+            }
             const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
             all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
         }
@@ -1077,7 +1089,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = rowsum == 0.0f ? dst_val*0.0f : dst_val / rowsum;
 }
 
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
@@ -1188,7 +1200,7 @@ static __global__ void flash_attn_stream_k_fixup_general(
     }
 
     // Write back final result:
-    *dst = dst_val / rowsum;
+    *dst = rowsum == 0.0f ? dst_val*0.0f : dst_val / rowsum;
 }
 
 template<int D> // D == head size
@@ -1246,7 +1258,8 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    // Match CPU empty rows while preserving non-finite accumulators.
+    dst[tid] = VKQ_denominator == 0.0f ? VKQ_numerator*0.0f : VKQ_numerator / VKQ_denominator;
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1260,7 +1273,7 @@ void launch_fattn(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    const bool V_is_K_view = ggml_cuda_fattn_v_is_k_view(K, V);
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
@@ -1385,7 +1398,7 @@ void launch_fattn(
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, mask->ne[3]);
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, mask->ne[3], Q->ne[1]);
         CUDA_CHECK(cudaGetLastError());
     }
 

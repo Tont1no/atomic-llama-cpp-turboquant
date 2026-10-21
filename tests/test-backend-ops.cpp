@@ -7755,9 +7755,10 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
+    const bool mask_tail_all;
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) + "," + VARS_TO_STR1(mask_tail_all);
     }
 
     double max_nmse_err() override {
@@ -7774,9 +7775,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_tail_all = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), mask_tail_all(mask_tail_all) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7848,7 +7849,15 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (mask_tail_all) {
+                    std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                    for (int64_t i = 0; i < t->ne[2]*t->ne[3]; ++i) {
+                        std::fill_n(data.data() + ((i + 1)*t->ne[1] - 1)*t->ne[0], t->ne[0], ggml_fp32_to_fp16(-INFINITY));
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -7857,6 +7866,22 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+struct test_flash_attn_ext_permuted_shared_kv : public test_flash_attn_ext {
+    test_flash_attn_ext_permuted_shared_kv()
+        : test_flash_attn_ext(128, 128, 256, {1, 1}, 256, 2, false, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, {0, 1, 2, 3}, false) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",v_permuted_shared_root=true";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_flash_attn_ext::build_graph(ctx);
+        out->src[2] = ggml_permute(ctx, out->src[1], 0, 2, 1, 3);
+        return out;
     }
 };
 
@@ -11668,6 +11693,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
 
+    test_cases.emplace_back(new test_flash_attn_ext_permuted_shared_kv());
+
     // Direct symmetric TURBO4_0 VEC isolation: D128, QHeads=16, KVHeads=2,
     // NQ=1, with the two required KV lengths. CPU uses the existing TQ4
     // vec-dot/dequant reference implementation for the backend comparison.
@@ -11955,6 +11982,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (const auto kv_type : { GGML_TYPE_TURBO4_0, GGML_TYPE_F16 }) {
+        for (const int d : { 128, 256 }) {
+            for (const int nq : { 1, 3, 256 }) {
+                // Head/query tails with sinks, including SM120 shared-Q (optional GQA_COLS=2/4/8).
+                test_cases.emplace_back(new test_flash_attn_ext(d, d, 1, {3, 1}, 256, nq, true, true, 0, 0, GGML_PREC_F32, kv_type, kv_type));
+            }
+        }
+        // NQ=3, Nseq=2, exact [256,3,1,2] mask: all-masked final query with sinks.
+        // GGML_CUDA_FA_TURBO4_VEC_MAX_BATCH=8 selects TQ4 VEC; F16 remains an MMA control on SM120.
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {3, 2}, 256, 3, true, true, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, false, true));
+        // NQ=1, Nseq=2: every mask row is empty, without a sink denominator.
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {3, 2}, 256, 1, true, false, 0, 0, GGML_PREC_F32, kv_type, kv_type, {0, 1, 2, 3}, true, false, true));
+    }
+    // Default TQ4 VEC, 16 KV tiles: exercise split-result combination when the launcher selects multiple blocks.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {3, 2}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, {0, 1, 2, 3}, true, false, true));
+    for (const int gqa : { 5, 9 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {gqa, 1}, 256, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    }
     return test_cases;
 }
 #ifdef _MSC_VER

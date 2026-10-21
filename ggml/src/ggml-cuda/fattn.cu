@@ -500,12 +500,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_HYBRID;
     }
 
+    if (Q->ne[0] != K->ne[0] || K->ne[1] != V->ne[1] ||
+            K->ne[2] <= 0 || K->ne[2] != V->ne[2] || Q->ne[2] % K->ne[2] != 0 ||
+            K->ne[3] <= 0 || Q->ne[3] != K->ne[3] || Q->ne[3] != V->ne[3] ||
+            (mask != nullptr && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) ||
+                mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1] ||
+                mask->ne[2] <= 0 || mask->ne[3] <= 0 ||
+                Q->ne[2] % mask->ne[2] != 0 || Q->ne[3] % mask->ne[3] != 0))) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     const bool has_turbo4_kv = ggml_cuda_fattn_type_is_turbo(K->type) || ggml_cuda_fattn_type_is_turbo(V->type);
     if (has_turbo4_kv) {
         // Decode-sized Q tiles stay quantized through the direct vector kernel.
         // Returning NONE for unsupported shapes prevents the generic fallbacks.
         if (dst->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 ||
                 !ggml_cuda_fattn_type_is_turbo(K->type) || V->type != K->type ||
+                Q->nb[0] != ggml_element_size(Q) ||
+                K->nb[0] != ggml_element_size(K) || V->nb[0] != ggml_element_size(V) ||
                 (Q->ne[0] != 128 && Q->ne[0] != 256) ||
                 Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] ||
                 K->ne[1] <= 0 || K->ne[1] % FATTN_KQ_STRIDE != 0 ||

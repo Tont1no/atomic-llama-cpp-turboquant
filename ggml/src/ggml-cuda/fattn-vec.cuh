@@ -209,7 +209,7 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     // Keep the D256 query out of each thread's registers on SM120.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && !defined(GGML_USE_HIP)
-    constexpr bool tq4_shared_query = type_K == GGML_TYPE_TURBO4_0 && type_V == GGML_TYPE_TURBO4_0 && D == 256 && ncols == 1 && ncols2 == 1;
+    constexpr bool tq4_shared_query = type_K == GGML_TYPE_TURBO4_0 && type_V == GGML_TYPE_TURBO4_0 && D == 256 && (ncols == 1 || ncols == 2) && ncols2 == 1;
 #else
     constexpr bool tq4_shared_query = false;
 #endif
@@ -512,6 +512,9 @@ static __global__ void flash_attn_ext_vec(
             if (j0 + nwarps > ncols && j >= ncols) {
                 break;
             }
+            if (!col_valid(j)) {
+                continue;
+            }
 
             const float sink = ((const float *) sinks)[col_head(j)];
 
@@ -624,7 +627,8 @@ static __global__ void flash_attn_ext_vec(
                     }
                 }
                 if (gridDim.y == 1) {
-                    dst_val /= KQ_sum[j_VKQ];
+                    // Match CPU empty rows while preserving non-finite accumulators.
+                    dst_val = KQ_sum[j_VKQ] == 0.0f ? dst_val*0.0f : dst_val / KQ_sum[j_VKQ];
                 }
                 dst[(((sequence*int(ne01.z) + col_pos(j_VKQ))*ne02 + col_head(j_VKQ))*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
             }
