@@ -1853,6 +1853,20 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     quest_meta_dirty = true;
+    if (pyramidkv_c1_paged()) {
+        GGML_ASSERT(seq_id >= 0 && static_cast<uint32_t>(seq_id) < n_seq_max);
+        // seq_rm also clears head lists and invalidates only the discarded selections.
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            if (s == static_cast<uint32_t>(seq_id)) {
+                continue;
+            }
+            if (!seq_rm(static_cast<llama_seq_id>(s), -1, -1)) {
+                return;
+            }
+            pyramidkv_c1_protected[s].clear();
+        }
+        return;
+    }
     if ((pyramidkv_c1_hot_enabled || tq4_key_center_enabled_flag) && seq_id != 0) {
         pyramidkv_c1_fail_transition(tq4_key_center_enabled_flag
             ? "TQ4 key center supports only sequence 0"

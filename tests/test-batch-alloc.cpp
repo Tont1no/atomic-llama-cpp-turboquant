@@ -3,6 +3,8 @@
 #include "llama.h"
 
 #include "../src/llama-batch.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-model.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-vocab.h"
 #include "../src/llama-row-reorder.h"
@@ -10,6 +12,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -848,6 +851,108 @@ static void test_input_row_order(testing & t) {
     });
 }
 
+static void test_pyramidkv_seq_keep(testing & t) {
+    for (llama_seq_id kept : { 0, 1 }) {
+        for (bool pending : { false, true }) {
+            t.test("keep_" + std::to_string(kept) + (pending ? "_pending" : "_selected"), [=](testing & t) {
+                std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN2, llama_model_default_params()));
+                auto & hp = model->hparams;
+                hp.no_alloc = true;
+                hp.n_layer_all = 1;
+                hp.n_embd = hp.n_embd_head_k_full = hp.n_embd_head_v_full = 128;
+                hp.n_head_arr[0] = hp.n_head_kv_arr[0] = 1;
+                llama_pyramidkv_c1_config config;
+                config.enabled = config.paged = true;
+                config.layer_count = 1;
+                config.max_capacity_prompt = 4;
+                config.recent_window = config.observation_window = 1;
+                config.hot_capacity = config.list_capacity = 16;
+                config.continuation_headroom = 4;
+                // Real cache metadata and zero-size CPU buffers; no weights or graph execution.
+                llama_kv_cache cache(*model, hp, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                    false, false, true, 64, 2, 1, 0, LLAMA_SWA_TYPE_NONE,
+                    nullptr, {}, {}, {}, nullptr, config);
+                const llama_seq_id discarded = 1 - kept;
+                const auto append_prompt = [&](llama_seq_id seq) {
+                    batch_builder bb(128);
+                    for (llama_pos pos = 0; pos < 4; ++pos) {
+                        bb.add(pos, { seq }, pos == 3);
+                    }
+                    llama_batch_allocr ba(1);
+                    if (!ba.init(bb.make(), model->vocab, &cache, 128, 2, false)) {
+                        return false;
+                    }
+                    auto memory = cache.init_batch(ba, 4, false);
+                    if (llama_memory_status_is_fail(memory->get_status())) {
+                        return false;
+                    }
+                    do {
+                        if (!memory->apply()) {
+                            return false;
+                        }
+                    } while (memory->next());
+                    return true;
+                };
+                const auto selection = [&](llama_seq_id seq) {
+                    llama_pyramidkv_c1_layer_selection selected;
+                    selected.il = 0;
+                    selected.kv_heads = 1;
+                    selected.source_tokens = cache.get_size();
+                    selected.heads.resize(1);
+                    const auto & cells = cache.get_cells(seq);
+                    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+                        if (!cells.is_empty(i) && cells.seq_has(i, seq)) {
+                            selected.heads[0].keep_cells.push_back(i);
+                            selected.heads[0].keep_positions.push_back(cells.pos_get(i));
+                        }
+                    }
+                    return std::vector<llama_pyramidkv_c1_layer_selection>{ selected };
+                };
+                if (!t.assert_true(append_prompt(0)) || !t.assert_true(append_prompt(1))) {
+                    return;
+                }
+                const auto kept_selection = selection(kept);
+                const auto discarded_selection = selection(discarded);
+                std::string error;
+                if (!pending && (!t.assert_true(cache.pyramidkv_c1_paged_apply_selection(kept, kept_selection, error)) ||
+                        !t.assert_true(cache.pyramidkv_c1_paged_apply_selection(discarded, discarded_selection, error)))) {
+                    return;
+                }
+                cache.pyramidkv_c1_set_protected(kept, {{ 1, 2 }});
+                cache.pyramidkv_c1_set_protected(discarded, {{ 1, 2 }});
+                llama_memory_seq_keep(&cache, kept);
+                t.assert_equal(int64_t(4), cache.seq_n_cells(kept));
+                t.assert_equal(int64_t(0), cache.seq_n_cells(discarded));
+                t.assert_equal(-1, cache.seq_pos_max(discarded));
+                t.assert_true("discarded head lists are empty", cache.pyramidkv_c1_paged_list_size(discarded) == 0);
+                t.assert_true("discarded selection is reset", !cache.pyramidkv_c1_paged_seq_compacted(discarded));
+                t.assert_equal(!pending, cache.pyramidkv_c1_paged_seq_compacted(kept));
+                t.assert_equal(size_t(pending ? 0 : 4), cache.pyramidkv_c1_paged_list_size(kept));
+                t.assert_true("kept protection survives", cache.pyramidkv_c1_is_protected(kept, 1));
+                t.assert_true("discarded protection is reset", !cache.pyramidkv_c1_is_protected(discarded, 1));
+                // The context consumes this exact set before installing pending selections.
+                t.assert_true("only the discarded pending selection is stale",
+                    cache.pyramidkv_c1_take_stale_seqs() == std::vector<llama_seq_id>{ discarded });
+                t.assert_true("kept pending selection still installs",
+                    cache.pyramidkv_c1_paged_apply_selection(kept, kept_selection, error));
+                t.assert_true("discarded pending selection cannot install",
+                    !cache.pyramidkv_c1_paged_apply_selection(discarded, discarded_selection, error));
+                t.assert_true("kept selection remains intact", selection(kept)[0].heads[0].keep_cells ==
+                    kept_selection[0].heads[0].keep_cells && selection(kept)[0].heads[0].keep_positions ==
+                    kept_selection[0].heads[0].keep_positions);
+                if (!t.assert_true("discarded sequence restarts at position zero", append_prompt(discarded))) {
+                    return;
+                }
+                t.assert_equal(0, cache.seq_pos_min(discarded));
+                t.assert_equal(3, cache.seq_pos_max(discarded));
+                t.assert_true("new prompt can receive its own selection",
+                    cache.pyramidkv_c1_paged_apply_selection(discarded, selection(discarded), error));
+                t.assert_true("no failed transition", !cache.pyramidkv_c1_reset_failed(error));
+            });
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -868,6 +973,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail", test_keep_tail);
     t.test("mrope",     test_mrope);
     t.test("input_rows", test_input_row_order);
+    t.test("pyramidkv_seq_keep", test_pyramidkv_seq_keep);
 
     return t.summary();
 }

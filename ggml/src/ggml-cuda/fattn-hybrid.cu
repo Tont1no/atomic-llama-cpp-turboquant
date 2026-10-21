@@ -3,6 +3,7 @@
 #include "turbo4-cuda.cuh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -269,8 +270,12 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_merge_kernel(
     const size_t value_base = meta_base*D;
 
     float local_max = -INFINITY;
+    bool invalid = false;
     for (int i = lane; i < split_k; i += 32) {
         const float2 meta = partial_meta[meta_base + i];
+        // Only (-Inf, 0) represents an empty split; failed softmax state must propagate.
+        invalid |= !(meta.x == -INFINITY && meta.y == 0.0f) &&
+            (!ggml_cuda_hybrid_is_finite(meta.x) || !ggml_cuda_hybrid_is_finite(meta.y) || meta.y <= 0.0f);
         if (ggml_cuda_hybrid_is_finite(meta.x) && meta.y > 0.0f) {
             local_max = fmaxf(local_max, meta.x);
         }
@@ -279,6 +284,17 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_merge_kernel(
         local_max = fmaxf(local_max, sinks[iq2]);
     }
     const float global_max = ggml_cuda_hybrid_warp_max(local_max);
+    if (sinks && lane == 0) {
+        const float sink = sinks[iq2];
+        invalid |= sink != sink || sink == INFINITY || (sink == -INFINITY && global_max == -INFINITY);
+    }
+    if (__any_sync(0xffffffffu, invalid)) {
+        float * dst_row = (float *) ((char *) dst + iq2*dst_nb1 + iq1*dst_nb2 + iq3*dst_nb3);
+        for (int d = lane; d < D; d += 32) {
+            dst_row[d] = NAN;
+        }
+        return;
+    }
 
     float local_denominator = 0.0f;
     if (ggml_cuda_hybrid_is_finite(global_max)) {
@@ -565,7 +581,12 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_kernel(
     const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + iq2*q_nb2);
     // same TQ4 lane layout as the GQA-6 kernel: a query computes the same sums
     // whichever of the two kernels a batch shape selects
-    constexpr bool vec = type == GGML_TYPE_TURBO4_0;
+    // Vector loads need aligned rows; views otherwise use the scalar layout.
+    const bool vec = type == GGML_TYPE_TURBO4_0 &&
+        (((uintptr_t) q | q_nb1 | q_nb2 | (uintptr_t) k_hot | kh_nb1 | kh_nb2 |
+          (uintptr_t) v_hot | vh_nb1 | vh_nb2) & 15) == 0 &&
+        (((uintptr_t) k_cold | kc_nb1 | kc_nb2 |
+          (uintptr_t) v_cold | vc_nb1 | vc_nb2) & 3) == 0;
     const int d0 = 128*(lane >> 4) + 8*(lane & 15);
     const auto dim = [&](int i) { return vec ? d0 + i : lane + 32*i; };
 
@@ -775,7 +796,12 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
     // one 32-bit load of packed codes and one norm per lane (instead of 8
     // byte and 8 norm loads); the kernel is bound by these dependent loads.
     // TQ3.5 keeps the strided layout.
-    constexpr bool vec = type == GGML_TYPE_TURBO4_0;
+    // Vector loads need aligned rows; views otherwise use the scalar layout.
+    const bool vec = type == GGML_TYPE_TURBO4_0 &&
+        (((uintptr_t) q | q_nb1 | q_nb2 | (uintptr_t) k_hot | kh_nb1 | kh_nb2 |
+          (uintptr_t) v_hot | vh_nb1 | vh_nb2) & 15) == 0 &&
+        (((uintptr_t) k_cold | kc_nb1 | kc_nb2 |
+          (uintptr_t) v_cold | vc_nb1 | vc_nb2) & 3) == 0;
     const int d0 = 128*(lane >> 4) + 8*(lane & 15);
     const auto dim = [&](int i) { return vec ? d0 + i : lane + 32*i; };
     const int32_t q_position = q_meta[2*iq1 + 0];
@@ -841,7 +867,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
 
             float keys[n_values];
             float values[n_values];
-            if constexpr (vec) {
+            if (vec) {
                 if (hot) {
                     const uint4 kr = *(const uint4 *) (k_row + d0*sizeof(half));
                     const uint4 vr = *(const uint4 *) (v_row + d0*sizeof(half));
@@ -886,7 +912,7 @@ static __global__ void ggml_cuda_flash_attn_ext_hybrid_paged_gqa6_kernel(
             for (int h = 0; h < n_heads; ++h) {
                 const float * q_row = (const float *) ((const char *) q + iq1*q_nb1 + (head0 + h)*q_nb2);
                 float dot = 0.0f;
-                if constexpr (vec) {
+                if (vec) {
                     const float4 qa = *(const float4 *) (q_row + d0);
                     const float4 qb = *(const float4 *) (q_row + d0 + 4);
                     dot += qa.x*keys[0];

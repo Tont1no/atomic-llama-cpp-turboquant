@@ -1181,6 +1181,11 @@ struct test_case {
         return true;
     }
 
+    virtual bool expects_nan(size_t index) {
+        GGML_UNUSED(index);
+        return false;
+    }
+
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1467,6 +1472,9 @@ struct test_case {
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
+                    if (ud->tc->expects_nan(i) && std::isnan(f1[i]) && std::isnan(f2[i])) {
+                        continue;
+                    }
                     printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
                     ud->ok = false;
                     return true;
@@ -8207,6 +8215,75 @@ struct test_flash_attn_ext_hybrid : public test_case {
     }
 };
 
+// Explicit non-finite expectations stay local to this fixture; ordinary tests still reject NaNs.
+struct test_flash_attn_ext_hybrid_nonfinite : public test_flash_attn_ext_hybrid {
+    enum case_kind { NAN_KEY, NAN_SINK, INF_SINK, NEG_INF_SINK, EMPTY_NEG_INF_SINK, EMPTY, FINITE };
+    const case_kind kind;
+
+    test_flash_attn_ext_hybrid_nonfinite(case_kind kind)
+        : test_flash_attn_ext_hybrid(128, 2, 2, 1, 32, 32, 1, false,
+            kind == EMPTY || kind == EMPTY_NEG_INF_SINK, true, 0.0f, 0.0f,
+            kind == NAN_SINK || kind == INF_SINK || kind == NEG_INF_SINK || kind == EMPTY_NEG_INF_SINK), kind(kind) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext_hybrid::vars() + ",nonfinite_case=" + std::to_string(kind);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return test_flash_attn_ext_hybrid::build_graph(ctx)->src[0];
+    }
+
+    bool expects_nan(size_t index) override {
+        return index < 128 && (kind == NAN_KEY || kind == NAN_SINK || kind == INF_SINK || kind == EMPTY_NEG_INF_SINK);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        for (size_t i = 0; i < n; ++i) {
+            if (expects_nan(i)) {
+                if (!std::isnan(a[i]) || !std::isnan(b[i])) {
+                    return INFINITY;
+                }
+            } else {
+                const float expected = all_masked ? 0.0f : sinks && i >= 128 ? 32.0f/33.0f : 1.0f;
+                if (!std::isfinite(a[i]) || !std::isfinite(b[i]) ||
+                        fabsf(a[i] - expected) > 2e-6f || fabsf(b[i] - expected) > 2e-6f) {
+                    return INFINITY;
+                }
+            }
+        }
+        return 0.0;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hy_mask") == 0) {
+                std::vector<ggml_fp16_t> values(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                if (!all_masked) {
+                    std::fill(values.begin() + n_cold, values.end(), ggml_fp32_to_fp16(0.0f));
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "hy_k_hot") == 0) {
+                std::vector<ggml_fp16_t> values(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                if (kind == NAN_KEY) {
+                    // Only KV head 0, hot row 0 is invalid; later hot splits and head 1 stay finite.
+                    values[0] = ggml_fp32_to_fp16(NAN);
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "hy_sinks") == 0) {
+                const float first = kind == NAN_SINK ? NAN : kind == INF_SINK ? INFINITY : -INFINITY;
+                const float values[2] = {first, 0.0f};
+                ggml_backend_tensor_set(t, values, 0, sizeof(values));
+            } else if (strcmp(t->name, "hy_q") == 0 || strcmp(t->name, "hy_v_hot") == 0) {
+                init_tensor_uniform(t, 1.0f, 1.0f);
+            } else if (strcmp(t->name, "hy_k_cold") == 0 || strcmp(t->name, "hy_v_cold") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Paged hybrid attention: each query token walks its sequence's per-KV-head
 // (row_code, position) list over a shared TQ4 arena plus an F16 hot ring.
 // The CPU backend carries the reference implementation, so the standard
@@ -8456,12 +8533,14 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
     const ggml_type type_kv;
     const int64_t quest_n;
     const bool use_ext;
+    const int unaligned_src;
 
     std::string vars() override {
         return VARS_TO_STR9(d, nh, nkv, nq, n_arena, n_hot, nseq, list_len, logit_softcap) +
             ",recent_window=" + std::to_string(recent_window) + "," + VARS_TO_STR1(type_kv) +
             (quest_n > 0 ? ",quest_n=" + std::to_string(quest_n) : "") +
-            (use_ext ? ",ext=1" : "");
+            (use_ext ? ",ext=1" : "") +
+            (unaligned_src >= 0 ? ",unaligned_src=" + std::to_string(unaligned_src) : "");
     }
 
     double max_nmse_err() override {
@@ -8487,21 +8566,34 @@ struct test_flash_attn_ext_hybrid_paged : public test_case {
             int32_t recent_window = 4,
             ggml_type type_kv = GGML_TYPE_TURBO4_0,
             int64_t quest_n = 0,
-            bool use_ext = false)
+            bool use_ext = false,
+            int unaligned_src = -1)
         : d(d), nh(nh), nkv(nkv), nq(nq), n_arena(n_arena), n_hot(n_hot), nseq(nseq),
           list_len(list_len), logit_softcap(logit_softcap), perf_only(perf_only), recent_window(recent_window), type_kv(type_kv),
-          quest_n(quest_n), use_ext(use_ext) {}
+          quest_n(quest_n), use_ext(use_ext), unaligned_src(unaligned_src) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nq, nh, 1);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d + (unaligned_src == 0), nq, nh, 1);
+        if (unaligned_src == 0) {
+            ggml_set_name(q, "pg_q_storage");
+            q = ggml_view_4d(ctx, q, d, nq, nh, 1, q->nb[1], q->nb[2], q->nb[3], sizeof(float));
+        }
         ggml_set_name(q, "pg_q");
         ggml_tensor * k_cold = ggml_new_tensor_3d(ctx, type_kv, d, n_arena, nkv);
         ggml_set_name(k_cold, "pg_k_cold");
         ggml_tensor * v_cold = ggml_new_tensor_3d(ctx, type_kv, d, n_arena, nkv);
         ggml_set_name(v_cold, "pg_v_cold");
-        ggml_tensor * k_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d, n_hot, nkv);
+        ggml_tensor * k_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d + (unaligned_src == 5), n_hot, nkv);
+        if (unaligned_src == 5) {
+            ggml_set_name(k_hot, "pg_k_hot_storage");
+            k_hot = ggml_view_3d(ctx, k_hot, d, n_hot, nkv, k_hot->nb[1], k_hot->nb[2], sizeof(ggml_fp16_t));
+        }
         ggml_set_name(k_hot, "pg_k_hot");
-        ggml_tensor * v_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d, n_hot, nkv);
+        ggml_tensor * v_hot = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, d + (unaligned_src == 6), n_hot, nkv);
+        if (unaligned_src == 6) {
+            ggml_set_name(v_hot, "pg_v_hot_storage");
+            v_hot = ggml_view_3d(ctx, v_hot, d, n_hot, nkv, v_hot->nb[1], v_hot->nb[2], sizeof(ggml_fp16_t));
+        }
         ggml_set_name(v_hot, "pg_v_hot");
         ggml_tensor * q_meta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, nq);
         ggml_set_name(q_meta, "pg_q_meta");
@@ -11726,6 +11818,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {8, 1}, 1024, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
 
+    for (auto kind : {test_flash_attn_ext_hybrid_nonfinite::NAN_KEY,
+                      test_flash_attn_ext_hybrid_nonfinite::NAN_SINK,
+                      test_flash_attn_ext_hybrid_nonfinite::INF_SINK,
+                      test_flash_attn_ext_hybrid_nonfinite::NEG_INF_SINK,
+                      test_flash_attn_ext_hybrid_nonfinite::EMPTY_NEG_INF_SINK,
+                      test_flash_attn_ext_hybrid_nonfinite::EMPTY,
+                      test_flash_attn_ext_hybrid_nonfinite::FINITE}) {
+        test_cases.emplace_back(new test_flash_attn_ext_hybrid_nonfinite(kind));
+    }
+
     // Hybrid PyramidKV contract: D64 is padded to D128, one softmax spans
     // TQ4 cold rows and F16 hot rows, and position metadata is per KV head.
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(64, 4, 1, 2, 3, 2, 2, true,  false, false));
@@ -11753,6 +11855,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 16, 2, 4, 1280, 1024, 1, true,  false, true));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(128, 8, 2, 3, 5, 3, 2, true, false, false, 8.0f, 30.0f, true, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext_hybrid(256, 16, 2, 1, 1024, 96, 1, true, true, false, 0.0f, 0.0f, false, GGML_TYPE_Q8_0));
+
+    // Isolate Q and hot K/V views with odd row strides and element offsets.
+    // NQ=3 selects ordinary paged attention; NQ=8 with GQA6 selects the grouped kernel.
+    for (int source : {0, 5, 6}) {
+        test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 8, 2, 3, 64, 16, 2, 24,
+            0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, false, source));
+        test_cases.emplace_back(new test_flash_attn_ext_hybrid_paged(256, 24, 4, 8, 128, 64, 2, 48,
+            0.0f, false, 4, GGML_TYPE_TURBO4_0, 0, false, source));
+    }
 
     // Paged lists (multi-sequence): small ragged lists with freed and
     // out-of-range entries, D128 and D256, the verification width, long
