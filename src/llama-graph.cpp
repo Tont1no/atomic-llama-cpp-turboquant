@@ -311,13 +311,6 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
-    // a ubatch without outputs (the head of a long prompt) builds a 0-row out_ids that the
-    // allocator may leave without a buffer; there is nothing to write
-    if (out_ids->buffer == nullptr) {
-        GGML_ASSERT(n_outputs == 0);
-        return;
-    }
-
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
