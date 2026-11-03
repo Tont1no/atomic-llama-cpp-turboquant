@@ -11,6 +11,21 @@
 // base classes
 //
 
+
+// Upstream asks for per-op accumulator / input precision (ggml_prec_set_acc,
+// ggml_prec_set_src). This ggml only knows the mul_mat accumulator setting, so
+// both requests map onto it: F32 accumulation on the near-tie sensitive
+// router and hyper-connection products.
+static inline bool ggml_prec_set_acc(ggml_tensor * a, enum ggml_prec prec) {
+    if (a->op != GGML_OP_MUL_MAT) { return false; }
+    ggml_mul_mat_set_prec(a, prec);
+    return true;
+}
+
+static inline bool ggml_prec_set_src(ggml_tensor * a, enum ggml_prec prec, int /*idx*/) {
+    return ggml_prec_set_acc(a, prec);
+}
+
 struct llm_build_mamba_base : public llm_graph_context {
     llm_build_mamba_base(const llm_graph_params & params);
 
@@ -1218,6 +1233,9 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
+
+        // mean over the hyper-connection streams, [n_embd, n_tokens]
+        ggml_tensor * build_hc_mean(ggml_tensor * x) const;
 
         ggml_tensor * build_attention(
                 const llama_model & model,

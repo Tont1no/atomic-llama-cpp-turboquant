@@ -1875,6 +1875,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     ml.done_getting_tensors();
 
+    // the deepseek41 Engram table stays memory-mapped on disk; its graph input
+    // prefetches the rows a ubatch hashes to before compute reads them
+    if (per_layer_tok_embd && arch == LLM_ARCH_DEEPSEEK41) {
+        can_prefetch.insert(per_layer_tok_embd);
+    }
+
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&

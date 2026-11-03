@@ -408,6 +408,41 @@ public:
         return seq_pos[seq_id].begin()->first;
     }
 
+    // the token of the cell of sequence seq_id at the largest position <= p
+    // when several cells share that position, the one with the highest index wins
+    // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+    // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        auto it = sp.upper_bound(p);
+        if (it == sp.begin()) {
+            return LLAMA_TOKEN_NULL;
+        }
+        const llama_pos target = (--it)->first;
+
+        // the preceding tokens are almost always among the most recent cells
+        int64_t best = -1;
+        const uint64_t n_recent = std::min<uint64_t>(seq_recent_n[seq_id], SEQ_RECENT);
+        for (uint64_t k = 0; k < n_recent; ++k) {
+            const uint32_t i = seq_recent[seq_id][k];
+            if (i < pos.size() && pos[i] == target && seq[i].test(seq_id) && (int64_t) i > best) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            for (int64_t i = (int64_t) pos.size() - 1; i >= 0; --i) {
+                if (pos[i] == target && seq[i].test(seq_id)) {
+                    best = i;
+                    break;
+                }
+            }
+        }
+        return best < 0 ? LLAMA_TOKEN_NULL : ext[best].tok;
+    }
+
     // the maximum position of sequence seq_id currently present in any of the cells
     // return -1 if the sequence is not present
     llama_pos seq_pos_max(llama_seq_id seq_id) const {

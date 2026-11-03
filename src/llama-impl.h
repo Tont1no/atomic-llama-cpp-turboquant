@@ -103,3 +103,9 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+
+struct ggml_tensor;
+
+// hints the OS to page in the given rows of a host (memory-mapped) matrix
+// ahead of use; a no-op for device tensors
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);

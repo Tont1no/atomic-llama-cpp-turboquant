@@ -169,3 +169,41 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
     }
 }
+
+#include "ggml-backend.h"
+
+#if defined(_WIN32)
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#else
+#    include <sys/mman.h>
+#    include <unistd.h>
+#endif
+
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
+    if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {
+        return;
+    }
+    GGML_ASSERT(ggml_is_matrix(tensor));
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    const auto * base = (const char *) tensor->data;
+#if defined(_WIN32)
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    ranges.reserve(n_rows);
+    for (size_t i = 0; i < n_rows; ++i) {
+        GGML_ASSERT(rows[i] >= 0 && rows[i] < tensor->ne[1]);
+        ranges.push_back({ (PVOID) (base + (size_t) rows[i] * tensor->nb[1]), row_bytes });
+    }
+    PrefetchVirtualMemory(GetCurrentProcess(), ranges.size(), ranges.data(), 0);
+#else
+    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    for (size_t i = 0; i < n_rows; ++i) {
+        GGML_ASSERT(rows[i] >= 0 && rows[i] < tensor->ne[1]);
+        const uintptr_t start = (uintptr_t) (base + (size_t) rows[i] * tensor->nb[1]);
+        const uintptr_t aligned = start & ~(uintptr_t) (page - 1);
+        madvise((void *) aligned, start + row_bytes - aligned, MADV_WILLNEED);
+    }
+#endif
+}
