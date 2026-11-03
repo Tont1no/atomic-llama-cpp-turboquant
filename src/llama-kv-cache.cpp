@@ -2625,7 +2625,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d() || ubatch.token) {
+            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
                 llama_kv_cell_ext ext;
 
                 if (ubatch.is_pos_2d()) {
@@ -2635,6 +2635,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 if (ubatch.token) {
                     ext.tok = ubatch.token[i];
+                } else if (hparams.ple_n_heads > 0) {
+                    // an embedding batch (image) has no token ids; the Engram
+                    // n-gram hash stands in the model's configured token
+                    ext.tok = hparams.ple_embd_token;
                 }
 
                 cells.ext_set(idx, ext);
@@ -4706,7 +4710,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 bool llama_kv_cache::has_cell_ext() const {
-    return hparams.n_pos_per_embd() > 1;
+    // M-RoPE needs the 2D position, the PLE / Engram n-gram hashes need the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
 }
 
 void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
