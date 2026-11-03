@@ -348,8 +348,48 @@ static value default_value(const func_args & args) {
     return no_value ? args.get_pos(1) : args.get_pos(0);
 }
 
+// dict(mapping or iterable of pairs, **kwargs), as in Python; DeepSeek-V4 templates
+// merge messages with dict(first, tools=tools).
+static value toobject(const func_args & args) {
+    auto out = mk_val<value_object>();
+    value iter = args.get_pos(0, mk_val<value_undefined>());
+    bool iter_first = false;
+    if (is_val<value_array>(iter)) {
+        iter_first = true;
+        for (const auto & it : iter->as_array()) {
+            if (is_val<value_array>(it) && it->as_array().size() == 2) {
+                auto tuple = it->as_array();
+                auto key = tuple[0];
+                auto val = tuple[1];
+                JJ_DEBUG("namespace/dict: adding key '%s'", key->as_string().str().c_str());
+                out->insert(key, val);
+            } else {
+                throw raised_exception("namespace/dict() iterable argument must consist of tuples, not " + it->type());
+            }
+        }
+    } else if (is_val<value_object>(iter)) {
+        iter_first = true;
+        for (const auto & pair : iter->as_ordered_object()) {
+            JJ_DEBUG("namespace/dict: adding key '%s'", pair.first->as_string().str().c_str());
+            out->insert(pair.first, pair.second);
+        }
+    }
+    for (const auto & arg : args.get_args()) {
+        if (is_val<value_kwarg>(arg)) {
+            auto kwarg = cast_val<value_kwarg>(arg);
+            JJ_DEBUG("namespace/dict: adding key '%s'", kwarg->key.c_str());
+            out->insert(kwarg->key, kwarg->val);
+        } else if (!iter_first) {
+            throw raised_exception("namespace/dict() arguments must be kwargs, dict and/or iterable of tuples, not " + arg->type());
+        }
+        iter_first = false;
+    }
+    return out;
+}
+
 const func_builtins & global_builtins() {
     static const func_builtins builtins = {
+        {"dict", toobject},
         {"raise_exception", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string msg = args.get_pos(0)->as_string().str();
