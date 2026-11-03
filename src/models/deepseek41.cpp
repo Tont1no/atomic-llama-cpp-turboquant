@@ -12,7 +12,7 @@
 
 // ref: deepseek-ai/DeepSeek-V4.1-Flash-1017 inference/model.py, engram.py
 // compressed layers attend over [window | all compressed rows] with top-k as a mask. with flash attention the default
-// is sparse: fused indexer, FA bounded to window + top-k, decode-sized ubatches gather only the selected rows (same
+// is sparse: fused indexer, FA over the masked window + compressed rows (this fork has no bounded sparse FA), decode-sized ubatches gather only the selected rows (same
 // keys and mask, different key order). LLAMA_DSV41_SPARSE=0 restores the reference path
 
 static constexpr int64_t DSV41_ENGRAM_DEAD = -1;
@@ -316,6 +316,9 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             all.insert(all.end(), ids[e].begin(), ids[e].end());
         }
         if (model.can_prefetch.count(model.per_layer_tok_embd)) {
+            // n-grams repeat within a ubatch; advise each table row once
+            std::sort(all.begin(), all.end());
+            all.erase(std::unique(all.begin(), all.end()), all.end());
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
         for (size_t e = 0; e < engram_ids.size(); ++e) {
@@ -751,7 +754,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             cb(kq_mask, "comp_kq_mask", il);
 
             // at most window + top-k visible columns per query: lets CUDA FA gather only those
-            const int64_t n_kv_max = sparse ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + k_sel : 0;
             out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks, nullptr, kq_scale, il);
         }
         if (k_rot) {
